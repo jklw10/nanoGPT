@@ -31,8 +31,8 @@ stoi = { ch:i for i,ch in enumerate(chars) }
 itos = { i:ch for i,ch in enumerate(chars) }
 def encode(s):
     return [stoi[c] for c in s] # encoder: take a string, output a list of integers
-def decode(l):
-    return ''.join([itos[i] for i in l]) # decoder: take a list of integers, output a string
+def decode(ll):
+    return ''.join([itos[i] for i in ll]) # decoder: take a list of integers, output a string
 
 # create the train and test splits
 n = len(data)

@@ -15,7 +15,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123
 $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
 """
-
+import gc
 import os
 import time
 import math
@@ -24,10 +24,19 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
+import torch._dynamo
+import torch._inductor.config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
-
 from model import GPTConfig, GPT
+
+
+torch._dynamo.optimize()
+#torch._inductor.config.force_disable_caches = True
+torch._inductor.config.disable_cpp_codegen = True
+#torch._inductor.config.triton = True
+
+
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -78,6 +87,8 @@ exec(open('configurator.py').read()) # overrides from command line or config fil
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
+
+
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
 if ddp:
@@ -120,15 +131,35 @@ def get_batch(split):
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+    #print(f"datalen {len(data)}")
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    
+    #outp = model.generate(X, 100, temperature=0.01, top_k=200)
+    
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
     else:
         x, y = x.to(device), y.to(device)
+    
     return x, y
+
+meta_path = os.path.join('data', 'shakespeare_char/meta.pkl')
+    
+with open(meta_path, 'rb') as f:
+    meta = pickle.load(f)
+stoi, itos = meta['stoi'], meta['itos']
+def encode(s): [stoi[c] for c in s]
+def decode(ll):
+    decoded = []
+    for i in ll:
+        if i in itos:
+            decoded.append(itos[i])
+        else:
+            decoded.append('[UNK]')  # Or another placeholder for unknown tokens
+    return ''.join(decoded)
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -192,8 +223,68 @@ if block_size < model.config.block_size:
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
 
+
+best                = True
+
+
+mnorm_enabled       = False
+#wack
+dfw_enabled         = False
+wwhitening_enabled  = False
+decor_enabled       = False
+#rough
+wnorm_enabled       = False
+gdiff_enabled       = False
+grokfast            = False
+sign_enabled        = False
+gwhitening_enabled  = False
+#??
+gsphere             = False
+ndiff_enabled       = False
+gchaos              = False #or best
+ggauss              = False #or best
+#known good
+gfft                = False or best
+gnorm               = False #or best
+gzca_enabled        = False #or best
+soft_wnorm_enabled  = False or best
+zcastep = 2 #2, 5
+szcapow = 2 #2, 10
+
+ghook = gdiff_enabled or ndiff_enabled or gnorm or dfw_enabled or grokfast or gwhitening_enabled or gfft or gzca_enabled or sign_enabled or gsphere or ggauss or gchaos
+
+decay = False
+decaying = 1.0
+
+eigenInit = False
+
+if(ghook):
+    
+    if(gdiff_enabled or dfw_enabled):
+        weight_emas = [p.clone().detach() for p in model.parameters()]
+    else:
+        weight_emas =None
+    if (grokfast):
+        gema = [torch.zeros_like(p) for p in model.parameters()]
+
+    for i, p in enumerate(model.parameters()):
+        if p.requires_grad:
+            if init_from!='resume' and weight_emas is not None:
+                weight_emas[i] = torch.randn_like(p) * p.size(0)
+            
+            if (grokfast):
+                p.register_hook(lambda grad, p=p, gema=gema[i]: custom_gradient_adjustment(grad, p, gema, decaying))
+            if(gdiff_enabled or dfw_enabled ):
+                p.register_hook(lambda grad, p=p, weight_ema=weight_emas[i]: custom_gradient_adjustment(grad, p, weight_ema))
+            else:
+                p.register_hook(lambda grad, p=p: custom_gradient_adjustment(grad, p))
+
+
+
 # initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+#scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+scaler = torch.amp.GradScaler(device_type, enabled=(dtype == 'float16'))
+
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
@@ -205,7 +296,8 @@ checkpoint = None # free up memory
 if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
-    model = torch.compile(model) # requires PyTorch 2.0
+    model = torch.compile(model, backend="cudagraphs") # requires PyTorch 2.0
+
 
 # wrap model into DDP container
 if ddp:
@@ -219,12 +311,19 @@ def estimate_loss():
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
+            
+            #torch.compiler.cudagraph_mark_step_begin()
             X, Y = get_batch(split)
             with ctx:
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
+
+    del X
+    del Y
+    # flush the gradients as soon as we can, no need for this memory anymore
+    optimizer.zero_grad(set_to_none=True)
     return out
 
 # learning rate decay scheduler (cosine with warmup)
@@ -252,85 +351,393 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
-while True:
 
-    # determine and set the learning rate for this iteration
-    lr = get_lr(iter_num) if decay_lr else learning_rate
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+@torch.compile(backend='cudagraphs')
+def zca_newton_schulz(G, epsilon=1e-5, steps=5, power_iters=10):
+    if G.ndim < 2:
+        return G
+    G = G - G.mean(dim=0, keepdim=True)
+    n, d = G.shape
+    device, dtype = G.device, G.dtype
+    
+    # Compute covariance matrix with regularization
+    Cov = (1/n) * torch.matmul(G.T, G) + epsilon * torch.eye(d, device=device, dtype=dtype)
+    
+    # Estimate spectral norm using power iteration
+    v = torch.randn(d, 1, device=device, dtype=dtype)
+    for _ in range(power_iters):
+        u = torch.matmul(Cov, v)
+        u = u / u.norm()
+        v = torch.matmul(Cov.T, u)
+        v = v / v.norm()
+    s = torch.matmul(u.T, torch.matmul(Cov, v))#.squeeze()
+    
+    # Scale Cov to ensure convergence
+    B = Cov / s
+    Y = torch.eye(d, device=device, dtype=dtype)
+    
+    # Newton-Schulz iterations for inverse square root of B
+    for _ in range(steps):
+        Y = 0.5 * torch.matmul(Y, 3 * torch.eye(d, device=device, dtype=dtype) - torch.matmul(Y, torch.matmul(B, Y)))
+    
+    # Rescale to get Cov^{-1/2}
+    W = Y / (s ** 0.5)
+    
+    return torch.matmul(G, W)
 
-    # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
-        losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        if wandb_log:
-            wandb.log({
-                "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
-            })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
-            if iter_num > 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
-                }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
-    if iter_num == 0 and eval_only:
-        break
+def zeropower_via_newtonschulz(G, steps=5, eps=1e-10):
+    assert len(G.shape) == 2
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    X /= (X.norm() + eps)  # ensure top singular value <= 1
+    if G.size(0) > G.size(1):
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A  # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        X = a * X + B @ X
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X.to(G.dtype)
 
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
-    for micro_step in range(gradient_accumulation_steps):
-        if ddp:
-            # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
-            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
-        with ctx:
-            logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
-        # backward pass, with gradient scaling if training in fp16
-        scaler.scale(loss).backward()
-    # clip the gradient
-    if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
-    scaler.step(optimizer)
-    scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
-    optimizer.zero_grad(set_to_none=True)
+def fftnorm(grad,center=0.5,sigma=0.5):
+    if(grad.ndim>=2):
+        adjusted_grad = torch.fft.fft2(grad) 
+        gk = gaussian_kernel(adjusted_grad.real, center, sigma)
+        adjusted_grad = torch.complex(gk*(adjusted_grad.real),gk*(adjusted_grad.imag))
+        return torch.fft.ifft2(adjusted_grad).real
+    else:
+        adjusted_grad = torch.fft.fft(grad) 
+        gk = gaussian_kernel(adjusted_grad.real, center, sigma)
+        adjusted_grad = torch.complex(gk*(adjusted_grad.real),gk*(adjusted_grad.imag))
+        return torch.fft.ifft(adjusted_grad).real
+    
+def gaussian_kernel(grad, center_offset: float, sigma = 3.0) -> torch.Tensor:
+    size = grad.size()
+    device= grad.device
+    dtype= grad.dtype
+    
+    # Calculate total elements and validate input
+    num_elements = torch.prod(torch.tensor(size, dtype=dtype, device=device))
+    # Generate position indices
+    indices = torch.arange(num_elements, dtype=dtype, device=device)
+    
+    # Calculate Gaussian parameters
+    center = center_offset * (num_elements - 1)
+    #max_distance = max(center, (num_elements - 1) - center)
+    sigma = sigma * (num_elements - 1)
+    
+    # Compute Gaussian values and reshape
+    kernel = torch.exp(-(indices - center).pow(2) / (2 * sigma**2))
+    return kernel.view(size)
 
-    # timing and logging
-    t1 = time.time()
-    dt = t1 - t0
-    t0 = t1
-    if iter_num % log_interval == 0 and master_process:
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5: # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
-    iter_num += 1
-    local_iter_num += 1
+#@torch.compile(backend='cudagraphs')
+def custom_gradient_adjustment(grad, param, weight_ema = None, gema = 0.0, decaying = 1.0):
+    #print(grad.size())
+    if(grad is None):
+        return
+    input_size = grad.size(0)
+    adjusted_grad = torch.where(torch.isnan(grad), torch.zeros_like(grad), grad)
+    if(gchaos):
+        adjusted_grad += torch.rand_like(adjusted_grad)*0.001
+    
+    if(gnorm): 
+        
+        grad_avg = adjusted_grad.nanmean()
+        grad_range = adjusted_grad.max() - adjusted_grad.min() + 1e-10
+        adjusted_grad = ((adjusted_grad - grad_avg) / grad_range)  * (2 - 2 / input_size) 
+    d2 = not (adjusted_grad.ndim < 2)
+    if(gsphere and d2): 
+        adjusted_grad = adjusted_grad / adjusted_grad.norm() # * (2 - 2 / input_size) 
+    if(gfft):
+        adjusted_grad = fftnorm(adjusted_grad)
+    if(sign_enabled):
+        adjusted_grad = torch.sign(torch.round(adjusted_grad)) 
+    if(gwhitening_enabled and d2):
+        adjusted_grad = zeropower_via_newtonschulz(adjusted_grad)
+    if(gzca_enabled and d2):
+        adjusted_grad = zca_newton_schulz(adjusted_grad, zcastep, szcapow)
 
-    # termination conditions
-    if iter_num > max_iters:
-        break
+    if(ndiff_enabled):
+        w_range = torch.abs(p.max() - p.min() + 1e-10)
+        w_avg = param.nanmean()
+        norm = ((param - w_avg) / w_range) * (1 + 2 / input_size) 
+        normgrad = norm - param
+        adjusted_grad *= torch.abs(adjusted_grad - normgrad)
+
+    if(gdiff_enabled):
+        awdiff = weight_ema - param 
+
+        npar = torch.abs(weight_ema)
+        npar += torch.abs(adjusted_grad - awdiff) 
+        gdiff = 1.0 / torch.abs(npar)
+        adjusted_grad *= gdiff 
+    
+    if(gdiff_enabled or dfw_enabled):
+        weight_ema += 0.99 * (param - weight_ema)
+    if(grokfast):
+        gema += 0.9999 * (adjusted_grad - gema)
+        adjusted_grad += gema * 2
+        adjusted_grad /= 3
+    if(ggauss):
+        gk = gaussian_kernel(adjusted_grad,0.5,3)
+        adjusted_grad = gk * adjusted_grad
+    #if(gfast):
+    #    surprise += 0.98 * (adjusted_grad - surprise)
+    #    adjusted_grad = funnyMulti(adjusted_grad,surprise)
+    return adjusted_grad 
+
+def wfunny(model):
+        for i, p in enumerate(model.parameters()):
+            if p.requires_grad:
+                #if p.dim() > 0:
+                p.data  = funnyMulti(weight_emas[i],p.data)
+
+def wunfunny(model):
+        for i, p in enumerate(model.parameters()):
+            if p.requires_grad:
+                #if p.dim() > 0:
+                p.data  = unfunnyMulti(p.data, weight_emas[i])
+
+
+def funnyMulti(x, y):
+    return torch.sign(x) * torch.sqrt(torch.abs(x * y))
+
+def unfunnyMulti(x, y):
+    return torch.sign(x) * torch.abs((x ** 2) / y)
+
+#@torch.compile(backend='cudagraphs')
+def wnorm(model):
+    for p in model.parameters():
+        if p.requires_grad:
+            if p.ndim >= 2:
+                a = 1.0
+            else:
+                continue
+                a = 1e-5
+            with torch.no_grad():
+                pstep = snormstep(p, a) 
+                p.data = p.data - pstep 
+
+
+
+#@torch.compile(backend='cudagraphs')
+
+@torch.compile(backend='cudagraphs')
+def snormstep(p, alpha):
+    #wsize = np.max((p.data.nelement(), 10.0)) * torch.ones(1,device =p.data.device,dtype =p.data.dtype)
+    scale = 1 + 2 / p.data.nelement()
+    w_avg = p.data.nanmean()
+    w_range = torch.abs(p.data.max() - p.data.min() + 1e-10) / scale
+    return (p.data - ((p.data - w_avg) / w_range)  ) * alpha 
+
+#@torch.compile(backend='cudagraphs')
+def softwnorm(model, alpha = 5e-5):
+    for i, p in enumerate(model.parameters()):
+        if p.requires_grad:
+            if p.ndim >= 2:
+                a = alpha
+            else:
+                continue
+                a = 0 #alpha / 20
+            with torch.no_grad():
+                pstep = snormstep(p, a) 
+                p.data = p.data - pstep 
+
+
+def wwhite(model):
+    for p in model.parameters():
+        if p.requires_grad:
+            with torch.no_grad():
+                p.data = zca_newton_schulz(p.data)
+
+def justnorm(x, idim=-1):
+    dtype = x.dtype
+    x = x.float()
+    res = (x / x.norm(p=2, dim=idim, keepdim=True)).to(dtype=dtype) 
+    return res
+#ngpt
+def normalize_matrices():
+    model.transformer.wte.weight.data.copy_(justnorm(model.transformer.wte.weight.data, 1))         # V, n_embd
+    model.lm_head.weight.data.copy_(justnorm(model.lm_head.weight.data, 1))           # V, n_embd
+    
+
+    for layer_idx in range(0, model.config.n_layer):
+        block = model.transformer["h"][layer_idx]
+
+        #block.query.weight.data.copy_(justnorm(block.query.weight.data, 1))             # n_proj, n_embd
+        #block.key.weight.data.copy_(justnorm(block.key.weight.data, 1))                 # n_proj, n_embd
+        block.attn.c_attn.weight.data.copy_(justnorm(block.attn.c_attn.weight.data, 1))             # n_proj, n_embd
+        block.attn.c_proj.weight.data.copy_(justnorm(block.attn.c_proj.weight.data, 0))   # n_embd, n_proj
+
+        block.mlp.c_fc.weight.data.copy_(justnorm(block.mlp.c_fc.weight.data, 1))               # n_proj, n_embd
+        block.mlp.c_proj.weight.data.copy_(justnorm(block.mlp.c_proj.weight.data, 0))   # n_embd, n_proj
+
+
+scaler.is_enabled = False
+scaler = None
+#if(dfw_enabled):
+#    wfunny(model)  
+
+
+
+tl = time.time()
+
+#if(True and dataset == 'shakespeare_char'): #test if generation works asd
+#    with torch.no_grad():
+#        outp = model.generate(X, 100, temperature=0.01, top_k=200)
+gc.collect()
+torch.cuda.empty_cache()
+gc.collect()
+torch.cuda.empty_cache()
+#with torch.profiler.profile(
+#    activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+#    on_trace_ready=torch.profiler.tensorboard_trace_handler('./log'),
+#    #record_shapes=True
+#) as prof:
+if(True): #i hate white space significance. (this is for that profiler and i'm lazy)
+    while True:
+        # determine and set the learning rate for this iteration
+        lr = get_lr(iter_num) if decay_lr else learning_rate
+
+        #if(dfw_enabled):
+        #    wunfunny(model) 
+        if(wnorm_enabled):
+            wnorm(model)
+        if(soft_wnorm_enabled):
+            if(decay):
+                softwnorm(model, lr/20)
+            else:
+                softwnorm(model)#, 1e-5)
+        if(mnorm_enabled ):
+            normalize_matrices()
+        if(dfw_enabled):
+            wfunny(model)  
+        
+            
+
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+
+        # evaluate the loss on train/val sets and write checkpoints
+        if iter_num % eval_interval == 0 and master_process: # and iter_num > 0:
+            if(iter_num > 0):
+                torch.compiler.cudagraph_mark_step_begin()
+                gc.collect()
+                torch.cuda.empty_cache()
+                losses = estimate_loss()
+                saved = False
+                if wandb_log:
+                    wandb.log({
+                        "iter": iter_num,
+                        "train/loss": losses['train'],
+                        "val/loss": losses['val'],
+                        "lr": lr,
+                        "mfu": running_mfu*100, # convert to percentage
+                    })
+                if losses['val'] < best_val_loss or always_save_checkpoint:
+                    best_val_loss = losses['val']
+                    if(False and dataset == 'shakespeare_char'):
+                        with torch.no_grad():
+                            outp = model.generate(X[0].unsqueeze(0), 100, temperature=0.01, top_k=200)
+                        #print('---------------')
+                        #print(decode(Y[0].detach().cpu().numpy().tolist()))
+                        print('---------------')
+                        print(decode(outp[0].detach().cpu().numpy().tolist()))
+                        print('---------------')
+                    if iter_num > 0:
+                        checkpoint = {
+                            'model': raw_model.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            'model_args': model_args,
+                            'iter_num': iter_num,
+                            'best_val_loss': best_val_loss,
+                            'config': config,
+                        }
+                    saved = True
+                    torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                t1 = time.time()
+                print(f"step {iter_num} : saved {saved}, train loss {losses['train']:.4f}, val loss {losses['val']:.4f} : time {(t1-tl)*1000:.2f}ms")
+                tl=time.time()
+
+            #print(torch.cuda.memory_summary())
+            #torch.cuda.reset_peak_memory_stats()
+            #if(not dataset == 'shakespeare_char'):
+            torch.cuda.empty_cache()
+        if iter_num == 0 and eval_only:
+            break
+        
+        torch.compiler.cudagraph_mark_step_begin()
+        #if iter_num % eval_interval == 0:
+        #    torch.cuda.empty_cache()
+        #if iter_num <= 0:
+        #    X, Y = get_batch('train') 
+       
+
+
+        # forward backward update, with optional gradient accumulation to simulate larger batch size
+        # and using the GradScaler if data type is float16
+        for micro_step in range(gradient_accumulation_steps):
+            if ddp:
+                # in DDP training we only need to sync gradients at the last micro step.
+                # the official way to do this is with model.no_sync() context manager, but
+                # I really dislike that this bloats the code and forces us to repeat code
+                # looking at the source of that context manager, it just toggles this variable
+                model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+            with ctx:
+                logits, loss = model(X, Y)
+                loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+            # immediately async prefetch next batch while model is doing the forward pass on the GPU
+            del X
+            del Y
+            X, Y = get_batch('train')
+            loss.backward()
+            # backward pass, with gradient scaling if training in fp16
+            #scaler.scale(loss).backward()
+        #if(dataset != 'shakespeare_char'):
+        torch.cuda.empty_cache()
+
+        # clip the gradient
+        if grad_clip != 0.0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        # step the optimizer and scaler if training in fp16
+        optimizer.step()
+        if(decay):
+            decaying *= 0.999999
+            #0.9999 = .05 at 30k
+            #0.99999 = .74 at 30k
+            #0.999999 = .97 at 30k
+        #scaler.step(optimizer)
+        #scaler.update()
+
+        # flush the gradients as soon as we can, no need for this memory anymore
+        optimizer.zero_grad(set_to_none=True)
+        
+        # timing and logging
+        #t1 = time.time()
+        #dt = t1 - t0
+        #t0 = t1
+        if iter_num % log_interval == 0 and master_process and False:
+            t1 = time.time()
+            # get loss as float. note: this is a CPU-GPU sync point
+            # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
+            lossf = loss.item() * gradient_accumulation_steps
+            #if local_iter_num >= 5: # let the training loop settle a bit
+            #    mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+            #    running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+            print(f"iter {iter_num}: loss {lossf:.4f}, time {(t1-tl)*1000:.2f}ms")#, mfu {running_mfu*100:.2f}%")
+            #print(prof.key_averages().table(row_limit=10,sort_by= device + "_time_total"))
+            tl=time.time()
+        iter_num += 1
+        local_iter_num += 1
+
+        # termination conditions
+        if iter_num > max_iters:
+            break
+
+
+
 
 if ddp:
     destroy_process_group()
