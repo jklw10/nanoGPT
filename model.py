@@ -25,6 +25,7 @@ qrot            = False
 mix_squish      = True
 #bad
 fftmem          = True
+CausalMem          = True
 convemb         = False
 emamem          = False
 diffembd        = False
@@ -458,11 +459,18 @@ class Dreamer(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.block = Block(config, False)
+        self.block = Block(config, CausalMem)
         
         
     def forward(self, x):
-        b,t,c = x.size()
+        while x.shape[0] > 1:
+            b, t, c = x.size()
+            x = x.reshape(b // 2, 2, t, c)
+            x = x.permute(0, 2, 1, 3).reshape(b // 2, t * 2, c)
+            #x = x.view(b//2, 2*t, c)
+            x = utils.fft_trunc_tsquish(x)
+            x = self.block(x)
+
         return x
 
 
@@ -544,10 +552,10 @@ class GPT(nn.Module):
             self.register_buffer('gmask', utils.gaussian_kernel(torch.ones(self.config.n_embd)))
         if(fftmem ):
             self.register_buffer('memory', torch.zeros(1,config.internal_block_size,config.n_embd//2))
-            
-            self.memory_selector = Block(config,False)
+            self.dreamer = Dreamer(config)
+            self.memory_selector = Block(config,CausalMem)
         if(emamem ):
-            self.memory_selector = Block(config,False)
+            self.memory_selector = Block(config,CausalMem)
             self.memory_mixer = nn.Linear(config.n_embd, config.n_embd)
             #self.memory_predictor = nn.Linear(config.n_embd,config.n_embd)
             self.register_buffer('memory', torch.zeros(config.internal_block_size, config.n_embd))
@@ -636,8 +644,9 @@ class GPT(nn.Module):
             selectedMemory = self.memory_selector(xswish)#(b,t,c)
             selectedMemory = utils.fft_trunc_csquish(selectedMemory) #(b,t,c//2)
             first_mem = torch.stack([selectedMemory, fh],dim =-1).flatten(start_dim=-2,end_dim=-1) #(b,t,c)
+            first_mem = self.dreamer(first_mem)
             first_mem = utils.fft_trunc_csquish(first_mem)#(b,t,c//2)
-            first_mem = first_mem.mean(dim=0).unsqueeze(0)
+            #first_mem = first_mem.mean(dim=0).unsqueeze(0)
             fh = first_mem.expand(b,t,self.config.n_embd//2)#(b,t,c//2)
             
         if(fftmem and not self.training):
@@ -677,8 +686,9 @@ class GPT(nn.Module):
                 selectedMemory = self.memory_selector(x)#(b,t,c)
                 selectedMemory = utils.fft_trunc_csquish(selectedMemory) #(b,t,c//2)
                 updated_mem = torch.stack([selectedMemory,fh],dim =-1).flatten(start_dim=-2,end_dim=-1) #(b,t,c)
+                updated_mem = self.dreamer(updated_mem)
                 updated_mem = utils.fft_trunc_csquish(updated_mem)#(b,t,c//2)
-                updated_mem = updated_mem.mean(dim=0).unsqueeze(0)
+                #updated_mem = updated_mem.mean(dim=0).unsqueeze(0)
                 #updated_mem = utils.fft_trunc_csquish(updated_mem)
                 self.memory.copy_(updated_mem)
 

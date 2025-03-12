@@ -244,10 +244,10 @@ ndiff_enabled       = False
 gchaos              = False #or best
 ggauss              = False #or best
 #known good
-gfft                = False or best
+gfft                = False #or best
 gnorm               = False #or best
 gzca_enabled        = False #or best
-soft_wnorm_enabled  = False or best
+soft_wnorm_enabled  = False #or best
 zcastep = 2 #2, 5
 szcapow = 2 #2, 10
 
