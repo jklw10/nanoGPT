@@ -23,17 +23,63 @@ def mmnorm(x, dim = -1, scale = None):
     w_range = torch.abs(x.max(dim=dim, keepdim=True)[0] - x.min(dim=dim, keepdim=True)[0] + 1e-10)
     return ((x - w_avg) / w_range) * scale
 
+def fast_sin_leakyrelu(x):
+     base = F.leaky_relu(x)
+     sine_mod = F.relu(torch.sign(x)) * torch.sin(1.25 * x)
+     return base + sine_mod
 
+def fast_sin_gelu_leaky(x, leaky=0.01):
+     base = F.gelu(x)
+     sine_mod = torch.where(x >= 0, torch.sin(1.25 * x), x * leaky)
+     return base + sine_mod
+
+
+def fast_sin_gelu(x):
+     base = F.gelu(x)
+     sine_mod = torch.relu(torch.sign(x)) * torch.sin(1.25 * x)
+     return base + sine_mod
+
+def fast_sin_gelu_sinleak(x, leaky=0.01):
+     base = F.gelu(x)
+     lh = F.leaky_relu(torch.sign(x),negative_slope=leaky)
+     sine_mod = lh * torch.sin(1.25 * x)
+     return base + sine_mod
+
+def modified_sin_gelu_leaky(x, leaky=0.01):
+     sqpi = torch.sqrt(torch.ones_like(x)*2/torch.pi)
+     base = 0.5 * x * (1 + F.tanh(sqpi * (x + 0.044715 * x**3)))
+     sine_mod = torch.where(x >= 0, torch.sin(1.25 * x), x * leaky)
+     return base + sine_mod
 def create_memory_causal_mask(memory_length, incoming_length):
     total_length = memory_length + incoming_length
-    mask = torch.tril(torch.full((total_length, total_length), float('-inf')))    
     
-    # Memory can attend to all memory tokens
-    mask[:total_length, :memory_length] = 0
-    mask[:memory_length, :total_length] = 0
+    # Create a 2D mask tensor initialized with zeros (allows attention)
+    mask = torch.zeros((total_length, total_length), dtype=torch.float)
     
+    # Create the causal mask for the token-to-token section
+    token_indices = slice(memory_length, total_length)
+    
+    # Fill upper triangular part with -inf to prevent attention in those positions
+    mask[token_indices, token_indices] = torch.triu(
+        torch.ones((incoming_length, incoming_length), dtype=torch.float) * float('-inf'),
+        diagonal=1
+    )
     
     return mask
+
+def create_memory_causal_mask2(memory_length, incoming_length):
+    total_length = memory_length + incoming_length
+    mask = torch.zeros((total_length,total_length))
+    mask[incoming_length:,incoming_length:] = torch.triu(
+        torch.ones((incoming_length, incoming_length), dtype=torch.float) * float('-inf'),
+        diagonal=1
+        )
+    
+    ## Memory can attend to all memory tokens
+    #mask[:total_length, :memory_length] = 0
+    #mask[:memory_length, :total_length] = 0
+    return mask
+
 def lambda_init_fn(depth):
     return 0.8 - 0.6 * math.exp(-0.3 * depth)
 def quaternion_multiply(q1, q2):

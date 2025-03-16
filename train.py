@@ -247,7 +247,10 @@ ggauss              = False #or best
 gfft                = False #or best
 gnorm               = False #or best
 gzca_enabled        = False #or best
-soft_wnorm_enabled  = False #or best
+soft_wnorm_enabled  = False or best
+#for fftmem owt: 1e-5
+#for fftmem skspr: 5e-5
+swna = 1e-5 
 zcastep = 2 #2, 5
 szcapow = 2 #2, 10
 
@@ -532,7 +535,7 @@ def snormstep(p, alpha):
     return (p.data - ((p.data - w_avg) / w_range)  ) * alpha 
 
 #@torch.compile(backend='cudagraphs')
-def softwnorm(model, alpha = 5e-5):
+def softwnorm(model, alpha = swna):
     for i, p in enumerate(model.parameters()):
         if p.requires_grad:
             if p.ndim >= 2:
@@ -637,7 +640,7 @@ if(True): #i hate white space significance. (this is for that profiler and i'm l
                     })
                 if losses['val'] < best_val_loss or always_save_checkpoint:
                     best_val_loss = losses['val']
-                    if(False and dataset == 'shakespeare_char'):
+                    if(True and dataset == 'shakespeare_char'):
                         with torch.no_grad():
                             outp = model.generate(X[0].unsqueeze(0), 100, temperature=0.01, top_k=200)
                         #print('---------------')

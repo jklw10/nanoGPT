@@ -15,39 +15,30 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import utils
+import wackmodel
 
 #settings :)
 #known good
 diffSplits      = 1
 ssmax           = True
-#good in shkspr
-qrot            = False
-mix_squish      = True
-#bad
+#ungraded
 fftmem          = True
-CausalMem          = True
+#good in shkspr
+mix_squish      = False #or fftmem
+mem_mix_squish  = False #or fftmem
+#bad
+CausalMem       = False
 convemb         = False
 emamem          = False
 diffembd        = False
 qope            = False
 side_squish     = False
 #slow
-spl             = True 
+spl             = False or fftmem
+qrot            = False
 think           = False
 repeat_block    = False
 repeatCenter    = False
-
-class CausalConv1d2(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, dilation=1, **kwargs):
-        super().__init__()
-        self.kernel_size = kernel_size
-        self.dilation = dilation
-        self.padding = ((kernel_size - 1) * dilation, 0) 
-        
-        self.conv1d = nn.Conv1d(in_channels,out_channels, kernel_size, **kwargs)
-
-    def forward(self, seq):
-        return self.pseudopatcher(F.pad(seq,self.padding)).contiguous()
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -61,11 +52,9 @@ class LayerNorm(nn.Module):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
 
-
-
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config, causal):
+    def __init__(self, config, causal, memorymix):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
@@ -73,8 +62,8 @@ class CausalSelfAttention(nn.Module):
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         
-        self.causal = causal
 
+        self.causal = causal
         #self.splits = 1
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
@@ -91,11 +80,9 @@ class CausalSelfAttention(nn.Module):
         if(ssmax):
             self.qm = nn.Parameter(torch.ones(self.head_dim).normal_(mean=1, std=0.1))
             self.qb = nn.Parameter(torch.zeros(self.head_dim).normal_(mean=0, std=0.1))
-        if(fftmem):
-            #self.attn_mask = create_memory_causal_mask(config.block_size//2,config.block_size//2)
-            
-            self.attn_mask=None
-            #self.register_buffer("attn_mask", utils.create_memory_causal_mask(config.block_size//2,config.block_size//2))
+        if(fftmem and memorymix and self.causal and not mem_mix_squish):
+            self.register_buffer("attn_mask", utils.create_memory_causal_mask(config.block_size,config.block_size))
+            self.causal = False
         else:
             self.attn_mask=None
         #self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.bfloat16).normal_(mean=0,std=0.1))
@@ -120,7 +107,7 @@ class CausalSelfAttention(nn.Module):
         return res
 
     
-    def forward(self, x):
+    def forward(self, x, maskless=False):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         device = x.device
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -167,7 +154,10 @@ class CausalSelfAttention(nn.Module):
             ys = []
             for i in range(diffSplits):#+self.qb
                 if(ssmax):
-                    ys.append(torch.nn.functional.scaled_dot_product_attention(qs[i]*(math.log(T)*self.qm), ks[i], v, attn_mask=self.attn_mask, dropout_p=self.dropout if self.training else 0, is_causal= self.causal))
+                    if(maskless):
+                        ys.append(torch.nn.functional.scaled_dot_product_attention(qs[i]*(math.log(T)*self.qm), ks[i], v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal= True))
+                    else:
+                        ys.append(torch.nn.functional.scaled_dot_product_attention(qs[i]*(math.log(T)*self.qm), ks[i], v, attn_mask=self.attn_mask, dropout_p=self.dropout if self.training else 0, is_causal= self.causal))
                 else:
                     ys.append(torch.nn.functional.scaled_dot_product_attention(qs[i], ks[i], v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=self.causal))
                         
@@ -214,74 +204,6 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
-class Softmaxless_attention(nn.Module):
-
-    def __init__(self, config, d):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head 
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-
-        self.head_dim =  self.n_embd //  self.n_head
-
-        self.qm = nn.Parameter(torch.ones(self.head_dim).normal_(mean=1, std=0.1))
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                    .view(1, 1, config.block_size, config.block_size))
-
-    def justnorm(self, x):
-        #return F.normalize(x, p=2, dim=-1)
-        res = x / x.norm(p=2, dim=-1, keepdim=True)
-        return res
-
-    
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-        q = q * (math.log(T)*self.qm)
-        # Split q and k for the diff part
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float(0))
-        att = att / att.norm()
-        att = self.attn_dropout(att)
-        y = (att @ v)
-        #y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-
-        y = y.transpose(1, 2).contiguous().view(B, T, self.n_head * self.splits * self.head_dim) # re-assemble all head outputs side by side
-
-        #y = mmnorm(y)
-
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        return y
-
-
-class GapRelu2D(nn.Module):
-    def __init__(self):
-        super(GapRelu2D, self).__init__()
-
-    def forward(self, x):
-        x1h, x2h = x.chunk(2, dim=2)
-        x1=torch.relu(x1h)
-        x2=(torch.sign(x1h)+1) * x2h
-        return x1+x2
-
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -309,49 +231,20 @@ class MLP(nn.Module):
             x = x_rotated.view(b, t, 2 * self.n_embd)
             #x = utils.fft_trunc_csquish(x) //meh
         else:
-            x=self.gelu(x)
+            x = fast_sin_relu(x) #F.leaky_relu(x)+torch.sin(x)*F.leaky_relu(torch.sign(x))
+            #x=modified_sin_gelu_leaky(x)
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
-
-class QrotMLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.c_fc2   = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
-        self.n_embd = config.n_embd
-
-    def forward(self, x, y, xnorm=False, ynorm=True):
-        xb,xt,xn=x.shape
-        yb,yt,yn=y.shape
-        x = self.c_fc(x)
-        y = self.c_fc2(y)
-        
-        x4d = x.view(xb, xt, xn, 4) #(batch, seq_len, n_embd, 4)
-        if(xnorm):
-            x_norm = x4d.norm(dim=-1, keepdim=True) 
-            x_normalized = x4d / x_norm             
-        else:
-            x_normalized = x4d
-        
-        y4d = y.view(yb, yt, yn, 4) # (batch, seq_len, n_embd, 4)
-        if(ynorm):
-            y_norm = y4d.norm(dim=-1, keepdim=True) 
-            y_normalized = y4d / y_norm             
-        else:
-            y_normalized = y4d
+    
 
 
-        rotors = x_normalized
-        rotated = y_normalized
-        
-        x_rotated = utils.quaternion_multiply(rotors, rotated) 
-        x = x_rotated.view(xb, xt, 4 * xn)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
+
+def fast_sin_relu(x):
+     base = F.relu(x)
+     sine_mod = F.relu(torch.sign(x)) * torch.sin(1.25 * x)
+     return base + sine_mod
+
 
 def quaternionize(x):
     b,t,n=x.shape
@@ -369,38 +262,15 @@ class Block(nn.Module):
         res = x / x.norm(p=2, dim=-1, keepdim=True)
         return res
 
-    def __init__(self, config, causal):
+    def __init__(self, config, causal, memorymix=False):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config, causal)
+        self.attn = CausalSelfAttention(config, causal,memorymix)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        #x = x + self.attn(x)
-        #x = x + self.mlp(x)
-        #x = mmnorm(x)
-        return x
-
-class uBlock(nn.Module):
-
-    
-    def justnorm(self, x):
-        #return F.normalize(x, p=2, dim=-1)
-        res = x / x.norm(p=2, dim=-1, keepdim=True)
-        return res
-
-    def __init__(self, config, d):
-        super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = Softmaxless_attention(config,d)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
-
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, maskless=False):
+        x = x + self.attn(self.ln_1(x),maskless)
         x = x + self.mlp(self.ln_2(x))
         #x = x + self.attn(x)
         #x = x + self.mlp(x)
@@ -418,42 +288,6 @@ class eBlock(nn.Module):
         x = x + self.mlp(x)
         x = utils.mmnorm(x)
         return x
-
-
-
-
-class PatchEmbedder(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.max_patch = config.patch_max
-        self.n_embd = config.n_embd
-        
-        # Learnable pooling weights
-        self.pool_proj = nn.Linear(config.n_embd, 3)  # For mean/max/attention
-        self.mlp = nn.Sequential(
-            nn.Linear(3 * config.n_embd, config.n_embd),
-            nn.GELU(),
-            nn.Linear(config.n_embd, config.n_embd)
-        )
-        
-    def forward(self, x, lengths):
-        # x: (B, T, D), lengths: (B,)
-        
-        # Dynamic pooling with learned weights
-        weights = torch.softmax(self.pool_proj(x), dim=-1)  # (B, T, 3)
-        
-        # Mask out padding
-        mask = torch.arange(x.size(1), device=x.device)[None] < lengths[:, None]
-        mask = mask.float().unsqueeze(-1)  # (B, T, 1)
-        
-        # Pooled features
-        mean_pool = (x * mask * weights[..., 0]).sum(1) / (lengths[:, None] + 1e-6)
-        max_pool = (x * mask * weights[..., 1]).max(1).values
-        attn_pool = (x * mask * weights[..., 2]).sum(1)
-        
-        combined = torch.cat([mean_pool, max_pool, attn_pool], dim=-1)
-        return self.mlp(combined)
-
 
 class Dreamer(nn.Module):
     def __init__(self, config):
@@ -519,26 +353,21 @@ class GPT(nn.Module):
             wpe = nn.Embedding(config.internal_block_size, config.n_embd),
             #pwpe = nn.Embedding(self.patch_max, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config, True) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config, True, (i>=1 and not mem_mix_squish and fftmem)) for i in range(config.n_layer)]),
             #h = nn.ModuleList([uBlock(config,i) for i in range(config.n_layer-1)]).append(Block(config,config.n_layer-1)),
             #h = nn.ModuleList([uBlock(config,i) for i in range(config.n_layer-1)]),
             #h = Block(config), #nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
-        if(convemb):
-            self.lm_head = nn.Linear(config.n_embd, config.vocab_size * self.patch_max, bias=False)
-        else:
-            self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        
 
-        self.embmix = nn.Sequential(
+        
+        if(False): #don't remember
+            self.embmix = nn.Sequential(
                 nn.Linear(config.n_embd*2, config.n_embd*2),
                 nn.GELU(),
                 nn.Linear(config.n_embd*2, config.n_embd)
             )
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
         if(think):
             self.thinkthreshold = nn.Parameter(torch.ones(1))
             self.thinkstop = nn.Sequential(
@@ -547,11 +376,15 @@ class GPT(nn.Module):
                 nn.Linear(config.n_embd, 1)
             )
         if(qope):
-            self.qoper = QrotMLP(config)
+            self.qoper = wackmodel.QrotMLP(config)
         if(diffembd):
             self.register_buffer('gmask', utils.gaussian_kernel(torch.ones(self.config.n_embd)))
         if(fftmem ):
-            self.register_buffer('memory', torch.zeros(1,config.internal_block_size,config.n_embd//2))
+            if(mem_mix_squish):
+                self.register_buffer('memory', torch.zeros(1,config.internal_block_size,config.n_embd//2))
+            else:
+                self.register_buffer('memory', torch.zeros(1,config.internal_block_size,config.n_embd))
+
             self.dreamer = Dreamer(config)
             self.memory_selector = Block(config,CausalMem)
         if(emamem ):
@@ -562,6 +395,7 @@ class GPT(nn.Module):
             self.memory.data.zero_()  
         self.surprise = 1
         if(convemb):
+            self.lm_head = nn.Linear(config.n_embd, config.vocab_size * self.patch_max, bias=False)
             #self.pseudopatcher = nn.Conv1d(config.n_embd, config.n_embd, self.ksize, stride=self.stride, bias=False)#, padding='same')# padding=0, stride=7 )
             self.pseudopatcher = nn.Conv1d(self.bembwidth, self.bembwidth, self.ksize, stride=self.stride, bias=False)
             self.padding = (self.ksize-1, 0) 
@@ -572,6 +406,11 @@ class GPT(nn.Module):
                 nn.Linear(config.n_embd, config.n_embd)
             ) #eBlock(config,1)
         else:
+            self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+            # with weight tying when using torch.compile() some warnings get generated:
+            # "UserWarning: functional_call was passed multiple values for tied weights.
+            # This behavior is deprecated and will be an error in future versions"
+            # not 100% sure what this is, so far seems to be harmless. TODO investigate
             self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
         
         self.predict_weight = 0.01
@@ -616,7 +455,6 @@ class GPT(nn.Module):
             if(qope):
                 x = self.qoper(tok_emb,pos_emb.expand(b,t,self.config.n_embd),False,False)
             else:
-                #x = self.embmix(torch.cat((tok_emb, pos_emb.expand(b,t,self.config.n_embd)), dim=-1))
                 x = tok_emb + pos_emb
         x = self.transformer.drop(x)
 
@@ -629,31 +467,45 @@ class GPT(nn.Module):
         i=0
         if(fftmem and self.training):
             xswish = torch.cat([x[b//2:,:,],x[:b//2,:,:]],dim=0)
-            fh = self.memory.expand(b,t,self.config.n_embd//2)
+            if(mem_mix_squish):
+                fh = self.memory.expand(b,t,self.config.n_embd//2)
             for block in self.transformer.h:
                 i+=1 
                 xswish = block(xswish)
-                if(not(i == 1 or i == self.config.n_layer)):
-                    if(mix_squish):
+                if(mem_mix_squish):
+                    if(not(i == 1 or i == self.config.n_layer)):
                         sh = utils.fft_trunc_csquish(xswish)
                         if (i) % 2 == 0:
                             xswish = torch.stack([fh,sh],dim =-1).flatten(start_dim=-2,end_dim=-1)
                         else:
                             xswish = torch.stack([sh,fh],dim =-1).flatten(start_dim=-2,end_dim=-1)
+                elif i == 1:
+                    xswish = torch.cat([self.memory.expand(b,t,self.config.n_embd), xswish], dim=1)
             
-            selectedMemory = self.memory_selector(xswish)#(b,t,c)
-            selectedMemory = utils.fft_trunc_csquish(selectedMemory) #(b,t,c//2)
-            first_mem = torch.stack([selectedMemory, fh],dim =-1).flatten(start_dim=-2,end_dim=-1) #(b,t,c)
-            first_mem = self.dreamer(first_mem)
-            first_mem = utils.fft_trunc_csquish(first_mem)#(b,t,c//2)
-            #first_mem = first_mem.mean(dim=0).unsqueeze(0)
-            fh = first_mem.expand(b,t,self.config.n_embd//2)#(b,t,c//2)
-            
+            if(mem_mix_squish):
+                selectedMemory = self.memory_selector(xswish)#(b,t,c)
+                selectedMemory = utils.fft_trunc_csquish(selectedMemory) #(b,t,c//2)
+                first_mem = torch.stack([selectedMemory, fh],dim =-1).flatten(start_dim=-2,end_dim=-1) #(b,t,c)
+                first_mem = self.dreamer(first_mem)
+                first_mem = utils.fft_trunc_csquish(first_mem)#(b,t,c//2)
+                #first_mem = first_mem.mean(dim=0).unsqueeze(0)
+                fh = first_mem.expand(b,t,self.config.n_embd//2)#(b,t,c//2)
+            else:
+                #could be better but it works
+                selectedMemory = self.memory_selector(xswish[:,:t,:])#(b,t,c)
+                selectedMemory = utils.fft_trunc_tsquish(selectedMemory) #(b,t//2,c)
+                squishmem = utils.fft_trunc_tsquish(self.memory).expand(b,t//2,self.config.n_embd) #(b,t//2,c)
+                first_mem = torch.cat([selectedMemory,squishmem],dim =1) #(b,t,c)
+                first_mem = self.dreamer(first_mem).expand(b,t,self.config.n_embd)
+        
         if(fftmem and not self.training):
-            fh = self.memory.expand(b,t,self.config.n_embd//2)
+            if(mem_mix_squish):
+                fh = self.memory.expand(b,t,self.config.n_embd//2)
+            else:
+                first_mem = self.memory.expand(b,t,self.config.n_embd)
         i=0
         iters=0
-        if(mix_squish and not fftmem):
+        if(mix_squish and not (fftmem and mem_mix_squish)):
             fh = utils.fft_trunc_csquish(x)
         for block in self.transformer.h:
             i+=1 
@@ -661,7 +513,6 @@ class GPT(nn.Module):
                 block_inputs.append(x) 
                 
             x = block(x)
-            
             if(not(i == 1 or i == self.config.n_layer)):
                 if(mix_squish):
                     sh = utils.fft_trunc_csquish(x)
@@ -680,23 +531,31 @@ class GPT(nn.Module):
                         iters+=~t
                         if((iters >= 10).any()):
                             break
+            
+            if(not mem_mix_squish and i == 1):
+                x = torch.cat([first_mem, x], dim=1)
         
         if fftmem and self.training:
             with torch.no_grad():
-                selectedMemory = self.memory_selector(x)#(b,t,c)
-                selectedMemory = utils.fft_trunc_csquish(selectedMemory) #(b,t,c//2)
-                updated_mem = torch.stack([selectedMemory,fh],dim =-1).flatten(start_dim=-2,end_dim=-1) #(b,t,c)
-                updated_mem = self.dreamer(updated_mem)
-                updated_mem = utils.fft_trunc_csquish(updated_mem)#(b,t,c//2)
-                #updated_mem = updated_mem.mean(dim=0).unsqueeze(0)
-                #updated_mem = utils.fft_trunc_csquish(updated_mem)
+                if(mem_mix_squish):
+                    selectedMemory = self.memory_selector(x)#(b,t,c)
+                    selectedMemory = utils.fft_trunc_csquish(selectedMemory) #(b,t,c//2)
+                    updated_mem = torch.stack([selectedMemory,fh],dim =-1).flatten(start_dim=-2,end_dim=-1) #(b,t,c)
+                    updated_mem = self.dreamer(updated_mem)
+                    updated_mem = utils.fft_trunc_csquish(updated_mem)#(b,t,c//2)
+                else:
+                    selectedMemory = self.memory_selector(x[:,:t,:])#(b,t,c)
+                    selectedMemory = utils.fft_trunc_tsquish(selectedMemory) #(b,t//2,c)
+                    squishmem = utils.fft_trunc_tsquish(first_mem).expand(b,t//2,self.config.n_embd) #(b,t,c)
+                    updated_mem = torch.cat([selectedMemory,squishmem],dim =1) #(b,t,c)
+                    updated_mem = self.dreamer(updated_mem)
                 self.memory.copy_(updated_mem)
 
         if(emamem):
             with torch.no_grad():
                 # Create temporary tensor for update
                 new_mem = x.mean(dim=0).detach().clone()
-                new_mem = utils.mmnorm(new_mem,dim = 0)
+                new_mem = utils.mmnorm(new_mem,dim = 0) #consider sleep block since it workes way too well for fftmem
                 updated_mem = 0.99 * self.memory + 0.01 * new_mem
                 self.memory.copy_(updated_mem)
         
@@ -705,7 +564,10 @@ class GPT(nn.Module):
             # if we are given some desired targets also calculate the loss
             
             #x = x * zeropower_via_newtonschulz(x.detach()).detach() # hacks time dim
-            logits = self.lm_head(x)
+            if(not mem_mix_squish):
+                logits = self.lm_head(x[:,t:,:])
+            else:
+                logits = self.lm_head(x)
             if(convemb):
                 #logits = self.lm_head(x)  # (b, t_internal, vocab_size * patch_max)
                 logits = logits.view(
@@ -726,10 +588,15 @@ class GPT(nn.Module):
                     targets_flat,
                     ignore_index=-1
                 )
+
                 loss = loss + pploss.mean()/(self.threshold/self.patch_max) #+ length_penalty
                     
             else:
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+                
+                if(fftmem and not mem_mix_squish):
+                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+                else:
+                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
                 #targ_emb = self.transformer.wte(targets)
                 #eloss = F.mse_loss(x, targ_emb).mean()
                 if(think):
@@ -737,15 +604,33 @@ class GPT(nn.Module):
                 
             if(spl):
                 for i in range(self.config.n_layer - 1, -1, -1):
-                    target_output = block_inputs[i]  # The target is the block input
-                    predicted_output = self.transformer.h[i](-x)  #use the negative direction of token space as the self prediction space
+                    if(fftmem and not mem_mix_squish):
+                        
+                        target_output = block_inputs[i]  # The target is the block input
+                        ##tokpred
+                        if(i < 1):
+                            target_output = block_inputs[i]  # The target is the block input
+                            predicted_output = self.transformer.h[i](-x[:,t:,:]) 
+                        else:
+                            target_output = block_inputs[i]  # The target is the block input
+                            predicted_output = self.transformer.h[i](-x,True)  #use the negative direction of token space as the self prediction space
 
-                    sploss = nn.functional.mse_loss(
-                        predicted_output.view(-1, self.config.n_embd),
-                        target_output.view(-1, self.config.n_embd)
-                    )
-                    if(self.training):
-                        loss = loss + sploss * self.predict_weight 
+                        sploss = nn.functional.mse_loss(
+                            predicted_output.view(-1, self.config.n_embd),
+                            target_output.view(-1, self.config.n_embd)
+                        ).mean()
+                        if(self.training):
+                            loss = loss + sploss * self.predict_weight 
+                    else:
+                        target_output = block_inputs[i]  # The target is the block input
+                        predicted_output = self.transformer.h[i](-x)  #use the negative direction of token space as the self prediction space
+
+                        sploss = nn.functional.mse_loss(
+                            predicted_output.view(-1, self.config.n_embd),
+                            target_output.view(-1, self.config.n_embd)
+                        )
+                        if(self.training):
+                            loss = loss + sploss * self.predict_weight 
 
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
