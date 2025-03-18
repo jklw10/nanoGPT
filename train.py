@@ -638,11 +638,23 @@ if(True): #i hate white space significance. (this is for that profiler and i'm l
                         "lr": lr,
                         "mfu": running_mfu*100, # convert to percentage
                     })
+                #if(True and dataset == 'shakespeare_char'):
+                #        with torch.no_grad():
+                #            model.eval()
+                #            outp = model.generate(X[0].unsqueeze(0), 100, temperature=0.01, top_k=200)
+                #            model.train()
+                #        #print('---------------')
+                #        #print(decode(Y[0].detach().cpu().numpy().tolist()))
+                #        print('---------------')
+                #        print(decode(outp[0].detach().cpu().numpy().tolist()))
+                #        print('---------------')
                 if losses['val'] < best_val_loss or always_save_checkpoint:
                     best_val_loss = losses['val']
-                    if(True and dataset == 'shakespeare_char'):
+                    if(False and dataset == 'shakespeare_char'):
                         with torch.no_grad():
+                            model.eval()
                             outp = model.generate(X[0].unsqueeze(0), 100, temperature=0.01, top_k=200)
+                            model.train()
                         #print('---------------')
                         #print(decode(Y[0].detach().cpu().numpy().tolist()))
                         print('---------------')

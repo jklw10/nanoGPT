@@ -51,20 +51,27 @@ def modified_sin_gelu_leaky(x, leaky=0.01):
      sine_mod = torch.where(x >= 0, torch.sin(1.25 * x), x * leaky)
      return base + sine_mod
 def create_memory_causal_mask(memory_length, incoming_length):
+    # Create a mask that allows attending to memory tokens and implements
+    # causal attention for the incoming tokens
     total_length = memory_length + incoming_length
+    mask = torch.zeros((incoming_length, total_length), dtype=torch.bool)
     
-    # Create a 2D mask tensor initialized with zeros (allows attention)
-    mask = torch.zeros((total_length, total_length), dtype=torch.float)
+    # Allow attending to all memory tokens
+    mask[:, :memory_length] = True
     
-    # Create the causal mask for the token-to-token section
-    token_indices = slice(memory_length, total_length)
+    # For incoming tokens, implement causal masking
+    for i in range(incoming_length):
+        mask[i, memory_length:memory_length+i+1] = True
     
-    # Fill upper triangular part with -inf to prevent attention in those positions
-    mask[token_indices, token_indices] = torch.triu(
+    # Convert to attention mask format (False where attention is allowed)
+    return ~mask
+def create_memory_causal_mask4(memory_length, incoming_length):
+    total_length = memory_length + incoming_length
+    mask = torch.zeros((total_length,incoming_length))
+    mask[incoming_length:,:] = torch.triu(
         torch.ones((incoming_length, incoming_length), dtype=torch.float) * float('-inf'),
         diagonal=1
-    )
-    
+        )
     return mask
 
 def create_memory_causal_mask2(memory_length, incoming_length):
@@ -74,10 +81,10 @@ def create_memory_causal_mask2(memory_length, incoming_length):
         torch.ones((incoming_length, incoming_length), dtype=torch.float) * float('-inf'),
         diagonal=1
         )
-    
-    ## Memory can attend to all memory tokens
-    #mask[:total_length, :memory_length] = 0
-    #mask[:memory_length, :total_length] = 0
+    #mask[incoming_length:,:incoming_length] = torch.triu(
+    #    torch.ones((incoming_length, incoming_length), dtype=torch.float) * float('-inf'),
+    #    diagonal=1
+    #    )
     return mask
 
 def lambda_init_fn(depth):
