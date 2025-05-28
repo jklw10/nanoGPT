@@ -17,8 +17,7 @@ def unfunnyMulti(x, y):
 
 def mmnorm(x, dim = -1, scale = None):  
     if(scale is None):
-        input_size = x.size(dim)
-        scale = (1 + 2 / input_size)
+        scale = 1 + 2 / x.nelement() #changed recently
     w_avg = x.mean(dim=dim, keepdim=True)
     w_range = torch.abs(x.max(dim=dim, keepdim=True)[0] - x.min(dim=dim, keepdim=True)[0] + 1e-10)
     return ((x - w_avg) / w_range) * scale
@@ -108,12 +107,10 @@ def quaternion_multiply(q1, q2):
     k_part    = a * h + b * g - c * f + d * e
     return torch.stack([real_part, i_part, j_part, k_part], dim=-1)
 
-def zca_newton_schulz(G, epsilon=1e-5, steps=2, power_iters=2):
-    if G.ndim < 3:
+@torch.compile(backend='cudagraphs')
+def zca_newton_schulz(G, epsilon=1e-5, steps=5, power_iters=10):
+    if G.ndim < 2:
         return G
-    original_shape = G.shape
-    G = G.view(-1, original_shape[-1])  # Flatten to (batch*seq_len, features)
-            
     G = G - G.mean(dim=0, keepdim=True)
     n, d = G.shape
     device, dtype = G.device, G.dtype
@@ -128,7 +125,7 @@ def zca_newton_schulz(G, epsilon=1e-5, steps=2, power_iters=2):
         u = u / u.norm()
         v = torch.matmul(Cov.T, u)
         v = v / v.norm()
-    s = torch.matmul(u.T, torch.matmul(Cov, v))
+    s = torch.matmul(u.T, torch.matmul(Cov, v))#.squeeze()
     
     # Scale Cov to ensure convergence
     B = Cov / s
@@ -141,7 +138,7 @@ def zca_newton_schulz(G, epsilon=1e-5, steps=2, power_iters=2):
     # Rescale to get Cov^{-1/2}
     W = Y / (s ** 0.5)
     
-    return torch.matmul(G, W).view(original_shape)
+    return torch.matmul(G, W)
 
 def fftnorm(grad,center=0.5,sigma=0.5, dim=None):
     if(grad.ndim>=2):
@@ -194,6 +191,7 @@ def fft_bmean_tsquish_add(x, x2):
         xc /= 2
     
     return torch.fft.ifft(xc,dim=1).real
+
 
 def fft_trunc_tsquish(x):
     b,t,c = x.size()

@@ -39,12 +39,6 @@ class PatchEmbedder(nn.Module):
         return self.mlp(combined)
 class uBlock(nn.Module):
 
-    
-    def justnorm(self, x):
-        #return F.normalize(x, p=2, dim=-1)
-        res = x / x.norm(p=2, dim=-1, keepdim=True)
-        return res
-
     def __init__(self, config, d):
         super().__init__()
         self.ln_1 = model.LayerNorm(config.n_embd, bias=config.bias)
@@ -135,10 +129,6 @@ class Softmaxless_attention(nn.Module):
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                     .view(1, 1, config.block_size, config.block_size))
 
-    def justnorm(self, x):
-        #return F.normalize(x, p=2, dim=-1)
-        res = x / x.norm(p=2, dim=-1, keepdim=True)
-        return res
 
     
     def forward(self, x):
@@ -167,6 +157,171 @@ class Softmaxless_attention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
+class Patcher(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.ksize = 8
+        self.patch_max = 10
+        self.bembwidth = config.n_embd//2
+        self.threshold= nn.Parameter(torch.ones(1))
+        self.end_patch_token_id = config.vocab_size-1
+        
+        self.pseudopatcher = nn.Conv1d(self.bembwidth, self.bembwidth, self.ksize, stride=1, bias=False)
+        self.padding = (self.ksize-1, 0) 
+        
+        self.embedder = nn.Sequential(
+            nn.Linear(config.n_embd*self.patch_max, config.n_embd),
+            nn.GELU(),
+            nn.Linear(config.n_embd, config.n_embd)
+        ) #eBlock(config,1)
+
+    def loss(self, logits, patchtargets, pploss):
+        logits = logits.view(
+            logits.size(0), 
+            logits.size(1), 
+            self.patch_max, 
+            self.config.vocab_size
+        )   # (b, t_internal, patch_max, vocab_size)
+        logits_flat = logits.contiguous().view(-1, self.config.vocab_size)  # (b * t_internal * patch_max, vocab_size)
+        targets_flat = patchtargets.contiguous().view(-1)  # (b * t_internal * patch_max)
+        loss = F.cross_entropy(
+            logits_flat, 
+            targets_flat,
+            ignore_index=-1
+        )
+        return loss + pploss.mean()/(self.threshold/self.patch_max) #+ length_penalty
+                    
+
+    def forward(self, idx):
+          #torch.compiler.cudagraph_mark_step_begin() # Add this line at the beginning of forward
+        device = idx.device
+        b, t = idx.size()
+
+        device = idx.device
+        b, t = idx.shape
+
+        pos = torch.arange(0, self.patch_max, dtype=torch.long, device=device)
+        pos_emb = self.transformer.wpe(pos)
+        tok_emb = self.transformer.wte(idx).permute(0, 2, 1).contiguous()
+        pred_idx = self.pseudopatcher(F.pad(tok_emb[:, :self.bembwidth, :], self.padding))#.permute(0, 2, 1).contiguous()
+        losses = F.mse_loss(tok_emb[:, :self.bembwidth, :-1], pred_idx[:, :, 1:], reduction='none').mean(dim=1)#.permute(0, 2, 1).contiguous()  
+        
+        #tok_emb = tok_emb.permute(0, 2, 1).contiguous()
+        
+        endtok= torch.as_tensor(self.end_patch_token_id,device=device,dtype=torch.long)
+        patch_indices = torch.full((b, self.config.internal_block_size+2, self.patch_max+1), -1, dtype=torch.long, device=device)
+        
+        patch_embeds = torch.zeros((b, self.config.internal_block_size+2, self.patch_max, self.config.n_embd), device=device)
+        accumulated_loss = torch.zeros(b, device=device)
+        patch_deposit_idx = torch.zeros(b, dtype=torch.long, device=device)
+        patch_length_idx = torch.zeros(b, dtype=torch.long, device=device)
+        batch_indices = torch.arange(b, device=device)  # Explicit batch indices
+        
+
+        for current_token_index in range(t-1): 
+            loss_value = losses[:, current_token_index]
+            accumulated_loss = accumulated_loss + loss_value 
+            cond1 = torch.gt(accumulated_loss,self.threshold  )
+            cond2 = torch.ge(patch_length_idx,self.patch_max-1)
+            mask = cond1 | cond2
+            #if loss is greater, or max length is reached, start setting values into the next patch
+            patch_deposit_idx = patch_deposit_idx + (mask) 
+            #if patch doesn't end, increment patch length else reset patch length
+            patch_length_idx = patch_length_idx + (~mask)
+            patch_length_idx = patch_length_idx * (~mask)
+            #if patch ends, reset patch accumulated loss
+            accumulated_loss = accumulated_loss * (~mask)  
+
+            patch_indices[batch_indices,patch_deposit_idx, patch_length_idx] = idx[batch_indices, current_token_index]
+            patch_embeds[batch_indices, patch_deposit_idx, patch_length_idx, :] = tok_emb[batch_indices, :, current_token_index]
+            
+            patch_indices[batch_indices,patch_deposit_idx, patch_length_idx+1] = endtok
+        
+        patch_indices= patch_indices.narrow(-1,0,self.patch_max).contiguous()#trim the end, hacky, but eh.
+
+
+        pos_emb = pos_emb.flatten(start_dim=0,end_dim=-1).unsqueeze(0).unsqueeze(0).contiguous()
+        toemb = pos_emb + torch.flatten(patch_embeds, start_dim=2, end_dim=-1)
+        patch_embeds = self.embedder(toemb)
+
+        pb, pt, pe = patch_embeds.size()
+        patch_embeds = patch_embeds[:,-(pt):-2,:] #(b, t_internal, n_embed)
+        
+        patch_targets = patch_indices[:,-(pt-1):-1,:] #(b, t_internal, patchmax)
+        
+        patch_embeds = patch_embeds 
+        return patch_embeds, patch_targets, losses
+    
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        block_size = self.config.block_size
+        patch_max = self.patch_max
+        vocab_size = self.config.vocab_size
+        batch_size = idx.size(0) # Get batch size
+
+        generated_tokens = 0
+        finished_batches = torch.zeros(batch_size, dtype=torch.bool, device=idx.device) # Track finished batches
+        next_indices_list = [] # List to accumulate generated indices for each batch
+
+        # Initialize next_indices_list with current idx sequences
+        for i in range(batch_size):
+            next_indices_list.append(idx[i].clone()) # Clone to avoid modifying original idx
+
+        for _ in range(max_new_tokens // patch_max):
+            if generated_tokens >= max_new_tokens or torch.all(finished_batches): # Stop condition
+                break
+
+            # Prepare input for the model, handling sequence length cropping
+            current_idx_batch = []
+            for i in range(batch_size):
+                current_seq = next_indices_list[i]
+                if current_seq.size(0) > block_size:
+                    current_seq = current_seq[-block_size:] # Crop if too long
+                current_idx_batch.append(current_seq)
+            idx_cond = torch.stack(current_idx_batch) # Stack into a batch
+
+            logits, _ = self(idx_cond)
+            logits_reshaped = logits.view(batch_size, -1, patch_max, vocab_size)
+            patch_logits = logits_reshaped[:, -1, :, :]
+
+            next_patch_tokens_batch = []
+            for batch_idx in range(batch_size):
+                if finished_batches[batch_idx]:
+                    next_patch_tokens_batch.append(None) # Placeholder for finished batch
+                    continue
+
+                current_batch_patch_tokens = []
+                for patch_pos in range(patch_max):
+                    pos_logits = patch_logits[batch_idx, patch_pos, :] / temperature
+                    if top_k is not None:
+                        v_topk, _ = torch.topk(pos_logits, min(top_k, pos_logits.size(-1)))
+                        pos_logits[pos_logits < v_topk[..., [-1]]] = -float('Inf')
+                    probs = F.softmax(pos_logits, dim=-1)
+                    idx_next_token = torch.multinomial(probs, num_samples=1)
+
+                    current_batch_patch_tokens.append(idx_next_token)
+                    generated_tokens += 1
+
+                    if idx_next_token.item() == self.end_patch_token_id:
+                        finished_batches[batch_idx] = True
+                        break
+                    if generated_tokens >= max_new_tokens:
+                        break
+                if not finished_batches[batch_idx]:
+                    next_patch_tokens_batch.append(torch.cat(current_batch_patch_tokens))
+                else:
+                    next_patch_tokens_batch.append(torch.tensor([], dtype=torch.long, device=idx.device)) # Empty tensor for finished
+
+            # Update next_indices_list with generated patch tokens
+            for batch_idx in range(batch_size):
+                if not finished_batches[batch_idx]:
+                    patch_tokens = next_patch_tokens_batch[batch_idx]
+                    next_indices_list[batch_idx] = torch.cat((next_indices_list[batch_idx], patch_tokens))
+
+
+        # Stack the list of sequences back into a batch tensor for return
+        #idx_result = torch.cat(next_indices_list)
+        return next_indices_list
 
 class GapRelu2D(nn.Module):
     def __init__(self):

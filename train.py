@@ -29,6 +29,7 @@ import torch._inductor.config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 from model import GPTConfig, GPT
+import utils
 
 
 torch._dynamo.optimize()
@@ -224,21 +225,22 @@ if block_size < model.config.block_size:
 model.to(device)
 
 
-best                = True
+best                = False
 
-
+gradorth            = False
 mnorm_enabled       = False
 #wack
 dfw_enabled         = False
-wwhitening_enabled  = False
 decor_enabled       = False
 #rough
 wnorm_enabled       = False
 gdiff_enabled       = False
 grokfast            = False
 sign_enabled        = False
+
 gwhitening_enabled  = False
 #??
+wwhite_enabled      = False
 gsphere             = False
 ndiff_enabled       = False
 gchaos              = False #or best
@@ -250,11 +252,11 @@ gzca_enabled        = False #or best
 soft_wnorm_enabled  = False or best
 #for fftmem owt: 1e-5
 #for fftmem skspr: 5e-5
-swna = 1e-5 
+swna = 1e-5
 zcastep = 2 #2, 5
 szcapow = 2 #2, 10
 
-ghook = gdiff_enabled or ndiff_enabled or gnorm or dfw_enabled or grokfast or gwhitening_enabled or gfft or gzca_enabled or sign_enabled or gsphere or ggauss or gchaos
+ghook = gdiff_enabled or ndiff_enabled or gnorm or dfw_enabled or grokfast or gwhitening_enabled or gfft or gzca_enabled or sign_enabled or gsphere or ggauss or gchaos or gradorth
 
 decay = False
 decaying = 1.0
@@ -403,7 +405,7 @@ def zeropower_via_newtonschulz(G, steps=5, eps=1e-10):
         X = X.T
     return X.to(G.dtype)
 
-def fftnorm(grad,center=0.5,sigma=0.5):
+def fft_squish(grad,center=0.5,sigma=0.5):
     if(grad.ndim>=2):
         adjusted_grad = torch.fft.fft2(grad) 
         gk = gaussian_kernel(adjusted_grad.real, center, sigma)
@@ -435,8 +437,7 @@ def gaussian_kernel(grad, center_offset: float, sigma = 3.0) -> torch.Tensor:
     return kernel.view(size)
 
 #@torch.compile(backend='cudagraphs')
-def custom_gradient_adjustment(grad, param, weight_ema = None, gema = 0.0, decaying = 1.0):
-    #print(grad.size())
+def custom_gradient_adjustment(grad, param, weight_ema = None, gema = 0.0):
     if(grad is None):
         return
     input_size = grad.size(0)
@@ -453,14 +454,23 @@ def custom_gradient_adjustment(grad, param, weight_ema = None, gema = 0.0, decay
     if(gsphere and d2): 
         adjusted_grad = adjusted_grad / adjusted_grad.norm() # * (2 - 2 / input_size) 
     if(gfft):
-        adjusted_grad = fftnorm(adjusted_grad)
+        adjusted_grad = fft_squish(adjusted_grad)
     if(sign_enabled):
         adjusted_grad = torch.sign(torch.round(adjusted_grad)) 
     if(gwhitening_enabled and d2):
         adjusted_grad = zeropower_via_newtonschulz(adjusted_grad)
     if(gzca_enabled and d2):
         adjusted_grad = zca_newton_schulz(adjusted_grad, zcastep, szcapow)
-
+    if(gradorth):
+        w = p.view(-1)
+        g = p.grad.view(-1)
+        w_norm_sq = torch.dot(w, w) + 1e-30
+        proj = torch.dot(w, g) / w_norm_sq
+        g_orth = g - proj * w
+        g_norm = g.norm(2)
+        g_orth_norm = g_orth.norm(2) + 1e-30
+        g_orth_scaled = g_orth * (g_norm / g_orth_norm)
+        p.grad.copy_(g_orth_scaled.view_as(p.grad))
     if(ndiff_enabled):
         w_range = torch.abs(p.max() - p.min() + 1e-10)
         w_avg = param.nanmean()
@@ -522,13 +532,8 @@ def wnorm(model):
                 pstep = snormstep(p, a) 
                 p.data = p.data - pstep 
 
-
-
-#@torch.compile(backend='cudagraphs')
-
 @torch.compile(backend='cudagraphs')
 def snormstep(p, alpha):
-    #wsize = np.max((p.data.nelement(), 10.0)) * torch.ones(1,device =p.data.device,dtype =p.data.dtype)
     scale = 1 + 2 / p.data.nelement()
     w_avg = p.data.nanmean()
     w_range = torch.abs(p.data.max() - p.data.min() + 1e-10) / scale
@@ -552,7 +557,7 @@ def wwhite(model):
     for p in model.parameters():
         if p.requires_grad:
             with torch.no_grad():
-                p.data = zca_newton_schulz(p.data)
+                p.data = p.data + 1e-5*(p.data-utils.zca_newton_schulz(p.data))
 
 def justnorm(x, idim=-1):
     dtype = x.dtype
@@ -568,14 +573,11 @@ def normalize_matrices():
     for layer_idx in range(0, model.config.n_layer):
         block = model.transformer["h"][layer_idx]
 
-        #block.query.weight.data.copy_(justnorm(block.query.weight.data, 1))             # n_proj, n_embd
-        #block.key.weight.data.copy_(justnorm(block.key.weight.data, 1))                 # n_proj, n_embd
         block.attn.c_attn.weight.data.copy_(justnorm(block.attn.c_attn.weight.data, 1))             # n_proj, n_embd
         block.attn.c_proj.weight.data.copy_(justnorm(block.attn.c_proj.weight.data, 0))   # n_embd, n_proj
 
         block.mlp.c_fc.weight.data.copy_(justnorm(block.mlp.c_fc.weight.data, 1))               # n_proj, n_embd
         block.mlp.c_proj.weight.data.copy_(justnorm(block.mlp.c_proj.weight.data, 0))   # n_embd, n_proj
-
 
 scaler.is_enabled = False
 scaler = None
@@ -585,7 +587,9 @@ scaler = None
 
 
 tl = time.time()
-
+#with torch.no_grad():
+#    iter_num=0
+#    model.reinit_nonmem()
 #if(True and dataset == 'shakespeare_char'): #test if generation works asd
 #    with torch.no_grad():
 #        outp = model.generate(X, 100, temperature=0.01, top_k=200)
@@ -605,6 +609,8 @@ if(True): #i hate white space significance. (this is for that profiler and i'm l
 
         #if(dfw_enabled):
         #    wunfunny(model) 
+        if(wwhite_enabled):
+            wwhite(model)
         if(wnorm_enabled):
             wnorm(model)
         if(soft_wnorm_enabled):
@@ -682,6 +688,21 @@ if(True): #i hate white space significance. (this is for that profiler and i'm l
         if iter_num == 0 and eval_only:
             break
         
+        #if(iter_num >= 1 and iter_num < 15000):
+        #    if iter_num % 1000 == 0:
+        #        with torch.no_grad():
+        #            model.reinit_nonmem()
+        #if(iter_num >= 1000 and iter_num < 15000):
+        #    if iter_num % 1000 == 0:
+        #        model.memory_freezeToggle()
+        #        with torch.no_grad():
+        #            model.reinit_nonmem()
+        #    if iter_num % 1000 == 5:
+        #        model.memory_freezeToggle()
+        #if iter_num % 100 == 0 and iter_num % 1000 <= 500 and iter_num > 1000:
+        #    with torch.no_grad():
+        #        model.reinit_nonmem()
+        
         torch.compiler.cudagraph_mark_step_begin()
         #if iter_num % eval_interval == 0:
         #    torch.cuda.empty_cache()
@@ -753,6 +774,7 @@ if(True): #i hate white space significance. (this is for that profiler and i'm l
 
 
 
+torch.save(checkpoint, os.path.join(out_dir, 'fckpt.pt'))
 
 if ddp:
     destroy_process_group()
