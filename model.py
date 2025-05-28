@@ -24,6 +24,7 @@ import wackmodel
 #known good
 diffSplits      = 1
 ssmax           = True
+mtp             = True
 #ungraded
 fftmem          = False
 mmnorm          = False
@@ -525,7 +526,7 @@ class GPT(nn.Module):
             if not mem_mix_squish and fftmem:
                 x = block(x,first_mem)
             else:
-                x = block(x)
+                x = block(x) #todo multitoken multilayer duplicated 
 
             i+=1 
             if(mix_squish):
@@ -551,7 +552,7 @@ class GPT(nn.Module):
         if targets is not None:
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1) #to display the right loss on test runs
-            
+            #TODO: wavelet loss
             if(convemb):
                 loss = self.convemb.loss(logits, patchtargets, pploss)
             
