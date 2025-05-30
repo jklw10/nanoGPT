@@ -230,6 +230,17 @@ def gaussian_kernel(grad, center_offset: float, sigma = 3.0, dim=None) -> torch.
     return kernel.view(size)
 
 
+def mmdiem( a:torch.Tensor,b:torch.Tensor):
+    numel = a.numel()# torch.sqrt(torch.ones(1,device=a.device,dtype=a.dtype)* a.numel())
+    afl = a.flatten()
+    bfl = b.flatten()
+    arange = afl.max() - afl.min() + 1e-10
+    brange = bfl.max() - bfl.min() + 1e-10
+    anorm = (afl - afl.mean()) / (arange)
+    bnorm = (bfl - bfl.mean()) / (brange)
+    variance = torch.sqrt(a.var()*b.var()+1e-10)
+    return torch.dot(anorm, bnorm) /  numel / variance # + (torch.abs(arange-brange)) + torch.abs(a.var() - b.var())
+
 def fast_sin_relu(x):
      base = F.relu(x)
      sine_mod = F.relu(torch.sign(x)) * torch.sin(1.25 * x)

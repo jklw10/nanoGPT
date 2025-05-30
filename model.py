@@ -21,6 +21,7 @@ import wackmodel
 
 #todo
 #prediction machine
+
 #settings :)
 #known good
 diffSplits      = 1
@@ -254,11 +255,6 @@ class GPT(nn.Module):
             self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
         
         self.predict_weight = 0.01
-        self.dwt_transform =  DWT1DForward(
-                wave='db1',
-                mode='periodization', # Common boundary mode for DWT
-                J=1
-            )
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
@@ -280,7 +276,7 @@ class GPT(nn.Module):
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         
         
-        if(convemb):
+        if convemb:
             x, patchtargets, pploss= self.convemb(idx)
             pb, pt, pe = x.size()
             
@@ -291,99 +287,37 @@ class GPT(nn.Module):
             pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
             tok_emb = self.transformer.wte(idx)
             pos_emb = self.transformer.wpe(pos) # position embeddings of shape (b, t, n_embd)
-            if(qope):
+            if qope:
                 x = self.qoper(tok_emb,pos_emb.expand(b,t,self.config.n_embd),False,False)
             else:
                 x = tok_emb + pos_emb
         x = self.transformer.drop(x)
 
-        if(mtp):
+        if mtp:
             return self.mtp_fwd(targets, x)
             
+        if fftmem:
+            if mem_mix_squish:
+                return self.mem_mix_fwd(targets, x)
+            else:
+                return self.mem_fwd(targets, x)
+
+        if mix_squish:
+            fh = utils.fft_trunc_csquish(x)
         
-        if(spl):
+        if spl:
             block_inputs = []
 
-        i=0
-        if(fftmem and self.training):
-            xswish = torch.cat([x[b//2:,:,],x[:b//2,:,:]],dim=0)
-            if(mem_mix_squish):
-                fh = self.memory.expand(b,t,self.config.n_embd//2)
-                for block in self.transformer.h:
-                    if(not(i == 1 or i == self.config.n_layer)):
-                        sh = utils.fft_trunc_csquish(xswish)
-                        xswish = torch.stack([fh,sh],dim =-1).flatten(start_dim=-2,end_dim=-1)
-
-                    xswish = block(xswish)
-                selectedMemory = self.memory_selector(xswish, causal = False)#(b,t,c)
-                selectedMemory = utils.fft_trunc_csquish(selectedMemory) #(b,t,c//2)
-                first_mem = torch.stack([selectedMemory, fh],dim =-1).flatten(start_dim=-2,end_dim=-1) #(b,t,c)
-                first_mem = self.dreamer(first_mem)
-                first_mem = utils.fft_trunc_csquish(first_mem)#(b,t,c//2)
-                #first_mem = first_mem.mean(dim=0).unsqueeze(0)
-                fh = first_mem.expand(b,t,self.config.n_embd//2)#(b,t,c//2)
-            else:
-                for block in self.transformer.h:
-                    xswish = block(xswish, self.memory.expand(b,self.config.mem_block_size,self.config.n_embd))
-
-                mh1 = self.mem_form(xswish[b//2:,:,:], self.memory).expand(b//2,t,self.config.n_embd)
-                mh2 = self.mem_form(xswish[:b//2,:,:], self.memory).expand(b//2,t,self.config.n_embd)
-
-                first_mem = torch.cat([mh1,mh2],dim =0) #disallow cheating as much as possible
-        
-        if(fftmem and not self.training):
-            if(mem_mix_squish):
-                fh = self.memory.expand(b,t,self.config.n_embd//2)
-            else:
-                first_mem = self.memory.expand(b,t,self.config.n_embd)
-        i=0
-        if(mix_squish and not (fftmem and mem_mix_squish)):
-            fh = utils.fft_trunc_csquish(x)
-
-        
-
-        #paths = []
-        #
-        #for i in self.config.n_layer:
-        #    block_inputs.append(x) 
-        #    x = self.transformer.h[i](x)
-        #    x2 = x
-        #    if(i == self.config.n_layer-1):
-        #        for j in self.config.n_layer:
-        #            x2 = self.transformer.h[i](x2)
-        #            paths.append(x2) 
-
-        
-        for block in self.transformer.h:
-            if(spl):
+        for i, block in enumerate(self.transformer.h):
+            if spl:
                 block_inputs.append(x) 
+            x = block(x) 
 
-            if not mem_mix_squish and fftmem:
-                x = block(x,first_mem)
-            else:
-                x = block(x) #todo multitoken multilayer duplicated 
-
-            i+=1 
-            if(mix_squish):
-                if(not(i == 1 or i == self.config.n_layer)):
+            if mix_squish:
+                if self.config.mix_mask[i]:
                     sh = utils.fft_trunc_csquish(x)
                     x = torch.stack([sh,fh],dim =-1).flatten(start_dim=-2,end_dim=-1)
-            
-        updated_mem = None
-        if fftmem and self.training and not self.memory_frozen :
-            if(mem_mix_squish):
-                updated_mem     = torch.stack([selectedMemory,fh],dim =-1).flatten(start_dim=-2,end_dim=-1) #(b,t,c)
-                selectedMemory  = self.memory_selector(x, causal = False)#(b,t,c)
-                selectedMemory  = utils.fft_trunc_csquish(selectedMemory) #(b,t,c//2)
-                updated_mem     = self.dreamer(updated_mem)
-                updated_mem     = utils.fft_trunc_csquish(updated_mem)#(b,t,c//2)
-            else:
-                updated_mem = self.mem_form(x, first_mem)
-            with torch.no_grad():
-                self.memory.copy_(updated_mem)
-
-        
-
+          
         x = self.transformer.ln_f(x)
         if targets is not None:
             logits = self.lm_head(x)
@@ -394,37 +328,8 @@ class GPT(nn.Module):
                 loss = self.convemb.loss(logits, patchtargets, pploss)
             
             if(spl and self.training):
-                for i in range(self.config.n_layer - 1, -1, -1):
-                    target_output = block_inputs[i]  # The target is the block input
-                    #predicted_output = self.transformer.h[i](-x,-updated_mem.expand(b,t,self.config.n_embd),causal= False)  #use the negative direction of token space as the self prediction space
-                    
-                    #if i >= 1 and not mem_mix_squish and fftmem:
-                    if fftmem:
-                        predicted_output = self.transformer.h[i](-x,-self.memory.expand(b,t,self.config.n_embd), causal = False)
-                    else:
-                        predicted_output = self.transformer.h[i](-x, causal = False)
-                    #predicted_output = self.transformer.h[i](-x)
-                    #sploss = nn.functional.mse_loss(
-                    #    utils.mmnorm(predicted_output.view(-1, self.config.n_embd)),
-                    #    utils.mmnorm(target_output.view(-1, self.config.n_embd))
-                    #)
-                    sploss = abs(torch.dot(
-                        utils.mmnorm(predicted_output.flatten()),
-                        utils.mmnorm(target_output.flatten())
-                    ) / predicted_output.numel()) #/torch.sqrt(predicted_output.var()*target_output.var()+1e-10) / predicted_output.numel()
-                    
-
-                    loss = loss + sploss #* self.predict_weight #* 0.001
-                if fftmem:# and i >= 1: #why is skipping first bad?
-                    predicted_output = self.memory_selector(-updated_mem.expand(b,t,self.config.n_embd), -x, causal=False).contiguous()
-                    target_output = first_mem#[::b//2,:,:].contiguous()
-                    sploss = torch.dot(
-                        utils.mmnorm(predicted_output.flatten()),
-                        utils.mmnorm(target_output.flatten())
-                    )/ predicted_output.numel()
-                    loss = loss + sploss * self.predict_weight #* loss #* 0.00001
+                loss = loss + self.self_prediction_loss(block_inputs,x) #* self.predict_weight #* 0.001
                 
-
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
@@ -433,7 +338,101 @@ class GPT(nn.Module):
         #self.memory = torch.zeros_like(self.memory)
 
         return logits, loss
+    
+    def mem_mix_fwd(self, targets, x):
+        b, t, e = x.size()
+        block_inputs = []
 
+        if(self.training):
+            xswish = torch.cat([x[b//2:,:,],x[:b//2,:,:]],dim=0)
+            fh = self.memory.expand(b,t,self.config.n_embd//2)
+            for i, block in enumerate(self.transformer.h):
+                if(self.config.mix_mask[i]):
+                    sh = utils.fft_trunc_csquish(xswish)
+                    xswish = torch.stack([fh,sh],dim =-1).flatten(start_dim=-2,end_dim=-1)
+                xswish = block(xswish)
+            first_mem = self.mix_mem_form(xswish,fh)
+        else:
+            first_mem = self.memory
+        
+        fh = first_mem.expand(b,t,self.config.n_embd//2)#(b,t,c//2)
+        
+        for i, block in enumerate(self.transformer.h):
+            block_inputs.append(x) 
+            x = block(x) 
+
+            if(self.config.mix_mask[i]):
+                sh = utils.fft_trunc_csquish(x)
+                x = torch.stack([sh,fh],dim =-1).flatten(start_dim=-2,end_dim=-1)
+            
+        updated_mem = None
+        if self.training and not self.memory_frozen:
+            updated_mem     = self.mix_mem_form(x,fh)
+            with torch.no_grad():
+                self.memory.copy_(updated_mem)
+
+        x = self.transformer.ln_f(x)
+        if targets is not None:
+            logits = self.lm_head(x)
+            
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1) 
+            
+            if(self.training):
+                loss = loss + self.self_prediction_loss(x,block_inputs) 
+                loss = loss + self.blockspl(self.memory_selector, self.memory)
+        else:
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            loss = None
+        return logits, loss
+    
+    def mem_fwd(self, targets, x):
+        b, t, e = x.size()
+        
+        block_inputs = []
+
+        if(self.training):
+            xswish = torch.cat([x[b//2:,:,],x[:b//2,:,:]],dim=0)
+            for block in self.transformer.h:
+                xswish = block(xswish, self.memory.expand(b,self.config.mem_block_size,self.config.n_embd))
+            mh1 = self.mem_form(xswish[b//2:,:,:], self.memory).expand(b//2,t,self.config.n_embd)
+            mh2 = self.mem_form(xswish[:b//2,:,:], self.memory).expand(b//2,t,self.config.n_embd)
+            first_mem = torch.cat([mh1,mh2],dim =0) #disallow cheating as much as possible
+        else:
+            first_mem = self.memory
+        
+        if(mix_squish):
+            fh = utils.fft_trunc_csquish(x)
+
+        for i, block in enumerate(self.transformer.h):
+            
+            block_inputs.append(x) 
+            x = block(x,first_mem.expand(b,t,self.config.n_embd))
+            if(mix_squish):
+                if(self.config.mix_mask[i]):
+                    sh = utils.fft_trunc_csquish(x)
+                    x = torch.stack([sh,fh],dim =-1).flatten(start_dim=-2,end_dim=-1)
+            
+        updated_mem = None
+        if self.training and not self.memory_frozen :
+            updated_mem = self.mem_form(x, first_mem)
+            with torch.no_grad():
+                self.memory.copy_(updated_mem)
+
+        x = self.transformer.ln_f(x)
+        if targets is not None:
+            logits = self.lm_head(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1) 
+            
+            if(self.training):
+                loss = loss + self.self_prediction_loss(x,block_inputs, self.memory) 
+                loss = loss + self.blockspl(self.memory_selector, self.memory)
+                
+        else:
+            logits = self.lm_head(x[:, [-1], :])
+            loss = None 
+        return logits, loss
+    
     def mtp_fwd(self, targets, x):
         if targets is not None:
             pathcount = 1
@@ -467,17 +466,35 @@ class GPT(nn.Module):
             loss = None
             return firstLogit, loss
     
-    def mmdiem(self, a:torch.Tensor,b:torch.Tensor):
-        numel = a.numel()# torch.sqrt(torch.ones(1,device=a.device,dtype=a.dtype)* a.numel())
-        afl = a.flatten()
-        bfl = b.flatten()
-        arange = afl.max() - afl.min() + 1e-10
-        brange = bfl.max() - bfl.min() + 1e-10
-        anorm = (afl - afl.mean()) / (arange)
-        bnorm = (bfl - bfl.mean()) / (brange)
-        variance = torch.sqrt(a.var()*b.var()+1e-10)
-        return torch.dot(anorm, bnorm) /  numel / variance # + (torch.abs(arange-brange)) + torch.abs(a.var() - b.var())
+    def blockspl(self, block, block_input, x, memory = None):
+        b, t, e = x.size()
+        loss = 0
+        target_output = block_input 
+        if memory is not None:
+            predicted_output = block(-x, -self.memory.expand(b,t,self.config.n_embd), causal = False)
+        else:
+            predicted_output = block(-x, causal = False)
+        sploss = abs(torch.dot(
+            utils.mmnorm(predicted_output.flatten()),
+            utils.mmnorm(target_output.flatten())
+        ) / predicted_output.numel())  #why does this even work mse is ever so slightly worse :pain:
+        loss = loss + sploss 
+        return loss
     
+    def self_prediction_loss(self,block_inputs, x, memory = None):
+        b, t, e = x.size()
+        loss = 0
+        for i, block in enumerate(self.transformer.h):
+            loss = loss + self.blockspl(block, block_inputs[i], memory) 
+        return loss
+    
+    def mix_mem_form(self,x,fh):
+        selectedMemory  = self.memory_selector(x, causal = False)#(b,t,c)
+        selectedMemory  = utils.fft_trunc_csquish(selectedMemory) #(b,t,c//2)
+        updated_mem     = torch.stack([selectedMemory,fh],dim =-1).flatten(start_dim=-2,end_dim=-1) #(b,t,c)
+        updated_mem     = self.dreamer(updated_mem)
+        return utils.fft_trunc_csquish(updated_mem)#(b,t,c//2)
+
     def mem_form(self, x, memory):
         b, t, e = x.size()
         squishmem      = utils.fft_trunc_tsquish(memory).expand(b, self.config.mem_block_size//2, self.config.n_embd) #(b, m//2,c)
