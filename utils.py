@@ -228,3 +228,17 @@ def gaussian_kernel(grad, center_offset: float, sigma = 3.0, dim=None) -> torch.
     # Compute Gaussian values and reshape
     kernel = torch.exp(-(indices - center).pow(2) / (2 * sigma**2))
     return kernel.view(size)
+
+
+def fast_sin_relu(x):
+     base = F.relu(x)
+     sine_mod = F.relu(torch.sign(x)) * torch.sin(1.25 * x)
+     return base + sine_mod
+
+
+def quaternionize(x):
+    b,t,n=x.shape
+    x4d = x.view(b, t, n//4, 4)
+    x_norm = x4d.norm(dim=-1, keepdim=True) 
+    x_normalized = x4d / x_norm             
+    return x_normalized

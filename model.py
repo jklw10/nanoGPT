@@ -12,6 +12,7 @@ import inspect
 from dataclasses import dataclass
 
 import numpy
+from pytorch_wavelets import DWT1DForward
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -24,7 +25,7 @@ import wackmodel
 #known good
 diffSplits      = 1
 ssmax           = True
-mtp             = True
+mtp             = False
 #ungraded
 fftmem          = False
 mmnorm          = False
@@ -114,146 +115,6 @@ class MemAttention(nn.Module):
 
         return y[:,self.mem_len:,:]
 
-class CausalSelfAttention(nn.Module):
-    
-    def __init__(self, config, causal = True):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        
-
-        self.causal = causal
-        #self.splits = 1
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head // diffSplits
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-        #diff
-        self.head_dim =  self.n_embd //  self.n_head // diffSplits
-        if(diffSplits > 1):
-            #self.lambda_init = utils.lambda_init_fn(d) 
-            self.q_lambdas = nn.ParameterList([nn.Parameter(torch.zeros(self.head_dim, dtype=torch.bfloat16).normal_(mean=0,std=0.1)) for _ in range(diffSplits)])
-            self.k_lambdas = nn.ParameterList([nn.Parameter(torch.zeros(self.head_dim, dtype=torch.bfloat16).normal_(mean=0,std=0.1)) for _ in range(diffSplits)])
-        if(ssmax):
-            self.qm = nn.Parameter(torch.ones(self.head_dim).normal_(mean=1, std=0.1))
-            self.qb = nn.Parameter(torch.zeros(self.head_dim).normal_(mean=0, std=0.1))
-        
-        #self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.bfloat16).normal_(mean=0,std=0.1))
-        #self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.bfloat16).normal_(mean=0,std=0.1))
-        #self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.bfloat16).normal_(mean=0,std=0.1))
-        #self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.bfloat16).normal_(mean=0,std=0.1))
-
-        #self.subln = nn.RMSNorm(config.n_embd, eps=1e-5, elementwise_affine=True)
-    
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        ##self.flash = False #TO DO remember to re-enable after test
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
-
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        device = x.device
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        
-        #q = mmnorm(q)
-        #k = mmnorm(k)
-        #v = mmnorm(v)
-        #q=utils.zca_newton_schulz(q)
-        #k=utils.zca_newton_schulz(k)#best
-        #v=utils.zca_newton_schulz(v)
-
-        #kernel_size = 3  # Example
-        #causal_kernel = torch.ones(1, 1, kernel_size).to(x.device)  # Shape: (out_channels, in_channels, kernel_size)
-        #causal_kernel[:, :, kernel_size // 2 + 1:] = 0  # Zero-out future positions
-
-        ## Reshape Q for convolution: (B, T, C) -> (B, C, T)
-        #v = v.permute(0, 2, 1)
-        ## Apply convolution
-        #v = self.query_conv(v)
-        ## Reshape back: (B, C, T) -> (B, T, C)
-        #v = v.permute(0, 2, 1)
-        #q = q*(math.log(T)*self.qm)
-        #q = utils.fft_trunc_squish(q)
-        #k = utils.fft_trunc_squish(k)
-
-        k = k.view(B, T, self.n_head, diffSplits * self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, diffSplits * self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, diffSplits * self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-        #qn = q.norm(dim=-1, keepdim=True)
-        #q = q /qn
-        #kn = k.norm(dim=-1, keepdim=True)
-        #vn = v.norm(dim=-1, keepdim=True)
-        #v= v/vn
-        
-
-        # Split q and k for the diff part
-        qs = q.split(self.head_dim, dim=-1)
-        ks = k.split(self.head_dim, dim=-1)
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash: #and self.splits >= 1:
-            # efficient attention using Flash Attention CUDA kernels
-            #y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-            ys = []
-            for i in range(diffSplits):#+self.qb
-                if(ssmax):
-                    ys.append(torch.nn.functional.scaled_dot_product_attention(qs[i]*(math.log(T)*self.qm), ks[i], v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal= self.causal))
-                else:
-                    ys.append(torch.nn.functional.scaled_dot_product_attention(qs[i], ks[i], v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=self.causal))
-                        
-        else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            
-            att = math.e ^ att / (1+sum(math.e ^ att))
-            #att = F.softmax(att, dim=-1)
-            #att = ((self.mmnorm(att) + 1) / 2) ** 3
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-
-        y = ys[0] #*kn#*vn
-        if diffSplits > 1:
-            #lambda_full = lambda_1 - lambda_2 + self.lambda_init
-            lambda_full = self.lambda_init + torch.exp(torch.sum(self.q_lambdas[0] * self.k_lambdas[0], dim=-1).float()).type_as(q) # + lambda_1 - lambda_2 
-            for i in range(diffSplits-1):
-                lambda_full = lambda_full - torch.exp(torch.sum(self.q_lambdas[1+i] * self.k_lambdas[1+i], dim=-1).float()).type_as(q)
-                #lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(q)
-            for i in range(diffSplits-1):
-                y = y - lambda_full.unsqueeze(-1).unsqueeze(-1) * ys[1+i]
-
-        #y = mmnorm(y, dim = 0)#, scale = 1) 
-        y = y.transpose(1, 2).contiguous().view(B, T, self.n_head * diffSplits * self.head_dim) # re-assemble all head outputs side by side
-
-        #y = mmnorm(y) #mmnorm: with: 1.4565, without: 1.4416
-        #unfixed without: step 6000: train loss 1.1178, val loss 1.4572, 12050.81ms
-        #unfixed with: step 9000: train loss 1.1000, val loss 1.4497, 14662.64ms #wack
-        #fixed without: step 8000: train loss 1.0563, val loss 1.4606, 18392.37ms
-        #fixed with: step 10000:  val loss 1.4479, 20605.08ms
-
-        #y = self.subln(y) # with fix:
-
-        #y = self.subln(y) # lowest: 1.4778 (with scale and vnorm)
-        #y = y * (1 - self.lambda_init) 
-
-        
-        #y = y.reshape(B, T, self.num_heads * 2 * self.head_dim)
-
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        return y
-
-
-
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -286,21 +147,6 @@ class MLP(nn.Module):
         return x
     
 
-
-
-def fast_sin_relu(x):
-     base = F.relu(x)
-     sine_mod = F.relu(torch.sign(x)) * torch.sin(1.25 * x)
-     return base + sine_mod
-
-
-def quaternionize(x):
-    b,t,n=x.shape
-    x4d = x.view(b, t, n//4, 4)
-    x_norm = x4d.norm(dim=-1, keepdim=True) 
-    x_normalized = x4d / x_norm             
-    return x_normalized
-
 class MemBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -313,40 +159,11 @@ class MemBlock(nn.Module):
         x = x + self.attn(self.ln_1(x),mem,causal)
         x = x + self.mlp(self.ln_2(x))
         return x
-
-class Block(nn.Module):
-    def __init__(self, config, causal= True):
-        super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config, causal)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
-
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        #x = x + self.attn(x)
-        #x = x + self.mlp(x)
-        #x = mmnorm(x)
-        return x
-
-class eBlock(nn.Module):
-    def __init__(self, config, d):
-        super().__init__()
-        self.attn = CausalSelfAttention(config,d)
-        self.mlp = MLP(config)
-
-    def forward(self, x):
-        x = x + self.attn(x)
-        x = x + self.mlp(x)
-        x = utils.mmnorm(x)
-        return x
-
 class Dreamer(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.block = Block(config, CausalMem)
+        self.block = MemBlock(config, CausalMem)
         
     def forward(self, x):
         while x.shape[0] > 1:
@@ -401,9 +218,6 @@ class GPT(nn.Module):
             wpe = nn.Embedding(config.internal_block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = blocks,
-            #h = nn.ModuleList([uBlock(config,i) for i in range(config.n_layer-1)]).append(Block(config,config.n_layer-1)),
-            #h = nn.ModuleList([uBlock(config,i) for i in range(config.n_layer-1)]),
-            #h = Block(config), #nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         
@@ -440,7 +254,11 @@ class GPT(nn.Module):
             self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
         
         self.predict_weight = 0.01
-
+        self.dwt_transform =  DWT1DForward(
+                wave='db1',
+                mode='periodization', # Common boundary mode for DWT
+                J=1
+            )
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
@@ -454,7 +272,7 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None):
         
-        #torch.compiler.cudagraph_mark_step_begin() # Add this line at the beginning of forward
+        #torch.compiler.cudagraph_mark_step_begin()
         device = idx.device
         b, t = idx.size()
         #end_tok=torch.as_tensor(self.end_patch_token_id, device=device, dtype=torch.long)
@@ -479,6 +297,10 @@ class GPT(nn.Module):
                 x = tok_emb + pos_emb
         x = self.transformer.drop(x)
 
+        if(mtp):
+            return self.mtp_fwd(targets, x)
+            
+        
         if(spl):
             block_inputs = []
 
@@ -519,6 +341,19 @@ class GPT(nn.Module):
             fh = utils.fft_trunc_csquish(x)
 
         
+
+        #paths = []
+        #
+        #for i in self.config.n_layer:
+        #    block_inputs.append(x) 
+        #    x = self.transformer.h[i](x)
+        #    x2 = x
+        #    if(i == self.config.n_layer-1):
+        #        for j in self.config.n_layer:
+        #            x2 = self.transformer.h[i](x2)
+        #            paths.append(x2) 
+
+        
         for block in self.transformer.h:
             if(spl):
                 block_inputs.append(x) 
@@ -548,10 +383,12 @@ class GPT(nn.Module):
                 self.memory.copy_(updated_mem)
 
         
+
         x = self.transformer.ln_f(x)
         if targets is not None:
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1) #to display the right loss on test runs
+            
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1) 
             #TODO: wavelet loss
             if(convemb):
                 loss = self.convemb.loss(logits, patchtargets, pploss)
@@ -576,6 +413,7 @@ class GPT(nn.Module):
                         utils.mmnorm(target_output.flatten())
                     ) / predicted_output.numel()) #/torch.sqrt(predicted_output.var()*target_output.var()+1e-10) / predicted_output.numel()
                     
+
                     loss = loss + sploss #* self.predict_weight #* 0.001
                 if fftmem:# and i >= 1: #why is skipping first bad?
                     predicted_output = self.memory_selector(-updated_mem.expand(b,t,self.config.n_embd), -x, causal=False).contiguous()
@@ -595,6 +433,39 @@ class GPT(nn.Module):
         #self.memory = torch.zeros_like(self.memory)
 
         return logits, loss
+
+    def mtp_fwd(self, targets, x):
+        if targets is not None:
+            pathcount = 1
+            if(self.training):
+                pathcount = 4
+            loss = 0
+            firstLogit = None
+            for pi in range(pathcount):
+                if(pi==0):
+                    for i in range(self.config.n_layer):
+                        x = self.transformer.h[i](x)
+                    x2 = self.transformer.ln_f(x)
+                    logits = self.lm_head(x2)
+                    firstLogit = logits
+                else:
+                    x = self.transformer.h[self.config.n_layer-1](x)
+                    x2 = self.transformer.ln_f(x)
+                    logits = self.lm_head(x2)
+                stage_logits = logits[:, :-(pi+1), :].contiguous()
+                stage_targets = targets[:, pi+1:].contiguous()
+
+                loss = loss + F.cross_entropy(stage_logits.view(-1, stage_logits.size(-1)), stage_targets.view(-1), ignore_index=-1) 
+                loss = loss / pathcount
+                return firstLogit, loss
+        else:
+            for block in self.transformer.h:
+                x = block(x)
+            x = self.transformer.ln_f(x)
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            loss = None
+            return firstLogit, loss
     
     def mmdiem(self, a:torch.Tensor,b:torch.Tensor):
         numel = a.numel()# torch.sqrt(torch.ones(1,device=a.device,dtype=a.dtype)* a.numel())

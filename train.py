@@ -227,7 +227,7 @@ model.to(device)
 
 best                = False
 
-gradorth            = True
+gradorth            = False
 mnorm_enabled       = False
 #wack
 dfw_enabled         = False
@@ -238,7 +238,6 @@ gdiff_enabled       = False
 grokfast            = False
 sign_enabled        = False
 
-gwhitening_enabled  = False
 #??
 wwhite_enabled      = False
 gsphere             = False
@@ -256,7 +255,7 @@ swna = 1e-5
 zcastep = 2 #2, 5
 szcapow = 2 #2, 10
 
-ghook = gdiff_enabled or ndiff_enabled or gnorm or dfw_enabled or grokfast or gwhitening_enabled or gfft or gzca_enabled or sign_enabled or gsphere or ggauss or gchaos or gradorth
+ghook = gdiff_enabled or ndiff_enabled or gnorm or dfw_enabled or grokfast or gfft or gzca_enabled or sign_enabled or gsphere or ggauss or gchaos or gradorth
 
 decay = False
 decaying = 1.0
@@ -300,8 +299,10 @@ checkpoint = None # free up memory
 # compile the model
 if compile:
     print("compiling the model... (takes a ~minute)")
+    #print(torch._dynamo.list_backends())
     unoptimized_model = model
-    model = torch.compile(model, backend="cudagraphs") # requires PyTorch 2.0
+    model = torch.compile(model, backend="inductor") # requires PyTorch 2.0
+    print("compiled")
 
 
 # wrap model into DDP container
@@ -357,53 +358,6 @@ local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 
-@torch.compile(backend='cudagraphs')
-def zca_newton_schulz(G, epsilon=1e-5, steps=5, power_iters=10):
-    if G.ndim < 2:
-        return G
-    G = G - G.mean(dim=0, keepdim=True)
-    n, d = G.shape
-    device, dtype = G.device, G.dtype
-    
-    # Compute covariance matrix with regularization
-    Cov = (1/n) * torch.matmul(G.T, G) + epsilon * torch.eye(d, device=device, dtype=dtype)
-    
-    # Estimate spectral norm using power iteration
-    v = torch.randn(d, 1, device=device, dtype=dtype)
-    for _ in range(power_iters):
-        u = torch.matmul(Cov, v)
-        u = u / u.norm()
-        v = torch.matmul(Cov.T, u)
-        v = v / v.norm()
-    s = torch.matmul(u.T, torch.matmul(Cov, v))#.squeeze()
-    
-    # Scale Cov to ensure convergence
-    B = Cov / s
-    Y = torch.eye(d, device=device, dtype=dtype)
-    
-    # Newton-Schulz iterations for inverse square root of B
-    for _ in range(steps):
-        Y = 0.5 * torch.matmul(Y, 3 * torch.eye(d, device=device, dtype=dtype) - torch.matmul(Y, torch.matmul(B, Y)))
-    
-    # Rescale to get Cov^{-1/2}
-    W = Y / (s ** 0.5)
-    
-    return torch.matmul(G, W)
-
-def zeropower_via_newtonschulz(G, steps=5, eps=1e-10):
-    assert len(G.shape) == 2
-    a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16()
-    X /= (X.norm() + eps)  # ensure top singular value <= 1
-    if G.size(0) > G.size(1):
-        X = X.T
-    for _ in range(steps):
-        A = X @ X.T
-        B = b * A + c * A @ A  # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
-        X = a * X + B @ X
-    if G.size(0) > G.size(1):
-        X = X.T
-    return X.to(G.dtype)
 
 def fft_squish(grad,center=0.5,sigma=0.5):
     if(grad.ndim>=2):
@@ -457,20 +411,10 @@ def custom_gradient_adjustment(grad, param, weight_ema = None, gema = 0.0):
         adjusted_grad = fft_squish(adjusted_grad)
     if(sign_enabled):
         adjusted_grad = torch.sign(torch.round(adjusted_grad)) 
-    if(gwhitening_enabled and d2):
-        adjusted_grad = zeropower_via_newtonschulz(adjusted_grad)
     if(gzca_enabled and d2):
-        adjusted_grad = zca_newton_schulz(adjusted_grad, zcastep, szcapow)
+        adjusted_grad = utils.zca_newton_schulz(adjusted_grad, zcastep, szcapow)
     if(gradorth):
-        w = param.view(-1)
-        g = adjusted_grad.view(-1)
-        w_norm_sq = torch.dot(w, w) + 1e-30
-        proj = torch.dot(w, g) / w_norm_sq
-        g_orth = g - proj * w
-        g_norm = g.norm(2)
-        g_orth_norm = g_orth.norm(2) + 1e-30
-        g_orth_scaled = g_orth * (g_norm / g_orth_norm)
-        adjusted_grad = (g_orth_scaled.view_as(grad))
+        adjusted_grad = GradOrth(grad, param, adjusted_grad)
     if(ndiff_enabled):
         w_range = torch.abs(p.max() - p.min() + 1e-10)
         w_avg = param.nanmean()
@@ -499,6 +443,19 @@ def custom_gradient_adjustment(grad, param, weight_ema = None, gema = 0.0):
     #    surprise += 0.98 * (adjusted_grad - surprise)
     #    adjusted_grad = funnyMulti(adjusted_grad,surprise)
     return adjusted_grad 
+
+@torch.compile(backend='cudagraphs')
+def GradOrth(grad, param, adjusted_grad):
+    w = param.view(-1)
+    g = adjusted_grad.view(-1)
+    w_norm_sq = torch.dot(w, w) + 1e-30
+    proj = torch.dot(w, g) / w_norm_sq
+    g_orth = g - proj * w
+    g_norm = g.norm(2)
+    g_orth_norm = g_orth.norm(2) + 1e-30
+    g_orth_scaled = g_orth * (g_norm / g_orth_norm)
+    adjusted_grad = (g_orth_scaled.view_as(grad))
+    return adjusted_grad
 
 def wfunny(model):
         for i, p in enumerate(model.parameters()):
@@ -688,29 +645,8 @@ if(True): #i hate white space significance. (this is for that profiler and i'm l
         if iter_num == 0 and eval_only:
             break
         
-        #if(iter_num >= 1 and iter_num < 15000):
-        #    if iter_num % 1000 == 0:
-        #        with torch.no_grad():
-        #            model.reinit_nonmem()
-        #if(iter_num >= 1000 and iter_num < 15000):
-        #    if iter_num % 1000 == 0:
-        #        model.memory_freezeToggle()
-        #        with torch.no_grad():
-        #            model.reinit_nonmem()
-        #    if iter_num % 1000 == 5:
-        #        model.memory_freezeToggle()
-        #if iter_num % 100 == 0 and iter_num % 1000 <= 500 and iter_num > 1000:
-        #    with torch.no_grad():
-        #        model.reinit_nonmem()
         
         torch.compiler.cudagraph_mark_step_begin()
-        #if iter_num % eval_interval == 0:
-        #    torch.cuda.empty_cache()
-        #if iter_num <= 0:
-        #    X, Y = get_batch('train') 
-       
-
-
         # forward backward update, with optional gradient accumulation to simulate larger batch size
         # and using the GradScaler if data type is float16
         for micro_step in range(gradient_accumulation_steps):
@@ -724,8 +660,8 @@ if(True): #i hate white space significance. (this is for that profiler and i'm l
                 logits, loss = model(X, Y)
                 loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
-            del X
-            del Y
+            #del X
+            #del Y
             X, Y = get_batch('train')
             loss.backward()
             # backward pass, with gradient scaling if training in fp16
