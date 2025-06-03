@@ -234,7 +234,7 @@ dfw_enabled         = False
 decor_enabled       = False
 #rough
 wnorm_enabled       = False
-gdiff_enabled       = False
+gdiff_enabled       = True
 grokfast            = False
 sign_enabled        = False
 
@@ -244,14 +244,15 @@ gsphere             = False
 ndiff_enabled       = False
 gchaos              = False #or best
 ggauss              = False #or best
+
 #known good
 gfft                = False #or best
 gnorm               = False #or best
 gzca_enabled        = False #or best
-soft_wnorm_enabled  = False or best
+swnrom_enabled      = False or best
 #for fftmem owt: 1e-5
 #for fftmem skspr: 5e-5
-swna = 1e-5
+swna = 5e-5
 zcastep = 2 #2, 5
 szcapow = 2 #2, 10
 
@@ -301,7 +302,7 @@ if compile:
     print("compiling the model... (takes a ~minute)")
     #print(torch._dynamo.list_backends())
     unoptimized_model = model
-    model = torch.compile(model, backend="inductor") # requires PyTorch 2.0
+    model = torch.compile(model, backend="inductor") # requires PyTorch 2.0 backend="inductor" is fast, backend="cudagraphs" is debuggable
     print("compiled")
 
 
@@ -570,7 +571,7 @@ if(True): #i hate white space significance. (this is for that profiler and i'm l
             wwhite(model)
         if(wnorm_enabled):
             wnorm(model)
-        if(soft_wnorm_enabled):
+        if(swnrom_enabled):
             if(decay):
                 softwnorm(model, lr/20)
             else:

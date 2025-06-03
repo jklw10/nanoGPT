@@ -230,7 +230,8 @@ def gaussian_kernel(grad, center_offset: float, sigma = 3.0, dim=None) -> torch.
     return kernel.view(size)
 
 
-def mmdiem( a:torch.Tensor,b:torch.Tensor):
+
+def mmdiem( a :torch.Tensor,b :torch.Tensor):
     numel = a.numel()# torch.sqrt(torch.ones(1,device=a.device,dtype=a.dtype)* a.numel())
     afl = a.flatten()
     bfl = b.flatten()

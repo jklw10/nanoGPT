@@ -160,11 +160,12 @@ class MemBlock(nn.Module):
         x = x + self.attn(self.ln_1(x),mem,causal)
         x = x + self.mlp(self.ln_2(x))
         return x
+    
 class Dreamer(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.block = MemBlock(config, CausalMem)
+        self.block = MemBlock(config)
         
     def forward(self, x):
         while x.shape[0] > 1:
@@ -173,7 +174,7 @@ class Dreamer(nn.Module):
             x = x.permute(0, 2, 1, 3).reshape(b // 2, t * 2, c)
             #x = x.view(b//2, 2*t, c)
             x = utils.fft_trunc_tsquish(x)
-            x = self.block(x)
+            x = self.block(x, causal = CausalMem)
 
         return x
 
@@ -275,7 +276,6 @@ class GPT(nn.Module):
         #patch_max=torch.as_tensor(self.patch_max, device=device, dtype=torch.long)
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         
-        
         if convemb:
             x, patchtargets, pploss= self.convemb(idx)
             pb, pt, pe = x.size()
@@ -335,8 +335,6 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        #self.memory = torch.zeros_like(self.memory)
-
         return logits, loss
     
     def mem_mix_fwd(self, targets, x):
@@ -395,11 +393,11 @@ class GPT(nn.Module):
             xswish = torch.cat([x[b//2:,:,],x[:b//2,:,:]],dim=0)
             for block in self.transformer.h:
                 xswish = block(xswish, self.memory.expand(b,self.config.mem_block_size,self.config.n_embd))
-            mh1 = self.mem_form(xswish[b//2:,:,:], self.memory).expand(b//2,t,self.config.n_embd)
-            mh2 = self.mem_form(xswish[:b//2,:,:], self.memory).expand(b//2,t,self.config.n_embd)
+            mh1 = self.mem_form(xswish[b//2:,:,:], self.memory).expand(b//2,self.config.mem_block_size,self.config.n_embd)
+            mh2 = self.mem_form(xswish[:b//2,:,:], self.memory).expand(b//2,self.config.mem_block_size,self.config.n_embd)
             first_mem = torch.cat([mh1,mh2],dim =0) #disallow cheating as much as possible
         else:
-            first_mem = self.memory
+            first_mem = self.memory.expand(b,self.config.mem_block_size,self.config.n_embd)
         
         if(mix_squish):
             fh = utils.fft_trunc_csquish(x)
@@ -407,7 +405,7 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             
             block_inputs.append(x) 
-            x = block(x,first_mem.expand(b,t,self.config.n_embd))
+            x = block(x,first_mem)
             if(mix_squish):
                 if(self.config.mix_mask[i]):
                     sh = utils.fft_trunc_csquish(x)
@@ -425,8 +423,9 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1) 
             
             if(self.training):
-                loss = loss + self.self_prediction_loss(x,block_inputs, self.memory) 
-                loss = loss + self.blockspl(self.memory_selector, self.memory)
+                loss = loss + self.self_prediction_loss(block_inputs, x, self.memory) 
+                loss = loss + self.blockspl(self.memory_selector, first_mem[::b//2,:,:], self.memory.expand(2,-1,-1), x)
+                _=0
                 
         else:
             logits = self.lm_head(x[:, [-1], :])
@@ -470,23 +469,33 @@ class GPT(nn.Module):
         b, t, e = x.size()
         loss = 0
         target_output = block_input 
+        #print("x:" + x.size())
+        #print("bs:" +block_input.size())
         if memory is not None:
-            predicted_output = block(-x, -self.memory.expand(b,t,self.config.n_embd), causal = False)
+            predicted_output = block(-x, -self.memory.expand(b, self.config.mem_block_size, self.config.n_embd), causal = False)
+         #   print("mem:" +memory.size())
         else:
             predicted_output = block(-x, causal = False)
-        sploss = abs(torch.dot(
+            
+        sploss = F.mse_loss(
             utils.mmnorm(predicted_output.flatten()),
             utils.mmnorm(target_output.flatten())
-        ) / predicted_output.numel())  #why does this even work mse is ever so slightly worse :pain:
+        ) #/ predicted_output.numel()
+        #print("po:" +predicted_output.size())
+        #sploss = abs(torch.dot(
+        #    utils.mmnorm(predicted_output.flatten()),
+        #    utils.mmnorm(target_output.flatten())
+        #) / predicted_output.numel())  #why does this even work mse is ever so slightly worse :pain:
         loss = loss + sploss 
         return loss
     
-    def self_prediction_loss(self,block_inputs, x, memory = None):
+    def self_prediction_loss(self, block_inputs, x, memory = None):
         b, t, e = x.size()
         loss = 0
         for i, block in enumerate(self.transformer.h):
-            loss = loss + self.blockspl(block, block_inputs[i], memory) 
+            loss = loss + self.blockspl(block, block_inputs[i], x, memory) 
         return loss
+    
     
     def mix_mem_form(self,x,fh):
         selectedMemory  = self.memory_selector(x, causal = False)#(b,t,c)
@@ -496,14 +505,15 @@ class GPT(nn.Module):
         return utils.fft_trunc_csquish(updated_mem)#(b,t,c//2)
 
     def mem_form(self, x, memory):
+        #currently assumes mem size and block size are the same
         b, t, e = x.size()
         squishmem      = utils.fft_trunc_tsquish(memory).expand(b, self.config.mem_block_size//2, self.config.n_embd) #(b, m//2,c)
-        selectedMemory = self.memory_selector(x, causal = False) #(b, m//2,c)
+        selectedMemory = self.memory_selector(x, causal = False)[:,:self.config.mem_block_size,:] #(b, m, c)
         selectedMemory = utils.fft_trunc_tsquish(selectedMemory) #(b, m//2,c)
         mh1 = torch.cat([selectedMemory,squishmem],dim =1)       #(b, m,c)
         mh1 = self.dreamer(mh1)
 
-        return mh1
+        return mh1#[:, :self.config.mem_block_size, :]
 
     
     def reinit_nonmem(self):
