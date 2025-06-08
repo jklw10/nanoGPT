@@ -263,6 +263,16 @@ decaying = 1.0
 
 eigenInit = False
 
+lrfinder = False
+
+if (lrfinder):
+    lr = 1.0
+    for i, p in enumerate(model.parameters()):
+        oldgrad = [torch.zeros_like(p) for p in model.parameters()]
+        batch_lr = [torch.randn(p) for p in range(batch_size)]
+        if p.requires_grad:
+            p.register_hook(lambda grad, oldgrad=oldgrad, batch_lr=batch_lr: grad_oldener(grad, oldgrad, batch_lr ))
+
 if(ghook):
     
     if(gdiff_enabled or dfw_enabled):
@@ -391,6 +401,19 @@ def gaussian_kernel(grad, center_offset: float, sigma = 3.0) -> torch.Tensor:
     kernel = torch.exp(-(indices - center).pow(2) / (2 * sigma**2))
     return kernel.view(size)
 
+def grad_oldener(grad, param, old_grad, blr):
+    if(grad is None):
+        return
+    adjusted_grad = torch.where(torch.isnan(grad), torch.zeros_like(grad), grad)
+
+
+    adjusted_grad, old_grad = old_grad, adjusted_grad #swap current gradient and old gradient
+    otk, otki = old_grad.mean(dim=0).topk(10,largest=False) #indices and best losses of previous batch
+    lrtk = blr[otki] #take the best lr's of previous batch
+    blr = torch.randn_like() * lrtk.var() + lrtk.mean() #make a new batch of random learn ratearound the best of last batch.
+    adjusted_grad *= lrtk.mean() #use the average of the best batche's lrs from previous step
+    return adjusted_grad #return old gradient modified by best lr to it for the whole batch.
+
 #@torch.compile(backend='cudagraphs')
 def custom_gradient_adjustment(grad, param, weight_ema = None, gema = 0.0):
     if(grad is None):
@@ -414,8 +437,8 @@ def custom_gradient_adjustment(grad, param, weight_ema = None, gema = 0.0):
         adjusted_grad = torch.sign(torch.round(adjusted_grad)) 
     if(gzca_enabled and d2):
         adjusted_grad = utils.zca_newton_schulz(adjusted_grad, zcastep, szcapow)
-    if(gradorth):
-        adjusted_grad = GradOrth(grad, param, adjusted_grad)
+    if(gradorth and d2):
+        adjusted_grad = utils.GradOrth(param, adjusted_grad)
     if(ndiff_enabled):
         w_range = torch.abs(p.max() - p.min() + 1e-10)
         w_avg = param.nanmean()
@@ -423,16 +446,27 @@ def custom_gradient_adjustment(grad, param, weight_ema = None, gema = 0.0):
         normgrad = norm - param
         adjusted_grad *= torch.abs(adjusted_grad - normgrad)
 
-    if(gdiff_enabled):
-        awdiff = weight_ema - param 
-
-        npar = torch.abs(weight_ema)
-        npar += torch.abs(adjusted_grad - awdiff) 
-        gdiff = 1.0 / torch.abs(npar)
-        adjusted_grad *= gdiff 
     
     if(gdiff_enabled or dfw_enabled):
-        weight_ema += 0.99 * (param - weight_ema)
+        weight_ema += 0.01 * (adjusted_grad - weight_ema)
+
+    if(gdiff_enabled):
+        awdiff = weight_ema - adjusted_grad 
+        gn = adjusted_grad.flatten().norm()
+        eman = weight_ema.flatten().norm()
+        awdot = torch.dot(weight_ema.flatten()/eman, adjusted_grad.flatten()/gn)
+        #npar = torch.abs(param)
+        npar = torch.abs(eman-gn)# 1.0-awdot + # torch.square(torch.abs(awdiff)) 
+        gdiff = 1.0 / torch.abs(npar) 
+        adjusted_grad *= gdiff 
+    #if(gdiff_enabled):
+    #    awdiff = weight_ema - param 
+#
+    #    npar = torch.abs(weight_ema)
+    #    npar += torch.abs(adjusted_grad - awdiff) 
+    #    gdiff = 1.0 / torch.abs(npar)
+    #    adjusted_grad *= gdiff 
+    
     if(grokfast):
         gema += 0.9999 * (adjusted_grad - gema)
         adjusted_grad += gema * 2
@@ -445,18 +479,6 @@ def custom_gradient_adjustment(grad, param, weight_ema = None, gema = 0.0):
     #    adjusted_grad = funnyMulti(adjusted_grad,surprise)
     return adjusted_grad 
 
-@torch.compile(backend='cudagraphs')
-def GradOrth(grad, param, adjusted_grad):
-    w = param.view(-1)
-    g = adjusted_grad.view(-1)
-    w_norm_sq = torch.dot(w, w) + 1e-30
-    proj = torch.dot(w, g) / w_norm_sq
-    g_orth = g - proj * w
-    g_norm = g.norm(2)
-    g_orth_norm = g_orth.norm(2) + 1e-30
-    g_orth_scaled = g_orth * (g_norm / g_orth_norm)
-    adjusted_grad = (g_orth_scaled.view_as(grad))
-    return adjusted_grad
 
 def wfunny(model):
         for i, p in enumerate(model.parameters()):

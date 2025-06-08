@@ -107,7 +107,7 @@ def quaternion_multiply(q1, q2):
     k_part    = a * h + b * g - c * f + d * e
     return torch.stack([real_part, i_part, j_part, k_part], dim=-1)
 
-@torch.compile(backend='cudagraphs')
+@torch.compile(backend='inductor', mode='max-autotune')
 def zca_newton_schulz(G, epsilon=1e-5, steps=5, power_iters=10):
     if G.ndim < 2:
         return G
@@ -139,6 +139,20 @@ def zca_newton_schulz(G, epsilon=1e-5, steps=5, power_iters=10):
     W = Y / (s ** 0.5)
     
     return torch.matmul(G, W)
+
+
+@torch.compile(backend='inductor', mode='max-autotune')
+def GradOrth(param, adjusted_grad):
+    w = param.view(-1)
+    g = adjusted_grad.view(-1)
+    w_norm_sq = torch.dot(w, w) + 1e-30
+    proj = torch.dot(w, g) / w_norm_sq
+    g_orth = g - proj * w
+    g_norm = g.norm(2)
+    g_orth_norm = g_orth.norm(2) + 1e-30
+    g_orth_scaled = g_orth * (g_norm / g_orth_norm)
+    adjusted_grad = (g_orth_scaled.view_as(adjusted_grad))
+    return adjusted_grad
 
 def fftnorm(grad,center=0.5,sigma=0.5, dim=None):
     if(grad.ndim>=2):

@@ -18,7 +18,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import utils
 import wackmodel
-
+from cut_cross_entropy import linear_cross_entropy
 #todo
 #prediction machine
 
@@ -320,9 +320,10 @@ class GPT(nn.Module):
           
         x = self.transformer.ln_f(x)
         if targets is not None:
-            logits = self.lm_head(x)
+            logits = None# self.lm_head(x)
             
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1) 
+            loss = linear_cross_entropy(x.to(torch.bfloat16), self.lm_head.weight.to(torch.bfloat16), targets, impl='torch_compile')
+            #loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1) 
             #TODO: wavelet loss
             if(convemb):
                 loss = self.convemb.loss(logits, patchtargets, pploss)
