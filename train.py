@@ -234,7 +234,7 @@ dfw_enabled         = False
 decor_enabled       = False
 #rough
 wnorm_enabled       = False
-gdiff_enabled       = True
+gdiff_enabled       = False
 grokfast            = False
 sign_enabled        = False
 
@@ -267,11 +267,11 @@ lrfinder = False
 
 if (lrfinder):
     lr = 1.0
-    for i, p in enumerate(model.parameters()):
-        oldgrad = [torch.zeros_like(p) for p in model.parameters()]
-        batch_lr = [torch.randn(p) for p in range(batch_size)]
-        if p.requires_grad:
-            p.register_hook(lambda grad, oldgrad=oldgrad, batch_lr=batch_lr: grad_oldener(grad, oldgrad, batch_lr ))
+    #for i, p in enumerate(model.parameters()):
+    #    oldgrad = [torch.zeros_like(p) for p in model.parameters()]
+    #    batch_lr = [torch.randn(p) for p in range(batch_size)]
+    #    if p.requires_grad:
+    #        p.register_hook(lambda grad, oldgrad=oldgrad, batch_lr=batch_lr: grad_oldener(grad, oldgrad, batch_lr ))
 
 if(ghook):
     
@@ -586,7 +586,8 @@ if(True): #i hate white space significance. (this is for that profiler and i'm l
     while True:
         # determine and set the learning rate for this iteration
         lr = get_lr(iter_num) if decay_lr else learning_rate
-
+        if(lrfinder):
+            lr = 1
         #if(dfw_enabled):
         #    wunfunny(model) 
         if(wwhite_enabled):

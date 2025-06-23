@@ -16,6 +16,7 @@ from pytorch_wavelets import DWT1DForward
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import optim
 import utils
 import wackmodel
 from cut_cross_entropy import linear_cross_entropy
@@ -64,12 +65,12 @@ class MemAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn = optim.OptimizedLinear(config.n_embd, 3 * config.n_embd, bias=config.bias, batch_size=64)
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj = optim.OptimizedLinear(config.n_embd,  config.n_embd, bias=config.bias, batch_size=64)
         
         #attention mod modifier
-        self.attmod = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.attmod =optim.OptimizedLinear(config.n_embd,  config.n_embd, bias=config.bias, batch_size=64)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -119,12 +120,12 @@ class MemAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_fc    = optim.OptimizedLinear(config.n_embd, 4 * config.n_embd, bias=config.bias, batch_size=64)
         if(qrot):
-            self.c_proj  = nn.Linear( 2*config.n_embd, config.n_embd, bias=config.bias)
+            self.c_proj  = optim.OptimizedLinear( 2*config.n_embd, config.n_embd, bias=config.bias, batch_size=64)
         else:
             self.gelu    = nn.GELU()
-            self.c_proj  = nn.Linear( 4*config.n_embd, config.n_embd, bias=config.bias)
+            self.c_proj  = optim.OptimizedLinear( 4*config.n_embd, config.n_embd, bias=config.bias, batch_size=64)
         self.dropout = nn.Dropout(config.dropout)
         self.n_embd = config.n_embd
 
@@ -246,14 +247,14 @@ class GPT(nn.Module):
         self.surprise = 1
         if(convemb):
             self.convemb = wackmodel.Patcher(config)
-            self.lm_head = nn.Linear(config.n_embd, config.vocab_size * self.patch_max, bias=False)
+            self.lm_head = optim.OptimizedLinear(config.n_embd, config.vocab_size * self.patch_max, bias=False, batch_size=64)
         else:
-            self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+            self.lm_head = optim.OptimizedLinear(config.n_embd, config.vocab_size, bias=False, batch_size=64)
             # with weight tying when using torch.compile() some warnings get generated:
             # "UserWarning: functional_call was passed multiple values for tied weights.
             # This behavior is deprecated and will be an error in future versions"
             # not 100% sure what this is, so far seems to be harmless. TODO investigate
-            self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+            #self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
         
         self.predict_weight = 0.01
         # init all weights
@@ -528,7 +529,7 @@ class GPT(nn.Module):
     def _init_nonmem_weights(self, module):
         if module is self.memory or module is self.dreamer or module is self.memory_selector:
             return
-        if isinstance(module, nn.Linear):
+        if isinstance(module, optim.OptimizedLinear):
             torch.nn.init.normal_(module.weight, mean=module.weight.mean()/2, std=(module.weight.max()-module.weight.min() + 1e-10))
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
@@ -572,7 +573,7 @@ class GPT(nn.Module):
         return n_params
 
     def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
+        if isinstance(module, optim.OptimizedLinear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)

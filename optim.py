@@ -93,7 +93,7 @@ class OptimizedLinear(nn.Module):
         # Result: (actual_batch_size, 1, in_features) @ (actual_batch_size, in_features, out_features)
         #       -> (actual_batch_size, 1, out_features)
         # Squeeze to get (actual_batch_size, out_features)
-        output_per_sample = torch.bmm(input_data.unsqueeze(1), simulated_weight.transpose(1, 2)).squeeze(1)
+        output_per_sample = torch.bmm(input_data, simulated_weight.transpose(1, 2))
 
         if self.bias is not None:
             # Simulate bias perturbation as well
