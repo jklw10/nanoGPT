@@ -247,14 +247,15 @@ class GPT(nn.Module):
         self.surprise = 1
         if(convemb):
             self.convemb = wackmodel.Patcher(config)
-            self.lm_head = optim.OptimizedLinear(config.n_embd, config.vocab_size * self.patch_max, bias=False, batch_size=64)
+            self.lm_head = nn.Linear(config.n_embd, config.vocab_size * self.patch_max, bias=False)
         else:
-            self.lm_head = optim.OptimizedLinear(config.n_embd, config.vocab_size, bias=False, batch_size=64)
+            #it'd seem like this isn't worth optimized linear's hassle with apple's CCE loss + atleast i benefit from weight tying.
+            self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)# optim.OptimizedLinear(config.n_embd, config.vocab_size, bias=False, batch_size=64)
             # with weight tying when using torch.compile() some warnings get generated:
             # "UserWarning: functional_call was passed multiple values for tied weights.
             # This behavior is deprecated and will be an error in future versions"
             # not 100% sure what this is, so far seems to be harmless. TODO investigate
-            #self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+            self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
         
         self.predict_weight = 0.01
         # init all weights
@@ -325,9 +326,13 @@ class GPT(nn.Module):
             reduction= 'none'
             if(not self.training):
                 reduction = 'mean'
+            #    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='mean')
+            #else:
+            #    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none').view(b,t)
             loss = linear_cross_entropy(x.to(torch.bfloat16), self.lm_head.weight.to(torch.bfloat16), targets, impl='torch_compile', reduction=reduction)
             
-            #loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1) 
+            #loss = F.cross_entropy(logits, targets, ignore_index=-1, reduction=reduction) 
+            #loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=reduction).view(b,t)
             #TODO: wavelet loss
             if(convemb):
                 loss = self.convemb.loss(logits, patchtargets, pploss)

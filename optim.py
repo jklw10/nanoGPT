@@ -64,8 +64,8 @@ class OptimizedLinear(nn.Module):
             
         simulated_weight = self.weight.unsqueeze(0) - \
                            self.previous_weight_grad.unsqueeze(0) * self.batch_lr_samples[:actual_batch_size].view(-1, 1, 1)
-        ##output_per_sample = torch.bmm(x, simulated_weight.transpose(1, 2))
-        output_per_sample = torch.einsum('bsi,boi->bso', x, simulated_weight)
+        output_per_sample = torch.bmm(x, simulated_weight.transpose(1, 2))
+        #output_per_sample = torch.einsum('bsi,boi->bso', x, simulated_weight)
         simulated_bias = None
         if self.bias is not None:
             simulated_bias = self.bias.unsqueeze(0) - \
@@ -108,7 +108,7 @@ class OptimizedLinear(nn.Module):
 
     @torch.no_grad()
     def _update_lr_stats(self, per_sample_losses: torch.Tensor):
-        if per_sample_losses.ndim != 1:
+        if per_sample_losses.ndim > 1:
             raise ValueError("per_sample_losses must be a 1D tensor (per-sample loss).")
         
         actual_batch_size = per_sample_losses.shape[0]

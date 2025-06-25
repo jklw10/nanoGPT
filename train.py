@@ -689,6 +689,7 @@ if(True): #i hate white space significance. (this is for that profiler and i'm l
             #del X
             #del Y
             X, Y = get_batch('train')
+            #print(loss.shape)
             loss = loss.mean(dim=0)
             loss.mean().backward()
             # backward pass, with gradient scaling if training in fp16
