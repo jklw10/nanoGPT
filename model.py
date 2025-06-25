@@ -322,8 +322,11 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)
         if targets is not None:
             logits = None# self.lm_head(x)
+            reduction= 'none'
+            if(not self.training):
+                reduction = 'mean'
+            loss = linear_cross_entropy(x.to(torch.bfloat16), self.lm_head.weight.to(torch.bfloat16), targets, impl='torch_compile', reduction=reduction)
             
-            loss = linear_cross_entropy(x.to(torch.bfloat16), self.lm_head.weight.to(torch.bfloat16), targets, impl='torch_compile')
             #loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1) 
             #TODO: wavelet loss
             if(convemb):
@@ -660,9 +663,15 @@ class GPT(nn.Module):
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        #self_lr = []
+        #for module in self.modules():
+        #    if isinstance(module, optim.OptimizedLinear):
+        #        for p in module.parameters():
+        #            self_lr.append(p)
         optim_groups = [
             {'params': decay_params, 'weight_decay': weight_decay},
             {'params': nodecay_params, 'weight_decay': 0.0},
+            #{'params': self_lr, 'lr': 1.0},
         ]
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
@@ -670,12 +679,14 @@ class GPT(nn.Module):
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
+        use_fused = fused_available and device_type == 'cuda' and False
         extra_args = dict(fused=True) if use_fused else dict()
         if(self.config.optim == 'adam'):
             optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
         else:
             optimizer = torch.optim.SGD(optim_groups, lr=learning_rate, **extra_args)
+        
+        #optimizer = optim.AdaptiveLROptimizer(optim_groups, lr=learning_rate,model = self, **extra_args)
             #optimizer =torch.optim.Adadelta(optim_groups)#, **extra_args)# lr=learning_rate, **extra_args)
         print(f"using fused AdamW: {use_fused}")
 

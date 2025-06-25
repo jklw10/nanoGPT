@@ -29,6 +29,7 @@ import torch._inductor.config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 from model import GPTConfig, GPT
+import optim
 import utils
 
 
@@ -604,6 +605,7 @@ if(True): #i hate white space significance. (this is for that profiler and i'm l
         if(dfw_enabled):
             wfunny(model)  
         
+        
             
 
         for param_group in optimizer.param_groups:
@@ -687,7 +689,8 @@ if(True): #i hate white space significance. (this is for that profiler and i'm l
             #del X
             #del Y
             X, Y = get_batch('train')
-            loss.backward()
+            loss = loss.mean(dim=0)
+            loss.mean().backward()
             # backward pass, with gradient scaling if training in fp16
             #scaler.scale(loss).backward()
         #if(dataset != 'shakespeare_char'):
@@ -698,6 +701,9 @@ if(True): #i hate white space significance. (this is for that profiler and i'm l
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         # step the optimizer and scaler if training in fp16
+        for mod in model.modules():
+            if isinstance(mod, optim.OptimizedLinear):
+                mod.prestep(loss)
         optimizer.step()
         if(decay):
             decaying *= 0.999999
