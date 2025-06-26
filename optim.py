@@ -77,14 +77,16 @@ class OptimizedLinear(nn.Module):
         
         with torch.no_grad():
             
-            if self.previous_weight_grad.grad is not None:
-                self.weight.data.sub_(self.previous_weight_grad * self.current_lr_mean) 
+            if self.weight.grad is not None:
+                if self.previous_weight_grad is not None:
+                    self.weight.data.sub_(self.previous_weight_grad * self.current_lr_mean) 
                 self.previous_weight_grad.copy_(self.weight.grad)
                 self.weight.grad.zero_()
-            if self.previous_bias_grad is not None and self.bias.grad is not None:
-                self.bias.data.sub_(self.previous_bias_grad * self.current_lr_mean)
+            if self.bias is not None and self.bias.grad:
+                if self.previous_bias_grad is not None:
+                    self.bias.data.sub_(self.previous_bias_grad * self.current_lr_mean) 
                 self.previous_bias_grad.copy_(self.bias.grad)
-                self.bias.grad.zero_() 
+                self.bias.grad.zero_()
     
     
     def prestep(self, per_sample_losses: torch.Tensor):

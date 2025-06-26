@@ -249,13 +249,14 @@ class GPT(nn.Module):
             self.convemb = wackmodel.Patcher(config)
             self.lm_head = nn.Linear(config.n_embd, config.vocab_size * self.patch_max, bias=False)
         else:
-            #it'd seem like this isn't worth optimized linear's hassle with apple's CCE loss + atleast i benefit from weight tying.
+            #it'd seem like this isn't worth optimized linear's hassle with apple's CCE loss 
             self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)# optim.OptimizedLinear(config.n_embd, config.vocab_size, bias=False, batch_size=64)
             # with weight tying when using torch.compile() some warnings get generated:
             # "UserWarning: functional_call was passed multiple values for tied weights.
             # This behavior is deprecated and will be an error in future versions"
             # not 100% sure what this is, so far seems to be harmless. TODO investigate
-            self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+            #apparently bad
+            #self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
         
         self.predict_weight = 0.01
         # init all weights

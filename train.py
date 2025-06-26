@@ -422,7 +422,7 @@ def custom_gradient_adjustment(grad, param, weight_ema = None, gema = 0.0):
     input_size = grad.size(0)
     adjusted_grad = torch.where(torch.isnan(grad), torch.zeros_like(grad), grad)
     if(gchaos):
-        adjusted_grad += torch.rand_like(adjusted_grad)*0.001
+        adjusted_grad += torch.rand_like(adjusted_grad)*1e-5
     
     if(gnorm): 
         
