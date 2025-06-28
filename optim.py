@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+import utils
+
 class OptimizedLinear(nn.Module):
     def __init__(self, in_features: int, out_features: int, batch_size: int, bias: bool = True):
         super().__init__()
@@ -78,9 +80,14 @@ class OptimizedLinear(nn.Module):
         with torch.no_grad():
             
             if self.weight.grad is not None:
-                if self.previous_weight_grad is not None:
+                if self.previous_weight_grad is not None:    
                     self.weight.data.sub_(self.previous_weight_grad * self.current_lr_mean) 
-                self.previous_weight_grad.copy_(self.weight.grad)
+
+                adjusted_grad = self.weight.grad
+                #adjusted_grad = utils.mmnorm(adjusted_grad)
+                #adjusted_grad = utils.zca_newton_schulz(adjusted_grad, 2, 2)
+                #
+                self.previous_weight_grad.copy_(adjusted_grad)
                 self.weight.grad.zero_()
             if self.bias is not None and self.bias.grad:
                 if self.previous_bias_grad is not None:

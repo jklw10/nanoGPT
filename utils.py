@@ -15,6 +15,7 @@ def funnyMulti(x, y):
 def unfunnyMulti(x, y):
     return torch.sign(x) * torch.abs((x ** 2) / y)
 
+@torch.compile(backend='inductor', mode='max-autotune')
 def mmnorm(x, dim = -1, scale = None):  
     if(scale is None):
         scale = 1 + 2 / x.nelement() #changed recently
