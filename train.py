@@ -225,7 +225,7 @@ if block_size < model.config.block_size:
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
 
-
+#switches
 best                = False
 
 gradorth            = False
@@ -706,6 +706,9 @@ if(True): #i hate white space significance. (this is for that profiler and i'm l
             if isinstance(mod, optim.OptimizedLinear):
                 mod.prestep(loss)
         optimizer.step()
+        for mod in model.modules():
+            if isinstance(mod, optim.OptimizedLinear):
+                mod.poststep()
         if(decay):
             decaying *= 0.999999
             #0.9999 = .05 at 30k

@@ -47,6 +47,8 @@ think           = False
 repeat_block    = False
 repeatCenter    = False
 
+xorgate         = True
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -54,6 +56,7 @@ class LayerNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(ndim))
         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+       
 
     def forward(self, input):
         if(mmnorm):
@@ -121,7 +124,7 @@ class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc    = optim.OptimizedLinear(config.n_embd, 4 * config.n_embd, bias=config.bias, batch_size=64)
-        if(qrot):
+        if(qrot or xorgate):
             self.c_proj  = optim.OptimizedLinear( 2*config.n_embd, config.n_embd, bias=config.bias, batch_size=64)
         else:
             self.gelu    = nn.GELU()
@@ -131,10 +134,21 @@ class MLP(nn.Module):
 
     def forward(self, x):
         x = self.c_fc(x)
-        if(qrot):
+        if(xorgate):
             b,t,n=x.shape
             x4d = x.view(b, t, self.n_embd, 4) # Reshape to (batch, seq_len, n_embd, 4)
-            x_norm = torch.max(x4d.norm(dim=-1, keepdim=True), torch.ones(1,device=x.device, dtype= x.dtype)*1e-10) # Calculate norm along the last dimension (dim=3 or -1), keep dimensions
+            #x_norm = torch.max(x4d.norm(dim=-1, keepdim=True), 1e-10) # Calculate norm along the last dimension (dim=3 or -1), keep dimensions
+            #x_normalized = x4d / x_norm             # Divide to normalize
+            rotors, rotated = x4d.chunk(2, dim=2) # Split along n_embd dimension
+            #xm,ym = x_norm.chunk(2, dim=2)
+            x_rotated = utils.quaternion_multiply(rotors, rotated) 
+            #x_rotated = x_rotated*self.gaprelu(x_norm-2)#*torch.sigmoid(xm+ym)#
+            x = x_rotated.view(b, t, 2 * self.n_embd)
+
+        elif(qrot):
+            b,t,n=x.shape
+            x4d = x.view(b, t, self.n_embd, 4) # Reshape to (batch, seq_len, n_embd, 4)
+            x_norm = torch.max(x4d.norm(dim=-1, keepdim=True), 1e-10) # Calculate norm along the last dimension (dim=3 or -1), keep dimensions
             x_normalized = x4d / x_norm             # Divide to normalize
             rotors, rotated = x_normalized.chunk(2, dim=2) # Split along n_embd dimension
             #xm,ym = x_norm.chunk(2, dim=2)

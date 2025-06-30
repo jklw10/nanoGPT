@@ -5,6 +5,8 @@ import math
 
 import utils
 
+ema_thing = True
+alpha = 0.9
 class OptimizedLinear(nn.Module):
     def __init__(self, in_features: int, out_features: int, batch_size: int, bias: bool = True):
         super().__init__()
@@ -21,6 +23,10 @@ class OptimizedLinear(nn.Module):
             self.register_parameter('bias', None)
 
         
+        self.register_buffer("wema", torch.zeros_like(self.weight))
+        self.previous_bias_grad = None
+        if bias:
+            self.register_buffer("bema", torch.zeros_like(self.bias))
         
         # Stores the gradient from the *previous* backward pass practically a per weight bias, which gets added to the weight after a run with lr.
       
@@ -53,11 +59,27 @@ class OptimizedLinear(nn.Module):
             self.current_lr_mean.fill_(0.5)
             self.current_lr_var.fill_(0.5)
             self._sample_batch_lrs() 
+            if(ema_thing):
+                self.wema =  (self.weight.data)
+                if self.bias is not None:
+                    self.bema =  (self.bias.data )
+            return
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # input_data: (actual_batch_size, in_features)
         if(not self.training):
             return nn.functional.linear(x,self.weight,self.bias)
+        
+        if(ema_thing):
+            #skip ema on backward pass?
+            forward_weight = utils.funnyMulti(self.wema.detach(), self.weight)
+            simulated_weight = self.weight + (forward_weight - self.weight).detach()
+
+            #simulated_weight = utils.funnyMulti(self.weight, self.wema)
+            simulated_bias = None
+            if self.bias is not None:
+                simulated_bias = utils.funnyMulti(self.bias, self.bema)
+            return nn.functional.linear(x,simulated_weight,simulated_bias)
         
         actual_batch_size = x.shape[0]
         if actual_batch_size != self.batch_size:
@@ -66,6 +88,7 @@ class OptimizedLinear(nn.Module):
             
         simulated_weight = self.weight.unsqueeze(0) - \
                            self.previous_weight_grad.unsqueeze(0) * self.batch_lr_samples[:actual_batch_size].view(-1, 1, 1)
+        
         output_per_sample = torch.bmm(x, simulated_weight.transpose(1, 2))
         #output_per_sample = torch.einsum('bsi,boi->bso', x, simulated_weight)
         simulated_bias = None
@@ -95,11 +118,31 @@ class OptimizedLinear(nn.Module):
                 self.previous_bias_grad.copy_(self.bias.grad)
                 self.bias.grad.zero_()
     
-    
+    def poststep(self):
+        #pass
+        if(ema_thing):
+            with torch.no_grad():
+                self.wema += alpha * (self.weight.data - self.wema)
+                if self.bias is not None:
+                    self.bema += alpha * (self.bias.data - self.bema)
+
     def prestep(self, per_sample_losses: torch.Tensor):
         """
         Call this method *before* the optimizer.step().
         """
+        if(ema_thing):
+            #with torch.no_grad():
+            #    self.wema += espeed * (self.weight.data - self.wema)
+            #    if self.bias is not None:
+            #        self.bema += espeed * (self.bias.data - self.bema)
+            return
+        
+        #if(ema_thing):
+        #    with torch.no_grad():
+        #        self.wema += 0.1 * (self.weight.data - self.wema)
+        #        if self.bias is not None:
+        #            self.bema += 0.1 * (self.bias.data - self.bema)
+        #    return
         self._update_lr_stats(per_sample_losses)
         self._weight_update()
         self._sample_batch_lrs()

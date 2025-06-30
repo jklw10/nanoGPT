@@ -10,10 +10,10 @@ from torch.nn import functional as F
 #everything here is probably a candidate to be made into a kernel.
 
 def funnyMulti(x, y):
-    return torch.sign(x) * torch.sqrt(torch.abs(x * y))
+    return torch.sign(x) * torch.sqrt(torch.abs(x * y) + 1e-10)
 
 def unfunnyMulti(x, y):
-    return torch.sign(x) * torch.abs((x ** 2) / y)
+    return torch.sign(x) * torch.abs((x ** 2) / (y + 1e-10))
 
 @torch.compile(backend='inductor', mode='max-autotune')
 def mmnorm(x, dim = -1, scale = None):  
@@ -27,6 +27,12 @@ def fast_sin_leakyrelu(x):
      base = F.leaky_relu(x)
      sine_mod = F.relu(torch.sign(x)) * torch.sin(1.25 * x)
      return base + sine_mod
+
+
+def oozing_floor(x):
+     base = F.leaky_relu(x)
+     oozing_floor = F.relu(torch.sign(x)) * torch.floor(1.25 * x)
+     return base + oozing_floor
 
 def fast_sin_gelu_leaky(x, leaky=0.01):
      base = F.gelu(x)
