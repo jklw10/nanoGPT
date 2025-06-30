@@ -95,6 +95,7 @@ def create_memory_causal_mask2(memory_length, incoming_length):
 
 def lambda_init_fn(depth):
     return 0.8 - 0.6 * math.exp(-0.3 * depth)
+@torch.compile(backend='inductor', mode='max-autotune')
 def quaternion_multiply(q1, q2):
     """
     Performs quaternion multiplication of two quaternions or batches of quaternions.

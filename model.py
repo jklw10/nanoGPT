@@ -47,7 +47,8 @@ think           = False
 repeat_block    = False
 repeatCenter    = False
 
-xorgate         = True
+tests           = True
+lnormless       = True
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -61,7 +62,74 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         if(mmnorm):
             return torch.tanh(input*self.weight)
+        if(lnormless):
+            return input
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+
+class QrotAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = optim.OptimizedLinear(config.n_embd, 2 * config.n_embd, bias=config.bias, batch_size=64)
+        # output projection
+        self.c_proj = optim.OptimizedLinear(config.n_embd,  config.n_embd, bias=config.bias, batch_size=64)
+        
+        # regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head 
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        self.head_dim =  self.n_embd //  self.n_head 
+        
+        self.qm = nn.Parameter(torch.ones(self.head_dim).normal_(mean=1, std=0.1))
+
+    def parallel_quaternion_scan(self, local_rotations):
+        #todo, make it actually parallel instead of just lying in the title lmao
+        seq_len = local_rotations.shape[1]
+        H_t = local_rotations[:, 0, :, :]
+        cumulative_outputs = [H_t]
+        for t in range(1, seq_len):
+            H_t = utils.quaternion_multiply(H_t, local_rotations[:, t, :, :])
+            cumulative_outputs.append(H_t)
+        return torch.stack(cumulative_outputs, dim=1)
+
+
+    def forward(self, x, mem=None,causal=True):
+        B, T, C = x.size() 
+        q, v = self.c_attn(x).split(self.n_embd, dim=2)
+        #q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        # q, k, v are tensors of shape [batch, seq_len, num_quaternions, 4]
+        
+        q = q.view(B, T, C//4, 4)#.transpose(1, 2) # (B, nh, T, hs)
+        #k = k.view(B, T, C//4, 4)
+        v = v.view(B, T, C//4, 4)
+
+        q_unit = q / torch.norm(q, p=2, dim=-1, keepdim=True) 
+        #k_unit = k #/ torch.norm(k, p=2, dim=-1, keepdim=True)
+        local_rotations = q_unit#utils.quaternion_multiply(q_unit, k_unit)
+
+        cumulative_rotations = self.parallel_quaternion_scan(local_rotations)
+
+        Y = utils.quaternion_multiply(cumulative_rotations, v)
+
+        Y = Y.view(B, T, -1)
+        return Y
+    
+    #def forward(self, x,mem=None, causal=True):
+    #    B, T, C = x.size() 
+    #    
+    #    q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+    #    q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+    #    k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+    #    v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+#
+    #    y = torch.nn.functional.scaled_dot_product_attention(q*(math.log(T)*self.qm), k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal= causal)
+    #    y = y.transpose(1, 2).contiguous().view(B, T, self.n_head * self.head_dim) 
+    #    y = self.resid_dropout(self.c_proj(y))
+#
+    #    return y[:,self.mem_len:,:]
 
 class MemAttention(nn.Module):
     def __init__(self, config):
@@ -120,11 +188,41 @@ class MemAttention(nn.Module):
 
         return y[:,self.mem_len:,:]
 
+class LearnableSpiral4D(nn.Module):
+    def __init__(self, init_freq=1.0, init_amp=1.0):
+        super().__init__()
+        
+        freqs = torch.ones(4) * init_freq + torch.randn(4) * 0.1
+        self.frequencies = nn.Parameter(freqs)
+
+        phases = torch.linspace(0, 2 * torch.pi, 5)[:-1] # 0, pi/2, pi, 3pi/2
+        self.phase_shifts = nn.Parameter(phases)
+
+        amps = torch.ones(4) * init_amp
+        self.amplitude_scales = nn.Parameter(amps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[-1] != 1:
+            x = x.unsqueeze(-1)
+        sin_term = torch.sin(self.frequencies * x + self.phase_shifts)
+        
+        amp_term = self.amplitude_scales * x
+        
+        output = sin_term * amp_term
+        
+        return output
+
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc    = optim.OptimizedLinear(config.n_embd, 4 * config.n_embd, bias=config.bias, batch_size=64)
-        if(qrot or xorgate):
+        #if(tests):
+        #    self.c_fc    = optim.OptimizedLinear(config.n_embd, 5 * config.n_embd, bias=config.bias, batch_size=64)
+        #    #self.qrotw = nn.Parameter(torch.randn(4 * config.n_embd))
+        #    self.wack = LearnableSpiral4D()
+        #    self.c_proj  = optim.OptimizedLinear( 4*config.n_embd, config.n_embd, bias=config.bias, batch_size=64)
+
+        if(qrot):
             self.c_proj  = optim.OptimizedLinear( 2*config.n_embd, config.n_embd, bias=config.bias, batch_size=64)
         else:
             self.gelu    = nn.GELU()
@@ -134,18 +232,20 @@ class MLP(nn.Module):
 
     def forward(self, x):
         x = self.c_fc(x)
-        if(xorgate):
-            b,t,n=x.shape
-            x4d = x.view(b, t, self.n_embd, 4) # Reshape to (batch, seq_len, n_embd, 4)
-            #x_norm = torch.max(x4d.norm(dim=-1, keepdim=True), 1e-10) # Calculate norm along the last dimension (dim=3 or -1), keep dimensions
-            #x_normalized = x4d / x_norm             # Divide to normalize
-            rotors, rotated = x4d.chunk(2, dim=2) # Split along n_embd dimension
-            #xm,ym = x_norm.chunk(2, dim=2)
-            x_rotated = utils.quaternion_multiply(rotors, rotated) 
-            #x_rotated = x_rotated*self.gaprelu(x_norm-2)#*torch.sigmoid(xm+ym)#
-            x = x_rotated.view(b, t, 2 * self.n_embd)
+        #if(tests):
+        #    b,t,n=x.shape
+        #    x4d = x.view(b, t, self.n_embd, 5) # Reshape to (batch, seq_len, n_embd, 4)
+        #    #x_norm = torch.max(x4d.norm(dim=-1, keepdim=True), 1e-10) # Calculate norm along the last dimension (dim=3 or -1), keep dimensions
+        #    #x_normalized = x4d / x_norm             # Divide to normalize
+        #    rotors = self.wack(x4d[:,:,:,-1])
+        #    rotated = x4d[:,:,:,:-1]
+        #    #rotors, rotated = x4d.chunk(2, dim=2) # Split along n_embd dimension
+        #    #xm,ym = x_norm.chunk(2, dim=2)
+        #    x_rotated = utils.quaternion_multiply(rotors, rotated) 
+        #    #x_rotated = x_rotated*self.gaprelu(x_norm-2)#*torch.sigmoid(xm+ym)#
+        #    x = x_rotated.view(b, t, 4 * self.n_embd)
 
-        elif(qrot):
+        if(qrot):
             b,t,n=x.shape
             x4d = x.view(b, t, self.n_embd, 4) # Reshape to (batch, seq_len, n_embd, 4)
             x_norm = torch.max(x4d.norm(dim=-1, keepdim=True), 1e-10) # Calculate norm along the last dimension (dim=3 or -1), keep dimensions
@@ -168,6 +268,8 @@ class MemBlock(nn.Module):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = MemAttention(config)
+        if(tests):
+            self.attn = QrotAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
