@@ -48,7 +48,7 @@ repeat_block    = False
 repeatCenter    = False
 
 tests           = True
-lnormless       = True
+
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -62,8 +62,6 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         if(mmnorm):
             return torch.tanh(input*self.weight)
-        if(lnormless):
-            return input
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
 class QrotAttention(nn.Module):
@@ -78,58 +76,36 @@ class QrotAttention(nn.Module):
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head 
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.head_dim =  self.n_embd //  self.n_head 
-        
-        self.qm = nn.Parameter(torch.ones(self.head_dim).normal_(mean=1, std=0.1))
+     
 
-    def parallel_quaternion_scan(self, local_rotations):
-        #todo, make it actually parallel instead of just lying in the title lmao
-        seq_len = local_rotations.shape[1]
-        H_t = local_rotations[:, 0, :, :]
-        cumulative_outputs = [H_t]
-        for t in range(1, seq_len):
-            H_t = utils.quaternion_multiply(H_t, local_rotations[:, t, :, :])
-            cumulative_outputs.append(H_t)
-        return torch.stack(cumulative_outputs, dim=1)
-
-
-    def forward(self, x, mem=None,causal=True):
+    def forward(self, x: torch.tensor, mem=None,causal=True, k=None):
         B, T, C = x.size() 
         q, v = self.c_attn(x).split(self.n_embd, dim=2)
-        #q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        # q, k, v are tensors of shape [batch, seq_len, num_quaternions, 4]
         
-        q = q.view(B, T, C//4, 4)#.transpose(1, 2) # (B, nh, T, hs)
-        #k = k.view(B, T, C//4, 4)
+        # q, k, v are tensors of shape [batch, seq_len, num_quaternions, 4]
+       
+        q = q.view(B, T, C//4, 4)
         v = v.view(B, T, C//4, 4)
 
-        q_unit = q / torch.norm(q, p=2, dim=-1, keepdim=True) 
-        #k_unit = k #/ torch.norm(k, p=2, dim=-1, keepdim=True)
-        local_rotations = q_unit#utils.quaternion_multiply(q_unit, k_unit)
+        #q_norms = torch.norm(q, p=2, dim=-1, keepdim=True)
+        q_unit =  q #* torch.softmax(q_norms, dim=-1) #probably bad idea for expandability
+        #q_unit = q # q / torch.norm(q, p=2, dim=-1, keepdim=True), dim=-1)
+        if(k is not None):
+            k = k.view(B, T, C//4, 4).clone()
+            k_unit = k #/ torch.norm(k, p=2, dim=-1, keepdim=True)
+            local_rotations = utils.quaternion_multiply(q_unit, k_unit)
+        else:
+            local_rotations = q_unit
 
-        cumulative_rotations = self.parallel_quaternion_scan(local_rotations)
+        cumulative_rotations = utils.parallel_quaternion_scan_log_n(local_rotations)
 
         Y = utils.quaternion_multiply(cumulative_rotations, v)
-
+        #Y / torch.norm(Y, p=2, dim=-1, keepdim=True)
         Y = Y.view(B, T, -1)
         return Y
     
-    #def forward(self, x,mem=None, causal=True):
-    #    B, T, C = x.size() 
-    #    
-    #    q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-    #    q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-    #    k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-    #    v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-#
-    #    y = torch.nn.functional.scaled_dot_product_attention(q*(math.log(T)*self.qm), k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal= causal)
-    #    y = y.transpose(1, 2).contiguous().view(B, T, self.n_head * self.head_dim) 
-    #    y = self.resid_dropout(self.c_proj(y))
-#
-    #    return y[:,self.mem_len:,:]
 
 class MemAttention(nn.Module):
     def __init__(self, config):
@@ -232,19 +208,6 @@ class MLP(nn.Module):
 
     def forward(self, x):
         x = self.c_fc(x)
-        #if(tests):
-        #    b,t,n=x.shape
-        #    x4d = x.view(b, t, self.n_embd, 5) # Reshape to (batch, seq_len, n_embd, 4)
-        #    #x_norm = torch.max(x4d.norm(dim=-1, keepdim=True), 1e-10) # Calculate norm along the last dimension (dim=3 or -1), keep dimensions
-        #    #x_normalized = x4d / x_norm             # Divide to normalize
-        #    rotors = self.wack(x4d[:,:,:,-1])
-        #    rotated = x4d[:,:,:,:-1]
-        #    #rotors, rotated = x4d.chunk(2, dim=2) # Split along n_embd dimension
-        #    #xm,ym = x_norm.chunk(2, dim=2)
-        #    x_rotated = utils.quaternion_multiply(rotors, rotated) 
-        #    #x_rotated = x_rotated*self.gaprelu(x_norm-2)#*torch.sigmoid(xm+ym)#
-        #    x = x_rotated.view(b, t, 4 * self.n_embd)
-
         if(qrot):
             b,t,n=x.shape
             x4d = x.view(b, t, self.n_embd, 4) # Reshape to (batch, seq_len, n_embd, 4)
@@ -273,8 +236,8 @@ class MemBlock(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x, mem = None, causal = True):
-        x = x + self.attn(self.ln_1(x),mem,causal)
+    def forward(self, x, mem = None, causal = True, k =None):
+        x = x + self.attn(self.ln_1(x),mem,causal,k)
         x = x + self.mlp(self.ln_2(x))
         return x
     
@@ -294,8 +257,6 @@ class Dreamer(nn.Module):
             x = self.block(x, causal = CausalMem)
 
         return x
-
-    
 
 @dataclass
 class GPTConfig:
@@ -426,11 +387,15 @@ class GPT(nn.Module):
         
         if spl:
             block_inputs = []
-
+        x= x.view(b, t, self.config.n_embd//4, 4)
+        ogx = x# utils.parallel_quaternion_scan_log_n(x)
+        x = x /  torch.norm(x, p=2, dim=-1, keepdim=True)
+        #ogx = x
+        x = x.view(b, t, -1)
         for i, block in enumerate(self.transformer.h):
             if spl:
                 block_inputs.append(x) 
-            x = block(x) 
+            x = block(x, k= ogx) 
 
             if mix_squish:
                 if self.config.mix_mask[i]:
