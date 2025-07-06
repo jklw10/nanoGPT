@@ -29,6 +29,7 @@ import torch._inductor.config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 from model import GPTConfig, GPT
+import optim
 import utils
 
 
@@ -88,7 +89,11 @@ exec(open('configurator.py').read()) # overrides from command line or config fil
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
-
+#q = torch.rand(10,10,10,4,device=device)
+#q1 = utils.scan_quaternion_multiply_window(q.clone(),3)
+#q2 = utils.naive_scan_quaternion_multiply_window(q.clone(),3)
+#print(f"difference in result: {torch.nn.functional.mse_loss(q1,q2)}")
+#torch._dynamo.reset() in case of cache corruption throw it off a bridge.
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -224,7 +229,7 @@ if block_size < model.config.block_size:
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
 
-
+#switches
 best                = False
 
 gradorth            = False
@@ -234,7 +239,7 @@ dfw_enabled         = False
 decor_enabled       = False
 #rough
 wnorm_enabled       = False
-gdiff_enabled       = True
+gdiff_enabled       = False
 grokfast            = False
 sign_enabled        = False
 
@@ -267,11 +272,11 @@ lrfinder = False
 
 if (lrfinder):
     lr = 1.0
-    for i, p in enumerate(model.parameters()):
-        oldgrad = [torch.zeros_like(p) for p in model.parameters()]
-        batch_lr = [torch.randn(p) for p in range(batch_size)]
-        if p.requires_grad:
-            p.register_hook(lambda grad, oldgrad=oldgrad, batch_lr=batch_lr: grad_oldener(grad, oldgrad, batch_lr ))
+    #for i, p in enumerate(model.parameters()):
+    #    oldgrad = [torch.zeros_like(p) for p in model.parameters()]
+    #    batch_lr = [torch.randn(p) for p in range(batch_size)]
+    #    if p.requires_grad:
+    #        p.register_hook(lambda grad, oldgrad=oldgrad, batch_lr=batch_lr: grad_oldener(grad, oldgrad, batch_lr ))
 
 if(ghook):
     
@@ -421,7 +426,7 @@ def custom_gradient_adjustment(grad, param, weight_ema = None, gema = 0.0):
     input_size = grad.size(0)
     adjusted_grad = torch.where(torch.isnan(grad), torch.zeros_like(grad), grad)
     if(gchaos):
-        adjusted_grad += torch.rand_like(adjusted_grad)*0.001
+        adjusted_grad += torch.rand_like(adjusted_grad)*1e-5
     
     if(gnorm): 
         
@@ -586,7 +591,8 @@ if(True): #i hate white space significance. (this is for that profiler and i'm l
     while True:
         # determine and set the learning rate for this iteration
         lr = get_lr(iter_num) if decay_lr else learning_rate
-
+        if(lrfinder):
+            lr = 1
         #if(dfw_enabled):
         #    wunfunny(model) 
         if(wwhite_enabled):
@@ -602,6 +608,7 @@ if(True): #i hate white space significance. (this is for that profiler and i'm l
             normalize_matrices()
         if(dfw_enabled):
             wfunny(model)  
+        
         
             
 
@@ -686,7 +693,9 @@ if(True): #i hate white space significance. (this is for that profiler and i'm l
             #del X
             #del Y
             X, Y = get_batch('train')
-            loss.backward()
+            #print(loss.shape)
+            loss = loss.mean(dim=0)
+            loss.mean().backward()
             # backward pass, with gradient scaling if training in fp16
             #scaler.scale(loss).backward()
         #if(dataset != 'shakespeare_char'):
@@ -697,7 +706,13 @@ if(True): #i hate white space significance. (this is for that profiler and i'm l
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         # step the optimizer and scaler if training in fp16
+        for mod in model.modules():
+            if isinstance(mod, optim.OptimizedLinear):
+                mod.prestep(loss)
         optimizer.step()
+        for mod in model.modules():
+            if isinstance(mod, optim.OptimizedLinear):
+                mod.poststep()
         if(decay):
             decaying *= 0.999999
             #0.9999 = .05 at 30k

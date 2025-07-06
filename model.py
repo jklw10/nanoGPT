@@ -16,6 +16,7 @@ from pytorch_wavelets import DWT1DForward
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import optim
 import utils
 import wackmodel
 from cut_cross_entropy import linear_cross_entropy
@@ -41,10 +42,13 @@ qope            = False
 side_squish     = False
 #slow
 spl             = False or fftmem
-qrot            = False
+qrot            = True
 think           = False
 repeat_block    = False
 repeatCenter    = False
+
+tests           = True
+
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -53,11 +57,66 @@ class LayerNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(ndim))
         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+       
 
     def forward(self, input):
+        #if(tests):
+        #    return input
         if(mmnorm):
             return torch.tanh(input*self.weight)
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+
+class QrotAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+
+        self.c_attn =  nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        
+        self.c_proj = nn.Linear(config.n_embd,  config.n_embd, bias=config.bias) #todo
+
+        self.c_kattn = nn.Linear(config.n_embd,  config.n_embd, bias=config.bias)
+        
+        
+        self.register_buffer('qidentity', torch.tensor([1.0, 0.0, 0.0, 0.0]).view(1, 1, 1, 4))
+
+        self.attn_dropout = nn.Dropout(config.dropout) #todo
+        self.resid_dropout = nn.Dropout(config.dropout) #todo
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+     
+
+    def forward(self, x: torch.tensor, mem=None,causal=True, k=None): #same signature to allow easy swapping.
+        B, T, C = x.size() 
+        q, s_gate, v = self.c_attn(x).split(self.n_embd, dim=2)
+        
+        # q, k, v are tensors of shape [batch, seq_len, num_quaternions, 4]
+       
+        q = q.view(B, T, C//4, 4)
+        v = v.view(B, T, C//4, 4)
+
+        s_gate = s_gate.view(B, T, C // 4, 4) 
+        s = torch.sigmoid(s_gate.mean(dim=-1, keepdim=True)) # Shape: [B, T, C//4, 1]
+
+        #q_norms = torch.norm(q, p=2, dim=-1, keepdim=True)
+        #q = q * torch.softmax(q_norms, dim=2) #probably bad idea for on the fly expandability, but atleast better than default norm
+        #q = q / (torch.norm(q, p=2, dim=-1, keepdim=True) + 1e-10)
+        #q = utils.lerp(q,self.qidentity,s) #try different lerps here
+
+        #q = q*s
+        q = utils.exponential_map(q*s)
+        #q = q / (torch.norm(q, p=2, dim=-1, keepdim=True) + 1e-10)
+        #if(k is not None): #this allows for block_size 256 to work, k acts as gate, and with less of a penalty than qnorm
+        #    k = k.view(B, T, C//4, 4).clone()
+        #    #k = k / torch.norm(k, p=2, dim=-1, keepdim=True)
+        #    q = utils.quaternion_multiply(q, k)
+        
+        q = utils.parallel_quaternion_scan_log_n(q)
+
+        Y = utils.quaternion_multiply(q, v)
+        #Y = Y / torch.norm(Y, p=2, dim=-1, keepdim=True)
+        Y = Y.view(B, T, -1)
+        return Y
+    
 
 class MemAttention(nn.Module):
     def __init__(self, config):
@@ -66,10 +125,10 @@ class MemAttention(nn.Module):
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd,  config.n_embd, bias=config.bias)
         
         #attention mod modifier
-        self.attmod = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.attmod = nn.Linear(config.n_embd,  config.n_embd, bias=config.bias)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -116,6 +175,30 @@ class MemAttention(nn.Module):
 
         return y[:,self.mem_len:,:]
 
+class LearnableSpiral4D(nn.Module):
+    def __init__(self, init_freq=1.0, init_amp=1.0):
+        super().__init__()
+        
+        freqs = torch.ones(4) * init_freq + torch.randn(4) * 0.1
+        self.frequencies = nn.Parameter(freqs)
+
+        phases = torch.linspace(0, 2 * torch.pi, 5)[:-1] # 0, pi/2, pi, 3pi/2
+        self.phase_shifts = nn.Parameter(phases)
+
+        amps = torch.ones(4) * init_amp
+        self.amplitude_scales = nn.Parameter(amps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[-1] != 1:
+            x = x.unsqueeze(-1)
+        sin_term = torch.sin(self.frequencies * x + self.phase_shifts)
+        
+        amp_term = self.amplitude_scales * x
+        
+        output = sin_term * amp_term
+        
+        return output
+
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -133,7 +216,7 @@ class MLP(nn.Module):
         if(qrot):
             b,t,n=x.shape
             x4d = x.view(b, t, self.n_embd, 4) # Reshape to (batch, seq_len, n_embd, 4)
-            x_norm = torch.max(x4d.norm(dim=-1, keepdim=True), torch.ones(1,device=x.device, dtype= x.dtype)*1e-10) # Calculate norm along the last dimension (dim=3 or -1), keep dimensions
+            x_norm = torch.clamp_min(x4d.norm(dim=-1, keepdim=True), 1e-10) # Calculate norm along the last dimension (dim=3 or -1), keep dimensions
             x_normalized = x4d / x_norm             # Divide to normalize
             rotors, rotated = x_normalized.chunk(2, dim=2) # Split along n_embd dimension
             #xm,ym = x_norm.chunk(2, dim=2)
@@ -153,13 +236,31 @@ class MemBlock(nn.Module):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = MemAttention(config)
+        if(tests):
+            self.attn = QrotAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x, mem = None, causal = True):
-        x = x + self.attn(self.ln_1(x),mem,causal)
+    def forward(self, x, mem = None, causal = True, k =None):
+        x = x + self.attn(self.ln_1(x),mem,causal,k)
         x = x + self.mlp(self.ln_2(x))
         return x
+
+    def spl(self, block_input, x, memory = None, k = None):
+        b, t, e = x.size()
+        target_output = block_input #store in block?
+        if memory is not None:
+            predicted_output = self(-x, -self.memory.expand(b, self.config.mem_block_size, self.config.n_embd), causal = False)
+        elif k is not None:
+            predicted_output = self(-x, k = k, causal = False)
+        else:
+            predicted_output = self(-x, causal = False)
+            
+        sploss = F.mse_loss(
+            utils.mmnorm(predicted_output.flatten()),
+            utils.mmnorm(target_output.flatten())
+        ) 
+        return sploss
     
 class Dreamer(nn.Module):
     def __init__(self, config):
@@ -178,8 +279,6 @@ class Dreamer(nn.Module):
 
         return x
 
-    
-
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -196,6 +295,7 @@ class GPTConfig:
     #optim: str = 'SGD'
     optim: str = 'adam'
     mem_block_size: int = 8
+    batch_size = 64
 
 class GPT(nn.Module):
 
@@ -248,12 +348,14 @@ class GPT(nn.Module):
             self.convemb = wackmodel.Patcher(config)
             self.lm_head = nn.Linear(config.n_embd, config.vocab_size * self.patch_max, bias=False)
         else:
-            self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+            #it'd seem like this isn't worth optimized linear's hassle with apple's CCE loss 
+            self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)# optim.OptimizedLinear(config.n_embd, config.vocab_size, bias=False, batch_size=64)
             # with weight tying when using torch.compile() some warnings get generated:
             # "UserWarning: functional_call was passed multiple values for tied weights.
             # This behavior is deprecated and will be an error in future versions"
             # not 100% sure what this is, so far seems to be harmless. TODO investigate
-            self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+            #apparently bad
+            #self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
         
         self.predict_weight = 0.01
         # init all weights
@@ -307,11 +409,15 @@ class GPT(nn.Module):
         
         if spl:
             block_inputs = []
-
+        x= x.view(b, t, self.config.n_embd//4, 4)
+        ogx = x# utils.parallel_quaternion_scan_log_n(x)
+        x = x /  torch.norm(x, p=2, dim=-1, keepdim=True)
+        #ogx = x
+        x = x.view(b, t, -1)
         for i, block in enumerate(self.transformer.h):
             if spl:
                 block_inputs.append(x) 
-            x = block(x) 
+            x = block(x, k= ogx) 
 
             if mix_squish:
                 if self.config.mix_mask[i]:
@@ -321,9 +427,16 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)
         if targets is not None:
             logits = None# self.lm_head(x)
+            reduction= 'none'
+            if(not self.training):
+                reduction = 'mean'
+            #    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='mean')
+            #else:
+            #    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none').view(b,t)
+            loss = linear_cross_entropy(x.to(torch.bfloat16), self.lm_head.weight.to(torch.bfloat16), targets, impl='torch_compile', reduction=reduction)
             
-            loss = linear_cross_entropy(x.to(torch.bfloat16), self.lm_head.weight.to(torch.bfloat16), targets, impl='torch_compile')
-            #loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1) 
+            #loss = F.cross_entropy(logits, targets, ignore_index=-1, reduction=reduction) 
+            #loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=reduction).view(b,t)
             #TODO: wavelet loss
             if(convemb):
                 loss = self.convemb.loss(logits, patchtargets, pploss)
@@ -466,35 +579,12 @@ class GPT(nn.Module):
             loss = None
             return firstLogit, loss
     
-    def blockspl(self, block, block_input, x, memory = None):
-        b, t, e = x.size()
-        loss = 0
-        target_output = block_input 
-        #print("x:" + x.size())
-        #print("bs:" +block_input.size())
-        if memory is not None:
-            predicted_output = block(-x, -self.memory.expand(b, self.config.mem_block_size, self.config.n_embd), causal = False)
-         #   print("mem:" +memory.size())
-        else:
-            predicted_output = block(-x, causal = False)
-            
-        sploss = F.mse_loss(
-            utils.mmnorm(predicted_output.flatten()),
-            utils.mmnorm(target_output.flatten())
-        ) #/ predicted_output.numel()
-        #print("po:" +predicted_output.size())
-        #sploss = abs(torch.dot(
-        #    utils.mmnorm(predicted_output.flatten()),
-        #    utils.mmnorm(target_output.flatten())
-        #) / predicted_output.numel())  #why does this even work mse is ever so slightly worse :pain:
-        loss = loss + sploss 
-        return loss
     
-    def self_prediction_loss(self, block_inputs, x, memory = None):
+    def self_prediction_loss(self, block_inputs, x, memory = None, k =None):
         b, t, e = x.size()
         loss = 0
         for i, block in enumerate(self.transformer.h):
-            loss = loss + self.blockspl(block, block_inputs[i], x, memory) 
+            loss = loss + block.spl( block_inputs[i], x, memory, k) 
         return loss
     
     
@@ -528,7 +618,7 @@ class GPT(nn.Module):
     def _init_nonmem_weights(self, module):
         if module is self.memory or module is self.dreamer or module is self.memory_selector:
             return
-        if isinstance(module, nn.Linear):
+        if isinstance(module, optim.OptimizedLinear):
             torch.nn.init.normal_(module.weight, mean=module.weight.mean()/2, std=(module.weight.max()-module.weight.min() + 1e-10))
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
@@ -572,7 +662,7 @@ class GPT(nn.Module):
         return n_params
 
     def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
+        if isinstance(module, optim.OptimizedLinear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
@@ -659,9 +749,15 @@ class GPT(nn.Module):
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        #self_lr = []
+        #for module in self.modules():
+        #    if isinstance(module, optim.OptimizedLinear):
+        #        for p in module.parameters():
+        #            self_lr.append(p)
         optim_groups = [
             {'params': decay_params, 'weight_decay': weight_decay},
             {'params': nodecay_params, 'weight_decay': 0.0},
+            #{'params': self_lr, 'lr': 1.0},
         ]
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
@@ -669,12 +765,14 @@ class GPT(nn.Module):
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
+        use_fused = fused_available and device_type == 'cuda' and False
         extra_args = dict(fused=True) if use_fused else dict()
         if(self.config.optim == 'adam'):
             optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
         else:
             optimizer = torch.optim.SGD(optim_groups, lr=learning_rate, **extra_args)
+        
+        #optimizer = optim.AdaptiveLROptimizer(optim_groups, lr=learning_rate,model = self, **extra_args)
             #optimizer =torch.optim.Adadelta(optim_groups)#, **extra_args)# lr=learning_rate, **extra_args)
         print(f"using fused AdamW: {use_fused}")
 
