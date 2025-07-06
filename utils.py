@@ -95,124 +95,201 @@ def create_memory_causal_mask2(memory_length, incoming_length):
 
 def lambda_init_fn(depth):
     return 0.8 - 0.6 * math.exp(-0.3 * depth)
-#@torch.compile(backend='inductor', mode='max-autotune')
-#def quaternion_multiply(q1, q2):
-#    """
-#    Performs quaternion multiplication of two quaternions or batches of quaternions.
-#    Args:
-#        q1 (torch.Tensor): First quaternion or batch of quaternions, shape (*, 4),
-#                           where the last dimension is [real, i, j, k].
-#        q2 (torch.Tensor): Second quaternion or batch of quaternions, shape (*, 4),
-#                           compatible with q1's batch dimensions.
-#    Returns:
-#        torch.Tensor: Quaternion product q1 * q2, shape (*, 4).
-#    """
-#    a, b, c, d = q1.unbind(-1)
-#    e, f, g, h = q2.unbind(-1)
-#    real_part = a * e - b * f - c * g - d * h
-#    i_part    = a * f + b * e + c * h - d * g
-#    j_part    = a * g - b * h + c * e + d * f
-#    k_part    = a * h + b * g - c * f + d * e
-#    return torch.stack([real_part, i_part, j_part, k_part], dim=-1)
-
-#@torch.compile(backend='inductor', mode='max-autotune')
-#def quaternion_multiply_matmul(q1, q2):
-#    # q1 and q2 are tensors of shape [..., 4]
-#    
-#    # Reshape q2 for matmul: from [..., 4] to [..., 4, 1]
-#    q2_reshaped = q2.unsqueeze(-1)
-#
-#    # Create the multiplication matrix from q1
-#    w, x, y, z = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
-#    
-#    # Create the 4 rows of the matrix. Each row is shape [..., 4]
-#    row1 = torch.stack([ w, -x, -y, -z], dim=-1)
-#    row2 = torch.stack([ x,  w, -z,  y], dim=-1)
-#    row3 = torch.stack([ y,  z,  w, -x], dim=-1)
-#    row4 = torch.stack([ z, -y,  x,  w], dim=-1)
-#
-#    # Stack the 4 rows to create the [..., 4, 4] matrix
-#    # We stack along a new dimension, which becomes dim=-2
-#    q1_matrix = torch.stack([row1, row2, row3, row4], dim=-2)
-#
-#    # Perform the multiplication
-#    # [..., 4, 4] @ [..., 4, 1] -> [..., 4, 1]
-#    result_reshaped = torch.matmul(q1_matrix, q2_reshaped)
-#
-#    # Reshape result back to [..., 4]
-#    return result_reshaped.squeeze(-1)
 
 @torch.compile(backend='inductor', mode='max-autotune')
-def parallel_quaternion_scan_log_n(local_rotations):
-    if local_rotations.dim() == 4 and local_rotations.shape[3] == 1:
-        x = local_rotations.squeeze(-1)
-    else:
-        x = local_rotations.clone() # Clone to avoid in-place modification of input
-    B, T, C , _= x.shape
-    device = x.device
-    # Pad to the next power of 2 for the algorithm to work cleanly.
+def parallel_quaternion_scan_log_n(q_in: torch.Tensor) -> torch.Tensor:
+    original_shape = q_in.shape
+    if q_in.dim() == 2:
+        q_in = q_in.unsqueeze(0).unsqueeze(2)
+
+    B, T, C, _ = q_in.shape
+    device = q_in.device
+
     next_pow_of_2 = 2**math.ceil(math.log2(T))
-    if T != next_pow_of_2:
-        # Pad with identity quaternions [1, 0, 0, 0]
+    
+    if T == next_pow_of_2:
+        x = q_in
+    else:
         padding_size = next_pow_of_2 - T
-        identity_padding = torch.zeros(B, padding_size, C, 4, device=device)
+        identity_padding = torch.zeros(B, padding_size, C, 4, device=device, dtype=q_in.dtype)
         identity_padding[..., 0] = 1.0
-        x = torch.cat([x, identity_padding], dim=1)
-    # The main loop runs log(n) times
+        x = torch.cat([q_in, identity_padding], dim=1)
+
+    padded_q_original = x.clone()
+    
     num_levels = int(math.log2(x.shape[1]))
-    # --- 1. Up-Sweep (Reduction) Phase ---
-    # At each level d, we combine elements 2**d apart.
+
+    # --- 2. Up-Sweep (Reduction) Phase ---
     for d in range(num_levels):
         stride = 2**d
-        offset = 2**(d + 1)
-        # We select elements to be updated. In PyTorch, it's easier to compute for all
-        # and then mask the results back into the original tensor.
-        # Get the left-hand side of the multiplication (from a shifted version of x)
-        source = x[:, :-stride, :, :]
-        # Get the right-hand side (the elements to be updated)
-        # Note: We slice the original tensor, not the shifted one
-        target = x[:, stride:, :, :]
-        # Perform the multiplication in parallel for all selected pairs
-        res = quaternion_multiply(source, target)
-        # Create a mask to update only the correct elements: k where (k+1) % 2**(d+1) == 0
-        # This mask identifies the right-most element in each block of size 2**(d+1)
-        mask_indices = torch.arange(stride - 1, x.shape[1] - stride, offset, device=device)
-        x[:, mask_indices + stride] = res[:, mask_indices]
-    # --- 2. Down-Sweep (Scan) Phase ---
-    # Clear the last element to identity, as it now holds the sum of the whole sequence
-    x[:, -1, :, :] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=device)
+        source_up = x[:, :x.shape[1]-stride, :, :]
+        target_up = x[:, stride:, :, :]
+        res = quaternion_multiply(source_up, target_up)
+        mask_indices = torch.arange(2*stride - 1, x.shape[1], 2*stride, device=device)
+        x[:, mask_indices] = res[:, mask_indices - stride]
+
+    # --- 3. Down-Sweep (Scan) Phase ---
+    x[:, -1, :, :] = 0.0
+    x[:, -1, :, 0] = 1.0
+
     for d in range(num_levels - 1, -1, -1):
         stride = 2**d
-        offset = 2**(d + 1)
-        # Get elements that will be swapped and used in multiplication
-        # These are the right-most elements of blocks of size 2**d
-        source = x[:, :-stride, :, :]
-        # Elements to be updated
-        target = x[:, stride:, :, :]
-        # Perform the multiplication needed for the scan
-        res = quaternion_multiply(source, target)
-        # Create the same mask as in the up-sweep to select the right elements
-        mask_indices = torch.arange(stride - 1, x.shape[1] - stride, offset, device=device)
-        # This is the tricky part of the down-sweep:
-        # a) The right element of the pair gets the value from the left element (the prefix).
-        # b) The left element gets the new combined value.
-        # This is effectively a swap and multiply.
-        temp = x[:, mask_indices + stride].clone()   # Value of right element (e.g., x[k])
-        x[:, mask_indices + stride] = res[:, mask_indices] # x[k] = op(x[k-stride], x[k])
-        x[:, mask_indices] = temp # x[k-stride] = original x[k]
-    # The result is now an "exclusive" scan (output[i] = product of inputs 0 to i-1)
-    # The original function needs an "inclusive" scan (output[i] = product of inputs 0 to i)
-    # We achieve this by shifting the result and multiplying by the original input.
-    exclusive_scan = x
-    # Shift right and multiply by original input to get inclusive scan
-    # [id, q0, q0*q1, q0*q1*q2, ...] -> multiply by [q0, q1, q2, q3, ...]
-    final_result = quaternion_multiply(exclusive_scan, local_rotations)
-    # Un-pad to original sequence length
-    return final_result[:, :T, :]
+        
+        mask_indices = torch.arange(stride - 1, x.shape[1] - stride, 2*stride, device=device)
+        
+        left_val = x[:, mask_indices]
+        right_val = x[:, mask_indices + stride]
+        
+        res = quaternion_multiply(right_val, left_val)#it just makes sense
+        
+        x[:, mask_indices + stride] = res
+        x[:, mask_indices] = right_val
+
+    # --- 4. Final Conversion to Inclusive Scan ---
+    inclusive_scan_padded = quaternion_multiply(x, padded_q_original)
+    
+    final_result = inclusive_scan_padded[:, :T, ...].reshape(original_shape)
+    
+    return final_result
+
+@torch.compile(backend='inductor', mode='max-autotune')
+def quaternion_inverse(q: torch.Tensor) -> torch.Tensor:
+    q_conj = q * torch.tensor([1., -1., -1., -1.], device=q.device, dtype=q.dtype)
+    q_norm_sq = torch.sum(q * q, dim=-1, keepdim=True)
+    return q_conj / (q_norm_sq + 1e-8)
+
+@torch.compile(backend='inductor', mode='max-autotune')
+def lerp(q1, q2, t):
+    return (1.0 - t) * q1 + t * q2
+
+@torch.compile(backend='inductor', mode='max-autotune')
+def qlerp(q, qident, t):
+    "lerp, but a little safer for quaternions"
+    dot = torch.sum(qident * q, dim=-1, keepdim=True)
+    q = q * ((dot > 0.0).float()*2.0 - 1.0 )
+    return lerp(q, qident, t)
+
+@torch.compile(backend='inductor', mode='max-autotune')
+def qmlerp(q, qident, s):
+    """lerp for sequential quaternion rotations, using previous as a tie breaker, a pseudo momentum, actual momentum is also an interesting idea """
+    B, T, C, Q = q.size()
+    q_prev = torch.cat([
+        qident.expand(B, 1, C, Q), 
+        q[:, :-1]
+    ], dim=1)
+    dot_product = torch.sum(q_prev * q, dim=-1, keepdim=True)
+    sign = torch.where(dot_product < 0.0, -1.0, 1.0)
+    q=q*sign
+    return  (1.0 - s) * qident + s * q
+
+@torch.compile(backend='inductor', mode='max-autotune')
+def exponential_map(q: torch.Tensor, epsilon=1e-8) -> torch.Tensor:
+    rot = q[..., 1:]
+    angle = torch.norm(rot, p=2, dim=-1, keepdim=True)
+    
+    axis = rot / (angle + epsilon)
+    
+    half_angle = angle / 2
+    q_w = torch.cos(half_angle)
+    
+    q_xyz = axis * torch.sin(half_angle)
+    
+    return torch.cat([q_w, q_xyz], dim=-1)
+
+@torch.compile(backend='inductor', mode='max-autotune')
+def slerp(q1, q2, t, epsilon=1e-7):
+    dot = torch.sum(q1 * q2, dim=-1, keepdim=True)
+
+    q2_corr = q2 * ((dot > 0.0).float() * 2.0 - 1.0)
+
+    dot = torch.abs(dot)
+    angle = torch.acos(torch.clamp(dot, -1.0, 1.0))
+    
+    sin_angle = torch.sin(angle)
+    
+    c1 = torch.sin((1.0 - t) * angle) / (sin_angle + epsilon)
+    c2 = torch.sin(t * angle) / (sin_angle + epsilon)
+    
+    q_slerp = c1 * q1 + c2 * q2_corr
+    
+    q_lerp = (1.0 - t) * q1 + t * q2_corr
+    
+    is_close = dot > 0.9995 
+    return torch.where(is_close, q_lerp, q_slerp)
+
+@torch.compile(backend='inductor', mode='max-autotune')
+def scan_quaternion_multiply_window(
+    q: torch.Tensor, 
+    window_size: int
+) -> torch.Tensor:
+    B, T, H, _ = q.shape
+    if not (isinstance(window_size, int) and window_size > 0):
+        raise ValueError("window_size must be a positive integer.")
+    
+    if window_size == 1:
+        return q.clone()
+
+    cum_prod = parallel_quaternion_scan_log_n(q.clone()) 
+
+    if window_size >= T:
+        return cum_prod
+
+    identity_q = torch.tensor([1., 0., 0., 0.], device=q.device, dtype=q.dtype)
+    identity_q = identity_q.view(1, 1, 1, 4).expand(B, 1, H, 4)
+    
+    p_t_minus_k = torch.cat(
+        (identity_q, cum_prod[:, :T - window_size, :, :]), 
+        dim=1 # Concatenate along the time dimension
+    )
+    
+    inv_p_t_minus_k = quaternion_inverse(p_t_minus_k)
+    
+    p_t = cum_prod[:, window_size - 1:, :, :]
+    
+    sliding_results = quaternion_multiply(inv_p_t_minus_k, p_t)
+    
+    initial_results = cum_prod[:, :window_size - 1, :, :]
+    
+    final_result = torch.cat((initial_results, sliding_results), dim=1)
+    
+    return final_result
+
+def naive_scan_quaternion_multiply_window(
+    q: torch.Tensor, 
+    window_size: int
+) -> torch.Tensor:
+    """
+    Ground truth to check against if touching the window scan
+    """
+    B, T, H, _ = q.shape
+    outputs = []
+    for t in range(T):
+        start_idx = max(0, t - window_size + 1)
+        window_q = q[:, start_idx : t + 1, :, :]
+        current_product = window_q[:, 0, :, :]
+        for i in range(1, window_q.shape[1]):
+            next_q = window_q[:, i, :, :]
+            current_product = quaternion_multiply(current_product, next_q)
+        outputs.append(current_product)
+    return torch.stack(outputs, dim=1)
+
+@torch.compile(backend='inductor', mode='max-autotune')
+def parallel_quaternion_scan(q: torch.Tensor) -> torch.Tensor:
+    T = q.shape[1]
+    cumulative_prod = torch.empty_like(q)
+    if T == 0:
+        return cumulative_prod
+        
+    cumulative_prod[:, 0, :, :] = q[:, 0, :, :]
+
+    for i in range(1, T):
+        cumulative_prod[:, i, :, :] = quaternion_multiply(cumulative_prod[:, i-1, :, :], q[:, i, :, :])
+        
+    return cumulative_prod
 
 
 @torch.compile(backend='inductor', mode='max-autotune')
-def parallel_quaternion_scan( local_rotations):
+def parallel_quaternion_scan2( local_rotations):
     #todo, make it actually parallel instead of just lying in the title lmao
     seq_len = local_rotations.shape[1]
     H_t = local_rotations[:, 0, :, :]

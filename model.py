@@ -42,7 +42,7 @@ qope            = False
 side_squish     = False
 #slow
 spl             = False or fftmem
-qrot            = False
+qrot            = True
 think           = False
 repeat_block    = False
 repeatCenter    = False
@@ -60,6 +60,8 @@ class LayerNorm(nn.Module):
        
 
     def forward(self, input):
+        #if(tests):
+        #    return input
         if(mmnorm):
             return torch.tanh(input*self.weight)
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
@@ -67,42 +69,51 @@ class LayerNorm(nn.Module):
 class QrotAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
-        assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = optim.OptimizedLinear(config.n_embd, 2 * config.n_embd, bias=config.bias, batch_size=64)
-        # output projection
-        self.c_proj = optim.OptimizedLinear(config.n_embd,  config.n_embd, bias=config.bias, batch_size=64)
+
+        self.c_attn = optim.OptimizedLinear(config.n_embd, 3 * config.n_embd, bias=config.bias, batch_size=config.batch_size)
         
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
+        self.c_proj = optim.OptimizedLinear(config.n_embd,  config.n_embd, bias=config.bias, batch_size=config.batch_size) #todo
+
+        self.c_kattn = optim.OptimizedLinear(config.n_embd,  config.n_embd, bias=config.bias, batch_size=config.batch_size)
+        
+        
+        self.register_buffer('qidentity', torch.tensor([1.0, 0.0, 0.0, 0.0]).view(1, 1, 1, 4))
+
+        self.attn_dropout = nn.Dropout(config.dropout) #todo
+        self.resid_dropout = nn.Dropout(config.dropout) #todo
         self.n_embd = config.n_embd
         self.dropout = config.dropout
      
 
-    def forward(self, x: torch.tensor, mem=None,causal=True, k=None):
+    def forward(self, x: torch.tensor, mem=None,causal=True, k=None): #same signature to allow easy swapping.
         B, T, C = x.size() 
-        q, v = self.c_attn(x).split(self.n_embd, dim=2)
+        q, s_gate, v = self.c_attn(x).split(self.n_embd, dim=2)
         
         # q, k, v are tensors of shape [batch, seq_len, num_quaternions, 4]
        
         q = q.view(B, T, C//4, 4)
         v = v.view(B, T, C//4, 4)
 
+        s_gate = s_gate.view(B, T, C // 4, 4) 
+        s = torch.sigmoid(s_gate.mean(dim=-1, keepdim=True)) # Shape: [B, T, C//4, 1]
+
         #q_norms = torch.norm(q, p=2, dim=-1, keepdim=True)
-        q_unit =  q #* torch.softmax(q_norms, dim=-1) #probably bad idea for expandability
-        #q_unit = q # q / torch.norm(q, p=2, dim=-1, keepdim=True), dim=-1)
-        if(k is not None):
-            k = k.view(B, T, C//4, 4).clone()
-            k_unit = k #/ torch.norm(k, p=2, dim=-1, keepdim=True)
-            local_rotations = utils.quaternion_multiply(q_unit, k_unit)
-        else:
-            local_rotations = q_unit
+        #q = q * torch.softmax(q_norms, dim=2) #probably bad idea for on the fly expandability, but atleast better than default norm
+        #q = q / (torch.norm(q, p=2, dim=-1, keepdim=True) + 1e-10)
+        #q = utils.lerp(q,self.qidentity,s) #try different lerps here
 
-        cumulative_rotations = utils.parallel_quaternion_scan_log_n(local_rotations)
+        #q = q*s
+        q = utils.exponential_map(q*s)
+        #q = q / (torch.norm(q, p=2, dim=-1, keepdim=True) + 1e-10)
+        #if(k is not None): #this allows for block_size 256 to work, k acts as gate, and with less of a penalty than qnorm
+        #    k = k.view(B, T, C//4, 4).clone()
+        #    #k = k / torch.norm(k, p=2, dim=-1, keepdim=True)
+        #    q = utils.quaternion_multiply(q, k)
+        
+        q = utils.parallel_quaternion_scan_log_n(q)
 
-        Y = utils.quaternion_multiply(cumulative_rotations, v)
-        #Y / torch.norm(Y, p=2, dim=-1, keepdim=True)
+        Y = utils.quaternion_multiply(q, v)
+        #Y = Y / torch.norm(Y, p=2, dim=-1, keepdim=True)
         Y = Y.view(B, T, -1)
         return Y
     
@@ -191,18 +202,12 @@ class LearnableSpiral4D(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = optim.OptimizedLinear(config.n_embd, 4 * config.n_embd, bias=config.bias, batch_size=64)
-        #if(tests):
-        #    self.c_fc    = optim.OptimizedLinear(config.n_embd, 5 * config.n_embd, bias=config.bias, batch_size=64)
-        #    #self.qrotw = nn.Parameter(torch.randn(4 * config.n_embd))
-        #    self.wack = LearnableSpiral4D()
-        #    self.c_proj  = optim.OptimizedLinear( 4*config.n_embd, config.n_embd, bias=config.bias, batch_size=64)
-
+        self.c_fc    = optim.OptimizedLinear(config.n_embd, 4 * config.n_embd, bias=config.bias, batch_size=config.batch_size)
         if(qrot):
-            self.c_proj  = optim.OptimizedLinear( 2*config.n_embd, config.n_embd, bias=config.bias, batch_size=64)
+            self.c_proj  = optim.OptimizedLinear( 2*config.n_embd, config.n_embd, bias=config.bias, batch_size=config.batch_size)
         else:
             self.gelu    = nn.GELU()
-            self.c_proj  = optim.OptimizedLinear( 4*config.n_embd, config.n_embd, bias=config.bias, batch_size=64)
+            self.c_proj  = optim.OptimizedLinear( 4*config.n_embd, config.n_embd, bias=config.bias, batch_size=config.batch_size)
         self.dropout = nn.Dropout(config.dropout)
         self.n_embd = config.n_embd
 
@@ -211,7 +216,7 @@ class MLP(nn.Module):
         if(qrot):
             b,t,n=x.shape
             x4d = x.view(b, t, self.n_embd, 4) # Reshape to (batch, seq_len, n_embd, 4)
-            x_norm = torch.max(x4d.norm(dim=-1, keepdim=True), 1e-10) # Calculate norm along the last dimension (dim=3 or -1), keep dimensions
+            x_norm = torch.clamp_min(x4d.norm(dim=-1, keepdim=True), 1e-10) # Calculate norm along the last dimension (dim=3 or -1), keep dimensions
             x_normalized = x4d / x_norm             # Divide to normalize
             rotors, rotated = x_normalized.chunk(2, dim=2) # Split along n_embd dimension
             #xm,ym = x_norm.chunk(2, dim=2)
@@ -240,6 +245,22 @@ class MemBlock(nn.Module):
         x = x + self.attn(self.ln_1(x),mem,causal,k)
         x = x + self.mlp(self.ln_2(x))
         return x
+
+    def spl(self, block_input, x, memory = None, k = None):
+        b, t, e = x.size()
+        target_output = block_input #store in block?
+        if memory is not None:
+            predicted_output = self(-x, -self.memory.expand(b, self.config.mem_block_size, self.config.n_embd), causal = False)
+        elif k is not None:
+            predicted_output = self(-x, k = k, causal = False)
+        else:
+            predicted_output = self(-x, causal = False)
+            
+        sploss = F.mse_loss(
+            utils.mmnorm(predicted_output.flatten()),
+            utils.mmnorm(target_output.flatten())
+        ) 
+        return sploss
     
 class Dreamer(nn.Module):
     def __init__(self, config):
@@ -274,6 +295,7 @@ class GPTConfig:
     #optim: str = 'SGD'
     optim: str = 'adam'
     mem_block_size: int = 8
+    batch_size = 64
 
 class GPT(nn.Module):
 
@@ -557,35 +579,12 @@ class GPT(nn.Module):
             loss = None
             return firstLogit, loss
     
-    def blockspl(self, block, block_input, x, memory = None):
-        b, t, e = x.size()
-        loss = 0
-        target_output = block_input 
-        #print("x:" + x.size())
-        #print("bs:" +block_input.size())
-        if memory is not None:
-            predicted_output = block(-x, -self.memory.expand(b, self.config.mem_block_size, self.config.n_embd), causal = False)
-         #   print("mem:" +memory.size())
-        else:
-            predicted_output = block(-x, causal = False)
-            
-        sploss = F.mse_loss(
-            utils.mmnorm(predicted_output.flatten()),
-            utils.mmnorm(target_output.flatten())
-        ) #/ predicted_output.numel()
-        #print("po:" +predicted_output.size())
-        #sploss = abs(torch.dot(
-        #    utils.mmnorm(predicted_output.flatten()),
-        #    utils.mmnorm(target_output.flatten())
-        #) / predicted_output.numel())  #why does this even work mse is ever so slightly worse :pain:
-        loss = loss + sploss 
-        return loss
     
-    def self_prediction_loss(self, block_inputs, x, memory = None):
+    def self_prediction_loss(self, block_inputs, x, memory = None, k =None):
         b, t, e = x.size()
         loss = 0
         for i, block in enumerate(self.transformer.h):
-            loss = loss + self.blockspl(block, block_inputs[i], x, memory) 
+            loss = loss + block.spl( block_inputs[i], x, memory, k) 
         return loss
     
     

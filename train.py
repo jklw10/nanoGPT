@@ -89,7 +89,10 @@ exec(open('configurator.py').read()) # overrides from command line or config fil
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
-
+#q = torch.rand(10,10,10,4,device=device)
+#q1 = utils.scan_quaternion_multiply_window(q.clone(),3)
+#q2 = utils.naive_scan_quaternion_multiply_window(q.clone(),3)
+#print(f"difference in result: {torch.nn.functional.mse_loss(q1,q2)}")
 #torch._dynamo.reset() in case of cache corruption throw it off a bridge.
 
 # various inits, derived attributes, I/O setup
