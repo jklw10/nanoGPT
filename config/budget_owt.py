@@ -29,7 +29,7 @@ lr_decay_iters = 30000
 min_lr = 1e-4 
 warmup_iters = 100
 
-beta2 = 0.99 
+beta2 = 0.999
 grad_clip=0.0    
 #warmup_iters = 100 
 

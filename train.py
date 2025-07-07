@@ -270,14 +270,6 @@ eigenInit = False
 
 lrfinder = False
 
-if (lrfinder):
-    lr = 1.0
-    #for i, p in enumerate(model.parameters()):
-    #    oldgrad = [torch.zeros_like(p) for p in model.parameters()]
-    #    batch_lr = [torch.randn(p) for p in range(batch_size)]
-    #    if p.requires_grad:
-    #        p.register_hook(lambda grad, oldgrad=oldgrad, batch_lr=batch_lr: grad_oldener(grad, oldgrad, batch_lr ))
-
 if(ghook):
     
     if(gdiff_enabled or dfw_enabled):
@@ -581,7 +573,7 @@ tl = time.time()
 #        outp = model.generate(X, 100, temperature=0.01, top_k=200)
 gc.collect()
 torch.cuda.empty_cache()
-losses = estimate_loss()
+#losses = estimate_loss()
 gc.collect()
 torch.cuda.empty_cache()
 #with torch.profiler.profile(

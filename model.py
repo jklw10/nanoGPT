@@ -70,7 +70,7 @@ class QrotAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.c_attn =  nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn =  nn.Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)
         
         self.c_proj = nn.Linear(config.n_embd,  config.n_embd, bias=config.bias) #todo
 
@@ -87,23 +87,23 @@ class QrotAttention(nn.Module):
 
     def forward(self, x: torch.tensor, mem=None,causal=True, k=None): #same signature to allow easy swapping.
         B, T, C = x.size() 
-        q, s_gate, v = self.c_attn(x).split(self.n_embd, dim=2)
+        q, v = self.c_attn(x).split(self.n_embd, dim=2)
         
         # q, k, v are tensors of shape [batch, seq_len, num_quaternions, 4]
        
         q = q.view(B, T, C//4, 4)
         v = v.view(B, T, C//4, 4)
 
-        s_gate = s_gate.view(B, T, C // 4, 4) 
-        s = torch.sigmoid(s_gate.mean(dim=-1, keepdim=True)) # Shape: [B, T, C//4, 1]
-
+        #s_gate = s_gate.view(B, T, C // 4, 4) 
+        #s = torch.sigmoid(s_gate.mean(dim=-1, keepdim=True)) # Shape: [B, T, C//4, 1]
+        s = torch.sigmoid(q[..., 0].view(B, T, C//4, 1))
         #q_norms = torch.norm(q, p=2, dim=-1, keepdim=True)
         #q = q * torch.softmax(q_norms, dim=2) #probably bad idea for on the fly expandability, but atleast better than default norm
         #q = q / (torch.norm(q, p=2, dim=-1, keepdim=True) + 1e-10)
         #q = utils.lerp(q,self.qidentity,s) #try different lerps here
 
         #q = q*s
-        q = utils.exponential_map(q*s)
+        q = utils.exponential_map(q*s) 
         #q = q / (torch.norm(q, p=2, dim=-1, keepdim=True) + 1e-10)
         #if(k is not None): #this allows for block_size 256 to work, k acts as gate, and with less of a penalty than qnorm
         #    k = k.view(B, T, C//4, 4).clone()
@@ -111,10 +111,13 @@ class QrotAttention(nn.Module):
         #    q = utils.quaternion_multiply(q, k)
         
         q = utils.parallel_quaternion_scan_log_n(q)
-
+        
+        #q = self.attn_dropout(q)
         Y = utils.quaternion_multiply(q, v)
         #Y = Y / torch.norm(Y, p=2, dim=-1, keepdim=True)
         Y = Y.view(B, T, -1)
+        Y = self.c_proj(Y)
+        Y = self.resid_dropout(Y)
         return Y
     
 
