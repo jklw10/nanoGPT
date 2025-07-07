@@ -328,6 +328,7 @@ if ddp:
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
+    torch.compiler.cudagraph_mark_step_begin()
     out = {}
     model.eval()
     for split in ['train', 'val']:
@@ -339,7 +340,7 @@ def estimate_loss():
             with ctx:
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
-        out[split] = losses.mean()
+        out[split] = losses.detach().mean()
     model.train()
 
     del X
@@ -580,6 +581,7 @@ tl = time.time()
 #        outp = model.generate(X, 100, temperature=0.01, top_k=200)
 gc.collect()
 torch.cuda.empty_cache()
+losses = estimate_loss()
 gc.collect()
 torch.cuda.empty_cache()
 #with torch.profiler.profile(
@@ -618,7 +620,6 @@ if(True): #i hate white space significance. (this is for that profiler and i'm l
         # evaluate the loss on train/val sets and write checkpoints
         if iter_num % eval_interval == 0 and master_process: # and iter_num > 0:
             if(iter_num > 0):
-                torch.compiler.cudagraph_mark_step_begin()
                 gc.collect()
                 torch.cuda.empty_cache()
                 losses = estimate_loss()
