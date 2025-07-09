@@ -183,8 +183,16 @@ def qmlerp(q, qident, s):
     return  (1.0 - s) * qident + s * q
 
 @torch.compile(backend='inductor', mode='max-autotune')
-def exponential_map(q: torch.Tensor, epsilon=1e-8) -> torch.Tensor:
+def maprotgate(q: torch.Tensor) -> torch.Tensor:
+    B, T, C, Q = q.size() 
     rot = q[..., 1:]
+    s = torch.sigmoid(q[..., 0].view(B, T, C, 1))
+
+    return exponential_map(rot*s) 
+
+@torch.compile(backend='inductor', mode='max-autotune')
+def exponential_map(rot: torch.Tensor, epsilon=1e-8) -> torch.Tensor:
+    
     angle = torch.norm(rot, p=2, dim=-1, keepdim=True)
     
     axis = rot / (angle + epsilon)
@@ -284,20 +292,45 @@ def parallel_quaternion_scan(q: torch.Tensor) -> torch.Tensor:
 
     for i in range(1, T):
         cumulative_prod[:, i, :, :] = quaternion_multiply(cumulative_prod[:, i-1, :, :], q[:, i, :, :])
-        
+    
     return cumulative_prod
 
+@torch.compile(backend='inductor', mode='max-autotune')
+def qcumprod(q: torch.Tensor) -> torch.Tensor:
+    T = q.shape[1]
+    cumulative_prod = torch.empty_like(q[:, 0, :, :].view(1,1,1,4))
+    if T == 0:
+        return cumulative_prod
+        
+    cumulative_prod= q[:, 0, :, :]
+
+    for i in range(1, T):
+        cumulative_prod = quaternion_multiply(cumulative_prod, q[:, i, :, :])
+    
+    return cumulative_prod
 
 @torch.compile(backend='inductor', mode='max-autotune')
-def parallel_quaternion_scan2( local_rotations):
-    #todo, make it actually parallel instead of just lying in the title lmao
-    seq_len = local_rotations.shape[1]
-    H_t = local_rotations[:, 0, :, :]
-    cumulative_outputs = [H_t]
-    for t in range(1, seq_len):
-        H_t = quaternion_multiply(H_t, local_rotations[:, t, :, :])
-        cumulative_outputs.append(H_t)
-    return torch.stack(cumulative_outputs, dim=1)
+def qumgate(q: torch.Tensor) -> torch.Tensor:
+    T = q.shape[1]
+    scan = parallel_quaternion_scan_log_n(q)
+    output = torch.empty_like(q)
+
+    #the nth token would be multiplied with all the previous tokens,
+    #those multiply results are now the gates for the next cumulative product, up to the nth token.
+    #and so for each token i need cumulative product up to that token, not quite  O(N) is that o log n ?
+    #and this would still be causal because even though for N token, the gate for N-X is non causal, that gate only knows up to Nth token.
+
+
+    for x in range( T):
+        gates = torch.empty_like(q[:, :x, :, :])
+        for y in range(x):
+            gates[:, y, :, :] = maprotgate(quaternion_multiply(scan[:, y, :, :] ,scan[:, x, :, :]))
+        gates = quaternion_multiply(gates, q[:, :x, :, :])
+        output[:, x, :, :] = qcumprod(gates[:, :x, :, :])
+
+    
+    return output
+
 
 @torch.compile(backend='inductor', mode='max-autotune')
 def quaternion_multiply(q, p):
@@ -425,10 +458,13 @@ def fft_trunc_tsquish(x):
     xc = torch.complex(halfft.real[:,t//4:-t//4,:],halfft.imag[:,t//4:-t//4,:])
     return torch.fft.ifft(xc,dim=1).real
 
-def fft_trunc_csquish(x):
+def fft_trunc_csquish(x, target = None):
     b,t,c = x.size()
     halfft = torch.fft.fft(x,dim=-1)
-    xc = torch.complex(halfft.real[:,:,c//4:-c//4],halfft.imag[:,:,c//4:-c//4])
+    if(target is None):
+        target = c//2
+    margin = c//2- target//2
+    xc = torch.complex(halfft.real[:,:,margin:-margin],halfft.imag[:,:,margin:-margin])
     #if(xc.isnan().any):
     #    print("nan complx")
     o = torch.fft.ifft(xc,dim=-1).real

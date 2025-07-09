@@ -48,6 +48,7 @@ repeat_block    = False
 repeatCenter    = False
 
 tests           = True
+symloss         = False
 
 
 class LayerNorm(nn.Module):
@@ -70,11 +71,16 @@ class QrotAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.c_attn =  nn.Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)
+        self.c_attn =  nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        
+        self.q_heads = nn.Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)#doesn't scale well :/ maybe a different down projection.
+        self.v_head =  nn.Linear(config.n_embd,  config.n_embd, bias=config.bias)
         
         self.c_proj = nn.Linear(config.n_embd,  config.n_embd, bias=config.bias) #todo
 
         self.c_kattn = nn.Linear(config.n_embd,  config.n_embd, bias=config.bias)
+
+        #self.q_proj = nn.Linear(2*config.n_embd,  config.n_embd, bias=config.bias)
         
         
         self.register_buffer('qidentity', torch.tensor([1.0, 0.0, 0.0, 0.0]).view(1, 1, 1, 4))
@@ -83,36 +89,34 @@ class QrotAttention(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout) #todo
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.n_head = config.n_head 
+        self.head_dim = config.n_embd//config.n_head * 2
      
 
     def forward(self, x: torch.tensor, mem=None,causal=True, k=None): #same signature to allow easy swapping.
         B, T, C = x.size() 
-        q, v = self.c_attn(x).split(self.n_embd, dim=2)
-        
-        # q, k, v are tensors of shape [batch, seq_len, num_quaternions, 4]
-       
-        q = q.view(B, T, C//4, 4)
+        #q, q2, v = self.c_attn(x).split(self.n_embd, dim=2)
+        v = self.v_head(x)
+        q = self.q_heads(x)
+        #q = torch.cat((q,q2),dim=-1)
+        QC = q.shape[2]
+
+        q = q.view(B, T, QC//4, 4)
         v = v.view(B, T, C//4, 4)
 
-        #s_gate = s_gate.view(B, T, C // 4, 4) 
-        #s = torch.sigmoid(s_gate.mean(dim=-1, keepdim=True)) # Shape: [B, T, C//4, 1]
-        s = torch.sigmoid(q[..., 0].view(B, T, C//4, 1))
-        #q_norms = torch.norm(q, p=2, dim=-1, keepdim=True)
-        #q = q * torch.softmax(q_norms, dim=2) #probably bad idea for on the fly expandability, but atleast better than default norm
-        #q = q / (torch.norm(q, p=2, dim=-1, keepdim=True) + 1e-10)
-        #q = utils.lerp(q,self.qidentity,s) #try different lerps here
-
-        #q = q*s
-        q = utils.exponential_map(q*s) 
-        #q = q / (torch.norm(q, p=2, dim=-1, keepdim=True) + 1e-10)
-        #if(k is not None): #this allows for block_size 256 to work, k acts as gate, and with less of a penalty than qnorm
-        #    k = k.view(B, T, C//4, 4).clone()
-        #    #k = k / torch.norm(k, p=2, dim=-1, keepdim=True)
-        #    q = utils.quaternion_multiply(q, k)
-        
+        #s = torch.sigmoid(q[..., 0].view(B, T, QC//4, 1))
+        #rot = q[..., 1:]
+        #q = utils.exponential_map(rot*s) 
+        #HQC = QC//2
+        q = utils.maprotgate(q)
+        #gates2 = utils.maprotgate(q[...,HQC:,:])
         q = utils.parallel_quaternion_scan_log_n(q)
         
+        #q = utils.quaternion_multiply(gatescan, utils.parallel_quaternion_scan_log_n(gates2))
+        #q = self.q_proj(q.view(B, T, -1)).view(B, T, C//4, 4)
         #q = self.attn_dropout(q)
+        q = utils.fft_trunc_csquish(q.view(B, T, -1).to(torch.float32), C).to(x.dtype).view(B, T, C//4, 4)
+        #q = utils.quaternion_multiply(q[...,:C//4,:], q[...,C//4:,:])
         Y = utils.quaternion_multiply(q, v)
         #Y = Y / torch.norm(Y, p=2, dim=-1, keepdim=True)
         Y = Y.view(B, T, -1)
@@ -216,6 +220,7 @@ class MLP(nn.Module):
 
     def forward(self, x):
         x = self.c_fc(x)
+        
         if(qrot):
             b,t,n=x.shape
             x4d = x.view(b, t, self.n_embd, 4) # Reshape to (batch, seq_len, n_embd, 4)
@@ -226,7 +231,7 @@ class MLP(nn.Module):
             x_rotated = utils.quaternion_multiply(rotors, rotated) 
             #x_rotated = x_rotated*self.gaprelu(x_norm-2)#*torch.sigmoid(xm+ym)#
             x = x_rotated.view(b, t, 2 * self.n_embd)
-            #x = utils.fft_trunc_csquish(x) //meh
+            #x = utils.fft_trunc_csquish(x) #meh
         else:
             x = self.gelu(x) # sinrelu
         x = self.c_proj(x)
@@ -325,7 +330,6 @@ class GPT(nn.Module):
             h = blocks,
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
-        
         if(think):
             self.thinkthreshold = nn.Parameter(torch.ones(1))
             self.thinkstop = nn.Sequential(
@@ -409,16 +413,15 @@ class GPT(nn.Module):
 
         if mix_squish:
             fh = utils.fft_trunc_csquish(x)
-        
-        if spl:
+        if spl or symloss:
             block_inputs = []
         x= x.view(b, t, self.config.n_embd//4, 4)
-        ogx = x# utils.parallel_quaternion_scan_log_n(x)
+        ogx = None #x# utils.parallel_quaternion_scan_log_n(x)
         x = x /  torch.norm(x, p=2, dim=-1, keepdim=True)
         #ogx = x
         x = x.view(b, t, -1)
         for i, block in enumerate(self.transformer.h):
-            if spl:
+            if spl or symloss:
                 block_inputs.append(x) 
             x = block(x, k= ogx) 
 
@@ -444,6 +447,21 @@ class GPT(nn.Module):
             if(convemb):
                 loss = self.convemb.loss(logits, patchtargets, pploss)
             
+            if symloss and self.training:
+                for i in block_inputs:
+                    
+                    #loss = loss + 0.001*self.floss(i)
+                    
+                    #f_magnitude = torch.fft.fft(i).imag
+                    #loss = loss + 0.01 * torch.norm(f_magnitude, p=2) 
+                    #fft_dim =-1
+                    #x_fft = torch.fft.rfft(i, dim=fft_dim)
+                    #power_spectrum = torch.abs(x_fft)**2
+                    #power_sum = torch.sum(power_spectrum, dim=fft_dim, keepdim=True)
+                    #normalized_power = power_spectrum / (power_sum + 1e-10)
+                    #entropy = normalized_power * torch.log(normalized_power + 1e-10)
+                    #loss = loss + -0.1 * torch.mean(torch.sum(entropy, dim=fft_dim))
+                    loss = loss + 0.001 * torch.nn.functional.mse_loss(torch.abs(torch.fft.fft(i)),torch.softmax(torch.abs(torch.fft.fft(i)), -1))
             if(spl and self.training):
                 loss = loss + self.self_prediction_loss(block_inputs,x) #* self.predict_weight #* 0.001
                 
