@@ -451,12 +451,56 @@ def fft_bmean_tsquish_add(x, x2):
     
     return torch.fft.ifft(xc,dim=1).real
 
+def calculate_linear_chaos_loss(logits: torch.tensor, balance_lambda= 0.1 , target_chaos= 0.1 ) -> float:
+    logits = logits.float()
+    vocab_size = logits.size(-1)
+
+    probabilities = F.softmax(logits, dim=-1)
+    probabilities = probabilities + 1e-9
+
+    # 2. Calculate Shannon Entropy: H(P) = -Σ p * log(p)
+    entropy = -torch.sum(probabilities * torch.log(probabilities), dim=-1)
+
+    # 3. Calculate Perplexity: exp(H(P))
+    perplexity = torch.exp(entropy)
+
+    # 4. Normalize Perplexity to get LinearChaos [0, 1]
+    # This gives us our linear metric.
+    linear_chaosness = perplexity / vocab_size
+
+    # 5. Calculate the balance loss
+    # We want the average chaosness of the batch to be near our target.
+    # Using MSE for a smooth, differentiable loss.
+    # .mean() averages the chaosness across all token predictions in the batch.
+    l_balance = (linear_chaosness.mean() - target_chaos)**2
+    
+    return l_balance * balance_lambda, linear_chaosness.mean()
 
 def fft_trunc_tsquish(x):
     b,t,c = x.size()
     halfft = torch.fft.fft(x,dim=1)
     xc = torch.complex(halfft.real[:,t//4:-t//4,:],halfft.imag[:,t//4:-t//4,:])
     return torch.fft.ifft(xc,dim=1).real
+
+def fft_trunc_squish(x, target=None, dim=-1):
+    c = x.size(dim)
+
+    if target is None:
+        target = c // 2
+    
+    ff_x = torch.fft.fft(x, dim=dim)
+    
+    margin = (c - target) // 2
+    
+    slicer = [slice(None)] * x.ndim 
+    if margin > 0:
+      slicer[dim] = slice(margin, -margin)
+    
+    ff_x_trunc = ff_x[tuple(slicer)]
+
+    o = torch.fft.ifft(ff_x_trunc, dim=dim).real
+
+    return o
 
 def fft_trunc_csquish(x, target = None):
     b,t,c = x.size()

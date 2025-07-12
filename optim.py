@@ -8,14 +8,16 @@ import utils
 ema_thing = True
 alpha = 0.9
 class OptimizedLinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, batch_size: int, bias: bool = True):
+    def __init__(self, in_features: int, out_features: int, batch_size: int = None, bias: bool = True):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.batch_size = batch_size # Max batch size the layer is designed for
         self.top_k_lr_selection = 5
         self.lr_update_momentum = 0.9
-
+        self.start_perc = 0.9
+        self.active_percentage = self.start_perc
+        self.step = 0.0
         self.weight = nn.Parameter(torch.Tensor(out_features, in_features))
         if bias:
             self.bias = nn.Parameter(torch.Tensor(out_features))
@@ -36,7 +38,10 @@ class OptimizedLinear(nn.Module):
             self.register_buffer("previous_bias_grad", torch.zeros_like(self.bias))
         
         # Stores the current batch of LR samples used for forward pass simulation
-        self.batch_lr_samples = nn.Parameter(torch.empty(batch_size), requires_grad=False) #i wonder what'd happen if i gave these a gradient :D
+        if batch_size is not None:
+            self.register_buffer("batch_lr_samples", torch.empty(batch_size))
+        else:
+            self.register_buffer("batch_lr_samples", torch.empty(0))
 
         self.current_lr_mean = nn.Parameter(torch.tensor(1e-5), requires_grad=False)
         self.current_lr_var = nn.Parameter(torch.tensor(1e-4), requires_grad=False) # Small initial variance
@@ -58,29 +63,63 @@ class OptimizedLinear(nn.Module):
                 self.previous_bias_grad.zero_()
             self.current_lr_mean.fill_(0.5)
             self.current_lr_var.fill_(0.5)
-            self._sample_batch_lrs() 
+            if(self.batch_size is not None):
+                self._sample_batch_lrs() 
             if(ema_thing):
-                self.wema =  (self.weight.data)
+                num_active_out = math.ceil(self.out_features * self.active_percentage)
+                self.wema =  self.weight.data.detach() 
                 if self.bias is not None:
-                    self.bema =  (self.bias.data )
+                    self.bema =  self.bias.data.detach() 
+                    torch.zero_(self.bias.data[num_active_out:])
+                torch.zero_(self.weight.data[num_active_out:,:])
             return
+        
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # input_data: (actual_batch_size, in_features)
-        if(not self.training):
-            return nn.functional.linear(x,self.weight,self.bias)
-        
-        if(ema_thing):
-            #skip ema on backward pass?
-            forward_weight = utils.funnyMulti(self.wema.detach(), self.weight)
-            simulated_weight = self.weight + (forward_weight - self.weight).detach()
+        #if(not self.training):
+        #    return nn.functional.linear(x,self.weight,self.bias)
 
+
+        if(ema_thing):
+            num_active_out = math.ceil(self.out_features * self.active_percentage)
+            if(not self.training):
+                aw = self.weight[:num_active_out, :]
+                ab = None
+                if self.bias is not None:
+                    ab = self.bias[:num_active_out]
+                active_output = nn.functional.linear(x,aw,ab)
+                full_output = torch.zeros(x.shape[0],x.shape[1], self.out_features, device=x.device, dtype=x.dtype)
+                full_output[:,:, :num_active_out] = active_output
+                return full_output 
+            # Create a mask to zero-out inactive weights
+            # This is done on the fly and is very efficient on GPU
+            #weight_mask = torch.zeros_like(self.weight.data, memory_format=torch.contiguous_format)
+            #weight_mask[:num_active_out, :] = 1.0
+            #skip ema on backward pass?
+            aw = self.weight[:num_active_out, :]
+            forward_weight = utils.funnyMulti(self.wema.detach()[:num_active_out, :], aw)
+            simulated_weight = aw + (forward_weight - aw).detach()
+            #simulated_weight = simulated_weight * weight_mask
+            #simulated_weight = simulated_weight[:num_active_out, :]
             #simulated_weight = utils.funnyMulti(self.weight, self.wema)
             simulated_bias = None
             if self.bias is not None:
-                simulated_bias = utils.funnyMulti(self.bias, self.bema)
-            return nn.functional.linear(x,simulated_weight,simulated_bias)
+                ab = self.bias[:num_active_out]
+                fwd_bias = utils.funnyMulti(self.bema.detach()[:num_active_out], ab)
+                simulated_bias = ab + (fwd_bias - ab).detach()
+
+            active_output = nn.functional.linear(x,simulated_weight,simulated_bias)
+            full_output = torch.zeros(x.shape[0],x.shape[1], self.out_features, device=x.device, dtype=x.dtype)
+            full_output[:,:, :num_active_out] = active_output
+            return full_output 
         
+        if(not self.training):
+            return nn.functional.linear(x,self.weight,self.bias)
+        if(self.batch_size is None):
+            self.batch_size = x.shape[0]
+            self._sample_batch_lrs()
+
         actual_batch_size = x.shape[0]
         if actual_batch_size != self.batch_size:
             if actual_batch_size > self.batch_size:
@@ -121,10 +160,14 @@ class OptimizedLinear(nn.Module):
     def poststep(self):
         #pass
         if(ema_thing):
+            num_active_out = math.ceil(self.out_features * self.active_percentage)
+            self.step += 1.0
+            self.active_percentage = min(self.start_perc+ (1.0-self.start_perc)*(self.step/30000.0),1.0 )
+            #self.active_percentage = torch.sqrt(self.active_percentage) 
             with torch.no_grad():
-                self.wema += alpha * (self.weight.data - self.wema)
+                self.wema[:num_active_out,:] += alpha * (self.weight.data[:num_active_out,:] - self.wema[:num_active_out,:])
                 if self.bias is not None:
-                    self.bema += alpha * (self.bias.data - self.bema)
+                    self.bema[:num_active_out] += alpha * (self.bias.data[:num_active_out]  - self.bema[:num_active_out])
 
     def prestep(self, per_sample_losses: torch.Tensor):
         """

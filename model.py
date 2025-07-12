@@ -11,7 +11,6 @@ import math
 import inspect
 from dataclasses import dataclass
 
-import numpy
 from pytorch_wavelets import DWT1DForward
 import torch
 import torch.nn as nn
@@ -22,7 +21,7 @@ import wackmodel
 from cut_cross_entropy import linear_cross_entropy
 #todo
 #prediction machine
-
+Linear = optim.OptimizedLinear
 #settings :)
 #known good
 diffSplits      = 1
@@ -42,12 +41,12 @@ qope            = False
 side_squish     = False
 #slow
 spl             = False or fftmem
-qrot            = True
+qrot            = False
 think           = False
 repeat_block    = False
 repeatCenter    = False
 
-tests           = True
+Qrotention      = False
 symloss         = False
 
 
@@ -71,19 +70,15 @@ class QrotAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.c_attn =  nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn =  Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)
         
-        self.q_heads = nn.Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)#doesn't scale well :/ maybe a different down projection.
-        self.v_head =  nn.Linear(config.n_embd,  config.n_embd, bias=config.bias)
+        #self.q_heads = Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)#doesn't scale well :/ maybe a different down projection.
+        #self.v_head =  Linear(config.n_embd,  config.n_embd, bias=config.bias)
         
-        self.c_proj = nn.Linear(config.n_embd,  config.n_embd, bias=config.bias) #todo
+        self.c_proj = Linear(config.n_embd,  config.n_embd, bias=config.bias) #todo
 
-        self.c_kattn = nn.Linear(config.n_embd,  config.n_embd, bias=config.bias)
+        self.c_kattn = Linear(config.n_embd,  config.n_embd, bias=config.bias)
 
-        #self.q_proj = nn.Linear(2*config.n_embd,  config.n_embd, bias=config.bias)
-        
-        
-        self.register_buffer('qidentity', torch.tensor([1.0, 0.0, 0.0, 0.0]).view(1, 1, 1, 4))
 
         self.attn_dropout = nn.Dropout(config.dropout) #todo
         self.resid_dropout = nn.Dropout(config.dropout) #todo
@@ -91,31 +86,44 @@ class QrotAttention(nn.Module):
         self.dropout = config.dropout
         self.n_head = config.n_head 
         self.head_dim = config.n_embd//config.n_head * 2
+        self.win = config.block_size // config.n_layer
      
 
     def forward(self, x: torch.tensor, mem=None,causal=True, k=None): #same signature to allow easy swapping.
         B, T, C = x.size() 
-        #q, q2, v = self.c_attn(x).split(self.n_embd, dim=2)
-        v = self.v_head(x)
-        q = self.q_heads(x)
+        q,  v = self.c_attn(x).split(self.n_embd, dim=2)
+        #v = self.v_head(x)
+        #q = self.q_heads(x)
         #q = torch.cat((q,q2),dim=-1)
         QC = q.shape[2]
 
+        #q2 = q2.view(B, T, QC//4, 4)
         q = q.view(B, T, QC//4, 4)
         v = v.view(B, T, C//4, 4)
 
+        #split, window T//n_layer, fft mix
+        q = utils.maprotgate(q)
+        #q2 = utils.maprotgate(q)
+        q2 = utils.scan_quaternion_multiply_window(q, self.win)
+        q2 = self.c_kattn(q2.view(B, T, -1)).view(B, T, QC//4, 4)
+        #q = utils.fft_trunc_csquish(torch.cat((q,q2),dim=-2).view(B, T, -1).to(torch.float32), C).to(x.dtype).view(B, T, C//4, 4) #win premap
+        
+        q2 = utils.maprotgate(q2)#winmul
         #s = torch.sigmoid(q[..., 0].view(B, T, QC//4, 1))
         #rot = q[..., 1:]
         #q = utils.exponential_map(rot*s) 
         #HQC = QC//2
-        q = utils.maprotgate(q)
+        
+        q = utils.quaternion_multiply(q, q2)#winmul
+
+        #q = utils.fft_trunc_csquish(torch.cat((q,q2),dim=-2).view(B, T, -1).to(torch.float32), C).to(x.dtype).view(B, T, C//4, 4)#winmix
         #gates2 = utils.maprotgate(q[...,HQC:,:])
         q = utils.parallel_quaternion_scan_log_n(q)
         
         #q = utils.quaternion_multiply(gatescan, utils.parallel_quaternion_scan_log_n(gates2))
         #q = self.q_proj(q.view(B, T, -1)).view(B, T, C//4, 4)
         #q = self.attn_dropout(q)
-        q = utils.fft_trunc_csquish(q.view(B, T, -1).to(torch.float32), C).to(x.dtype).view(B, T, C//4, 4)
+        #q = utils.fft_trunc_csquish(q.view(B, T, -1).to(torch.float32), C).to(x.dtype).view(B, T, C//4, 4)
         #q = utils.quaternion_multiply(q[...,:C//4,:], q[...,C//4:,:])
         Y = utils.quaternion_multiply(q, v)
         #Y = Y / torch.norm(Y, p=2, dim=-1, keepdim=True)
@@ -130,12 +138,12 @@ class MemAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn = Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
-        self.c_proj = nn.Linear(config.n_embd,  config.n_embd, bias=config.bias)
+        self.c_proj = Linear(config.n_embd,  config.n_embd, bias=config.bias)
         
         #attention mod modifier
-        self.attmod = nn.Linear(config.n_embd,  config.n_embd, bias=config.bias)
+        self.attmod = Linear(config.n_embd,  config.n_embd, bias=config.bias)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -209,12 +217,12 @@ class LearnableSpiral4D(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_fc    = Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
         if(qrot):
-            self.c_proj  = nn.Linear( 2*config.n_embd, config.n_embd, bias=config.bias)
+            self.c_proj  = Linear( 2*config.n_embd, config.n_embd, bias=config.bias)
         else:
             self.gelu    = nn.GELU()
-            self.c_proj  = nn.Linear( 4*config.n_embd, config.n_embd, bias=config.bias)
+            self.c_proj  = Linear( 4*config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
         self.n_embd = config.n_embd
 
@@ -244,13 +252,16 @@ class MemBlock(nn.Module):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = MemAttention(config)
-        if(tests):
+        if(Qrotention):
             self.attn = QrotAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
     def forward(self, x, mem = None, causal = True, k =None):
-        x = x + self.attn(self.ln_1(x),mem,causal,k)
+        if(Qrotention):
+            x = x + self.attn(self.ln_1(x),mem,causal,k)
+        else:
+            x = x + self.attn(self.ln_1(x),mem,causal)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -333,9 +344,9 @@ class GPT(nn.Module):
         if(think):
             self.thinkthreshold = nn.Parameter(torch.ones(1))
             self.thinkstop = nn.Sequential(
-                nn.Linear(config.n_embd, config.n_embd),
+                Linear(config.n_embd, config.n_embd),
                 nn.GELU(),
-                nn.Linear(config.n_embd, 1)
+                Linear(config.n_embd, 1)
             )
         if(qope):
             self.qoper = wackmodel.QrotMLP(config)
@@ -353,10 +364,10 @@ class GPT(nn.Module):
         self.surprise = 1
         if(convemb):
             self.convemb = wackmodel.Patcher(config)
-            self.lm_head = nn.Linear(config.n_embd, config.vocab_size * self.patch_max, bias=False)
+            self.lm_head = Linear(config.n_embd, config.vocab_size * self.patch_max, bias=False)
         else:
             #it'd seem like this isn't worth optimized linear's hassle with apple's CCE loss 
-            self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)# optim.OptimizedLinear(config.n_embd, config.vocab_size, bias=False, batch_size=64)
+            self.lm_head = Linear(config.n_embd, config.vocab_size, bias=False)# optim.OptimizedLinear(config.n_embd, config.vocab_size, bias=False, batch_size=64)
             # with weight tying when using torch.compile() some warnings get generated:
             # "UserWarning: functional_call was passed multiple values for tied weights.
             # This behavior is deprecated and will be an error in future versions"
@@ -371,7 +382,7 @@ class GPT(nn.Module):
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
-
+        self.laim = 0.1
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
@@ -423,7 +434,7 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             if spl or symloss:
                 block_inputs.append(x) 
-            x = block(x, k= ogx) 
+            x = block(x) 
 
             if mix_squish:
                 if self.config.mix_mask[i]:
@@ -449,19 +460,10 @@ class GPT(nn.Module):
             
             if symloss and self.training:
                 for i in block_inputs:
-                    
-                    #loss = loss + 0.001*self.floss(i)
-                    
-                    #f_magnitude = torch.fft.fft(i).imag
-                    #loss = loss + 0.01 * torch.norm(f_magnitude, p=2) 
-                    #fft_dim =-1
-                    #x_fft = torch.fft.rfft(i, dim=fft_dim)
-                    #power_spectrum = torch.abs(x_fft)**2
-                    #power_sum = torch.sum(power_spectrum, dim=fft_dim, keepdim=True)
-                    #normalized_power = power_spectrum / (power_sum + 1e-10)
-                    #entropy = normalized_power * torch.log(normalized_power + 1e-10)
-                    #loss = loss + -0.1 * torch.mean(torch.sum(entropy, dim=fft_dim))
-                    loss = loss + 0.001 * torch.nn.functional.mse_loss(torch.abs(torch.fft.fft(i)),torch.softmax(torch.abs(torch.fft.fft(i)), -1))
+                    lcloss, lmean = utils.calculate_linear_chaos_loss(i, balance_lambda=1.0,target_chaos=self.laim)
+                    self.laim = max(lmean.detach(),self.laim)
+                    loss = loss + lcloss#utils.calculate_linear_chaos_loss(i, balance_lambda=0.1,target_chaos=0.5)
+                    #loss = loss + 0.001 * torch.nn.functional.mse_loss(torch.abs(torch.fft.fft(i)),torch.softmax(torch.abs(torch.fft.fft(i)), -1))
             if(spl and self.training):
                 loss = loss + self.self_prediction_loss(block_inputs,x) #* self.predict_weight #* 0.001
                 
@@ -639,7 +641,7 @@ class GPT(nn.Module):
     def _init_nonmem_weights(self, module):
         if module is self.memory or module is self.dreamer or module is self.memory_selector:
             return
-        if isinstance(module, optim.OptimizedLinear):
+        if isinstance(module, Linear):
             torch.nn.init.normal_(module.weight, mean=module.weight.mean()/2, std=(module.weight.max()-module.weight.min() + 1e-10))
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
@@ -683,7 +685,7 @@ class GPT(nn.Module):
         return n_params
 
     def _init_weights(self, module):
-        if isinstance(module, optim.OptimizedLinear):
+        if isinstance(module, Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
