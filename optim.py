@@ -15,7 +15,7 @@ class OptimizedLinear(nn.Module):
         self.batch_size = batch_size # Max batch size the layer is designed for
         self.top_k_lr_selection = 5
         self.lr_update_momentum = 0.9
-        self.start_perc = 0.9
+        self.start_perc = 0.8
         self.active_percentage = self.start_perc
         self.step = 0.0
         self.weight = nn.Parameter(torch.Tensor(out_features, in_features))

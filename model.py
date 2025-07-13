@@ -21,7 +21,8 @@ import wackmodel
 from cut_cross_entropy import linear_cross_entropy
 #todo
 #prediction machine
-Linear = optim.OptimizedLinear
+#Linear = optim.OptimizedLinear
+Linear = nn.Linear
 #settings :)
 #known good
 diffSplits      = 1
@@ -46,17 +47,17 @@ think           = False
 repeat_block    = False
 repeatCenter    = False
 
-Qrotention      = False
+Qrotention      = True
 symloss         = False
 
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
-    def __init__(self, ndim, bias):
+    def __init__(self, config):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+        self.weight = nn.Parameter(torch.ones(config.n_embd))
+        self.bias = nn.Parameter(torch.zeros(config.n_embd)) if config.bias else None
        
 
     def forward(self, input):
@@ -66,11 +67,23 @@ class LayerNorm(nn.Module):
             return torch.tanh(input*self.weight)
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+class Scanner(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.scanner = nn.Sequential(
+                #nn.LayerNorm(config.n_embd * 2), #untested
+                Linear(config.n_embd*2, config.n_embd*2),
+                nn.GELU(),
+                Linear(config.n_embd*2, config.n_embd)
+            )
+    def forward(self, x: torch.tensor, y: torch.tensor):
+        return self.scanner( torch.cat((x,y),dim=-1))
+
 class QrotAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.c_attn =  Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)
+        self.c_attn =  Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         
         #self.q_heads = Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)#doesn't scale well :/ maybe a different down projection.
         #self.v_head =  Linear(config.n_embd,  config.n_embd, bias=config.bias)
@@ -78,7 +91,12 @@ class QrotAttention(nn.Module):
         self.c_proj = Linear(config.n_embd,  config.n_embd, bias=config.bias) #todo
 
         self.c_kattn = Linear(config.n_embd,  config.n_embd, bias=config.bias)
-
+        self.scanner = Scanner(config)
+        #nn.Sequential(
+        #        Linear(config.n_embd*2, config.n_embd*2),
+        #        nn.GELU(),
+        #        Linear(config.n_embd*2, config.n_embd)
+        #    )
 
         self.attn_dropout = nn.Dropout(config.dropout) #todo
         self.resid_dropout = nn.Dropout(config.dropout) #todo
@@ -91,41 +109,46 @@ class QrotAttention(nn.Module):
 
     def forward(self, x: torch.tensor, mem=None,causal=True, k=None): #same signature to allow easy swapping.
         B, T, C = x.size() 
-        q,  v = self.c_attn(x).split(self.n_embd, dim=2)
+        q, q2,  v = self.c_attn(x).split(self.n_embd, dim=2)
         #v = self.v_head(x)
         #q = self.q_heads(x)
-        #q = torch.cat((q,q2),dim=-1)
+        q = torch.cat((q,q2),dim=-1)
         QC = q.shape[2]
 
         #q2 = q2.view(B, T, QC//4, 4)
-        q = q.view(B, T, QC//4, 4)
-        v = v.view(B, T, C//4, 4)
+        #q = q.view(B, T, QC//4, 4)
+        #v = v.view(B, T, C//4, 4)
+        q = q.view(B, T, QC)
+        v = v.view(B, T, C)
 
         #split, window T//n_layer, fft mix
-        q = utils.maprotgate(q)
+        #q = utils.maprotgate(q)
         #q2 = utils.maprotgate(q)
-        q2 = utils.scan_quaternion_multiply_window(q, self.win)
-        q2 = self.c_kattn(q2.view(B, T, -1)).view(B, T, QC//4, 4)
+        #q2 = utils.scan_quaternion_multiply_window(q, self.win)
+        #q2 = self.c_kattn(q2.view(B, T, -1)).view(B, T, QC//4, 4)
         #q = utils.fft_trunc_csquish(torch.cat((q,q2),dim=-2).view(B, T, -1).to(torch.float32), C).to(x.dtype).view(B, T, C//4, 4) #win premap
         
-        q2 = utils.maprotgate(q2)#winmul
+        #q2 = utils.maprotgate(q2)#winmul
         #s = torch.sigmoid(q[..., 0].view(B, T, QC//4, 1))
         #rot = q[..., 1:]
         #q = utils.exponential_map(rot*s) 
         #HQC = QC//2
         
-        q = utils.quaternion_multiply(q, q2)#winmul
+        #q = utils.quaternion_multiply(q, q2)#winmul
 
         #q = utils.fft_trunc_csquish(torch.cat((q,q2),dim=-2).view(B, T, -1).to(torch.float32), C).to(x.dtype).view(B, T, C//4, 4)#winmix
         #gates2 = utils.maprotgate(q[...,HQC:,:])
-        q = utils.parallel_quaternion_scan_log_n(q)
-        
+        #q = utils.parallel_quaternion_scan_log_n(q)
+        #q = utils.fft_trunc_csquish(q.view(B, T, -1).to(torch.float32), C).to(x.dtype).view(B, T, C//4, 4)
+        q = utils.fft_trunc_csquish(q.view(B, T, -1).to(torch.float32), C).to(x.dtype).view(B, T, C)
+        q = utils.pscan(q,self.scanner)#.view(B, T, C//4, 4)
         #q = utils.quaternion_multiply(gatescan, utils.parallel_quaternion_scan_log_n(gates2))
         #q = self.q_proj(q.view(B, T, -1)).view(B, T, C//4, 4)
         #q = self.attn_dropout(q)
         #q = utils.fft_trunc_csquish(q.view(B, T, -1).to(torch.float32), C).to(x.dtype).view(B, T, C//4, 4)
         #q = utils.quaternion_multiply(q[...,:C//4,:], q[...,C//4:,:])
-        Y = utils.quaternion_multiply(q, v)
+        #Y =  utils.quaternion_multiply(q, v)
+        Y = q*v #utils.quaternion_multiply(q, v)
         #Y = Y / torch.norm(Y, p=2, dim=-1, keepdim=True)
         Y = Y.view(B, T, -1)
         Y = self.c_proj(Y)
@@ -153,7 +176,7 @@ class MemAttention(nn.Module):
         self.head_dim =  self.n_embd //  self.n_head 
         
         self.qm = nn.Parameter(torch.ones(self.head_dim).normal_(mean=1, std=0.1))
-
+        
         #self.conv = wackmodel.CausalConv1d2()
         # Memory positions are always visible
         self.mem_len = config.mem_block_size
@@ -250,11 +273,11 @@ class MLP(nn.Module):
 class MemBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_1 = LayerNorm(config)
         self.attn = MemAttention(config)
         if(Qrotention):
             self.attn = QrotAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_2 = LayerNorm(config)
         self.mlp = MLP(config)
 
     def forward(self, x, mem = None, causal = True, k =None):
@@ -312,9 +335,10 @@ class GPTConfig:
     internal_block_size: int = 30
     device='cuda'
     #optim: str = 'SGD'
-    optim: str = 'adam'
+    optimizer: str = 'adam'
     mem_block_size: int = 8
     batch_size = 64
+    step = 0
 
 class GPT(nn.Module):
 
@@ -339,7 +363,7 @@ class GPT(nn.Module):
             wpe = nn.Embedding(config.internal_block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = blocks,
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            ln_f = LayerNorm(config),
         ))
         if(think):
             self.thinkthreshold = nn.Parameter(torch.ones(1))
@@ -388,7 +412,7 @@ class GPT(nn.Module):
 
 
     def forward(self, idx, targets=None):
-        
+        #self.config.step += 1.0
         #torch.compiler.cudagraph_mark_step_begin()
         device = idx.device
         b, t = idx.size()
@@ -790,7 +814,7 @@ class GPT(nn.Module):
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda' and False
         extra_args = dict(fused=True) if use_fused else dict()
-        if(self.config.optim == 'adam'):
+        if(self.config.optimizer == 'adam'):
             optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
         else:
             optimizer = torch.optim.SGD(optim_groups, lr=learning_rate, **extra_args)

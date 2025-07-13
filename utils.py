@@ -9,6 +9,9 @@ from torch.nn import functional as F
 
 #everything here is probably a candidate to be made into a kernel.
 
+def scale(n_embd, step, start_perc, max):
+    return math.ceil(n_embd * min(start_perc+ (1.0-start_perc)*(step/max),1.0 ))
+
 def funnyMulti(x, y):
     return torch.sign(x) * torch.sqrt(torch.abs(x * y) + 1e-10)
 
@@ -149,6 +152,93 @@ def parallel_quaternion_scan_log_n(q_in: torch.Tensor) -> torch.Tensor:
     inclusive_scan_padded = quaternion_multiply(x, padded_q_original)
     
     final_result = inclusive_scan_padded[:, :T, ...].reshape(original_shape)
+    
+    return final_result
+
+
+
+@torch.compile(backend='inductor', mode='max-autotune')
+def pscan(x_in: torch.Tensor, func: nn.Module) -> torch.Tensor:
+    """
+    Performs a parallel scan using a provided binary operator `func`.
+    If `func` is associative, this is equivalent to a sequential scan.
+    If `func` is not associative, this computes a fixed binary-tree reduction
+    and broadcast, which is a different operation.
+
+    Args:
+        x_in (torch.Tensor): Input sequence of shape (B, T, C).
+        func (nn.Module): A module implementing a binary operator f(a, b).
+
+    Returns:
+        torch.Tensor: The result of the scan, shape (B, T, C).
+    """
+    # Store original shape and dimensions
+    original_shape = x_in.shape
+    B, T, C = original_shape
+    device = x_in.device
+    dtype = x_in.dtype
+
+    # --- 1. Padding ---
+    # Pad sequence length T to the next power of 2
+    next_pow_of_2 = 2**math.ceil(math.log2(T))
+    
+    if T == next_pow_of_2:
+        x = x_in
+    else:
+        padding_size = next_pow_of_2 - T
+        # The identity element for an MLP is not well-defined.
+        # Zero-padding is the most neutral choice.
+        # This assumes f(x, 0) ~= x, which the MLP might learn.
+        identity_padding = torch.zeros(B, padding_size, C, device=device, dtype=dtype)
+        x = torch.cat([x_in, identity_padding], dim=1)
+
+    # --- The standard Blelloch scan requires two separate arrays for clarity ---
+    # `a` will store the results of the up-sweep
+    a = x.clone()
+    num_items = a.shape[1]
+    num_levels = int(math.log2(num_items))
+
+    # --- 2. Up-Sweep (Reduction Phase) ---
+    # At each level d, we combine elements 2^d apart.
+    for d in range(num_levels):
+        stride = 2**d
+        # Apply func to pairs of elements and update the right element of the pair
+        # This is done in-place for efficiency
+        # The indices are tricky: we operate on elements [2*stride-1, 4*stride-1, ...]
+        indices = torch.arange(2*stride - 1, num_items, 2*stride, device=device)
+        
+        # Select left and right operands
+        left_operands = a[:, indices - stride, :]
+        right_operands = a[:, indices, :]
+        
+        # Apply the binary operator
+        a[:, indices, :] = func(left_operands, right_operands)
+
+
+    # --- 3. Down-Sweep (Scan Phase) ---
+    # Clear the last element to be the identity element
+    a[:, -1, :] = 0.0 #should this be a learnable?
+
+    # At each level d (from top down), we propagate values
+    for d in range(num_levels - 1, -1, -1):
+        stride = 2**d
+        indices = torch.arange(2*stride - 1, num_items, 2*stride, device=device)
+        
+        # Select the left sum (temp) and the right element (which will become the new left sum)
+        temp = a[:, indices - stride, :]
+        
+        # Update the left element with the value from the right
+        a[:, indices - stride, :] = a[:, indices, :]
+        
+        # Update the right element by combining the stored temp value with the new left value
+        a[:, indices, :] = func(a[:, indices, :], temp)
+
+    # The result `a` is now an EXCLUSIVE scan.
+    # To make it INCLUSIVE, we combine it with the original input sequence.
+    inclusive_scan_padded = func(a, x)
+    
+    # --- 4. Unpad and Reshape ---
+    final_result = inclusive_scan_padded[:, :T, :].reshape(original_shape)
     
     return final_result
 
