@@ -15,6 +15,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123
 $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
 """
+
 import gc
 import os
 import time
@@ -38,6 +39,8 @@ torch._dynamo.optimize()
 torch._inductor.config.disable_cpp_codegen = True
 #torch._inductor.config.triton = True
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 
 # -----------------------------------------------------------------------------
@@ -89,10 +92,21 @@ exec(open('configurator.py').read()) # overrides from command line or config fil
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
-#q = torch.rand(10,10,10,4,device=device)
-#q1 = utils.scan_quaternion_multiply_window(q.clone(),3)
-#q2 = utils.naive_scan_quaternion_multiply_window(q.clone(),3)
-#print(f"difference in result: {torch.nn.functional.mse_loss(q1,q2)}")
+
+q0 = torch.rand(10,10,10,device=device)
+q1 = torch.rand(10,10,10,device=device)
+q2 = torch.rand(10,10,10,device=device)
+r1 = utils.fft_trunc_csquish(torch.cat((q0,q1,q2),dim=-1).to(torch.float32), 10)
+r2 = utils.fft_trunc_csquish(torch.cat((q0,q1),dim=-1).to(torch.float32), 10)
+r3 = utils.fft_trunc_csquish(torch.cat((r2,q2),dim=-1).to(torch.float32), 10)
+
+r4 = utils.fft_trunc_csquish(torch.cat((q1,q0),dim=-1).to(torch.float32), 10)
+r5 = utils.fft_trunc_csquish(torch.cat((q1,q2),dim=-1).to(torch.float32), 10)
+r6 = utils.fft_trunc_csquish(torch.cat((q0,r5),dim=-1).to(torch.float32), 10)
+
+print(f"collativity in result: {torch.nn.functional.mse_loss(r1,r3)}")
+print(f"associativity in result: {torch.nn.functional.mse_loss(r2,r4)}")
+print(f"commutativity in result: {torch.nn.functional.mse_loss(r6,r3)}")
 #torch._dynamo.reset() in case of cache corruption throw it off a bridge.
 
 # various inits, derived attributes, I/O setup
@@ -683,6 +697,7 @@ if(True): #i hate white space significance. (this is for that profiler and i'm l
             with ctx:
                 logits, loss = model(X, Y)
                 loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+            
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
             #del X
             #del Y

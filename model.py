@@ -19,6 +19,7 @@ import optim
 import utils
 import wackmodel
 from cut_cross_entropy import linear_cross_entropy
+
 #todo
 #prediction machine
 #Linear = optim.OptimizedLinear
@@ -79,6 +80,20 @@ class Scanner(nn.Module):
     def forward(self, x: torch.tensor, y: torch.tensor):
         return self.scanner( torch.cat((x,y),dim=-1))
 
+
+class fftScanner(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.scanner = nn.Sequential(
+                #nn.LayerNorm(config.n_embd * 2), #untested
+                Linear(config.n_embd, config.n_embd*2),
+                nn.GELU(),
+                Linear(config.n_embd*2, config.n_embd)
+            )
+    def forward(self, x: torch.tensor, y: torch.tensor):
+        return self.scanner(utils.fft_trunc_csquish(torch.cat((x,y),dim=-1).to(torch.float32), x.shape[2], "mid").to(x.dtype))
+        #return utils.fft_trunc_csquish(torch.cat((x,y),dim=-1).to(torch.float32), x.shape[2], "low").to(x.dtype)
+
 class QrotAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -92,6 +107,7 @@ class QrotAttention(nn.Module):
 
         self.c_kattn = Linear(config.n_embd,  config.n_embd, bias=config.bias)
         self.scanner = Scanner(config)
+        self.identity = nn.Parameter(torch.rand(config.n_embd))
         #nn.Sequential(
         #        Linear(config.n_embd*2, config.n_embd*2),
         #        nn.GELU(),
@@ -112,9 +128,9 @@ class QrotAttention(nn.Module):
         q, q2,  v = self.c_attn(x).split(self.n_embd, dim=2)
         #v = self.v_head(x)
         #q = self.q_heads(x)
-        q = torch.cat((q,q2),dim=-1)
+        #q = torch.cat((q,q2),dim=-1)
         QC = q.shape[2]
-
+        
         #q2 = q2.view(B, T, QC//4, 4)
         #q = q.view(B, T, QC//4, 4)
         #v = v.view(B, T, C//4, 4)
@@ -140,14 +156,25 @@ class QrotAttention(nn.Module):
         #gates2 = utils.maprotgate(q[...,HQC:,:])
         #q = utils.parallel_quaternion_scan_log_n(q)
         #q = utils.fft_trunc_csquish(q.view(B, T, -1).to(torch.float32), C).to(x.dtype).view(B, T, C//4, 4)
-        q = utils.fft_trunc_csquish(q.view(B, T, -1).to(torch.float32), C).to(x.dtype).view(B, T, C)
-        q = utils.pscan(q,self.scanner)#.view(B, T, C//4, 4)
+        #q = utils.fft_trunc_csquish(q.view(B, T, -1).to(torch.float32), C).to(x.dtype).view(B, T, C)
+        q = utils.pscan(q, self.scanner, self.identity)#.view(B, T, C//4, 4)
+        #q2 = utils.pscan(q2, self.scanner, self.identity)
+        
+        #q = utils.fft_trunc_csquish(q.view(B, T, -1).to(torch.float32), C).to(x.dtype).view(B, T, C)
+        #q = self.scanner(q,q2)
+        #q= q*q2
+        #q = utils.fft_trunc_csquish(torch.cat((q,q2),dim=-1).view(B, T, -1).to(torch.float32), C).to(x.dtype).view(B, T, C)
         #q = utils.quaternion_multiply(gatescan, utils.parallel_quaternion_scan_log_n(gates2))
         #q = self.q_proj(q.view(B, T, -1)).view(B, T, C//4, 4)
         #q = self.attn_dropout(q)
         #q = utils.fft_trunc_csquish(q.view(B, T, -1).to(torch.float32), C).to(x.dtype).view(B, T, C//4, 4)
         #q = utils.quaternion_multiply(q[...,:C//4,:], q[...,C//4:,:])
         #Y =  utils.quaternion_multiply(q, v)
+        #Y = self.scanner(q,v) #utils.quaternion_multiply(q, v)
+        
+        #Y = utils.fft_trunc_csquish(torch.cat((q,q2,v),dim=-1).to(torch.float32), C).to(x.dtype)
+        #q = utils.fft_trunc_csquish(torch.cat((q,q2),dim=-1).to(torch.float32), C, "low").to(x.dtype)
+        #Y = utils.fft_trunc_csquish(torch.cat((q,v),dim=-1).to(torch.float32), C, "low").to(x.dtype)
         Y = q*v #utils.quaternion_multiply(q, v)
         #Y = Y / torch.norm(Y, p=2, dim=-1, keepdim=True)
         Y = Y.view(B, T, -1)
@@ -212,6 +239,8 @@ class MemAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
 
         return y[:,self.mem_len:,:]
+
+
 
 class LearnableSpiral4D(nn.Module):
     def __init__(self, init_freq=1.0, init_amp=1.0):
@@ -812,7 +841,7 @@ class GPT(nn.Module):
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda' and False
+        use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
         if(self.config.optimizer == 'adam'):
             optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)

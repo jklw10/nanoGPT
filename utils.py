@@ -155,69 +155,98 @@ def parallel_quaternion_scan_log_n(q_in: torch.Tensor) -> torch.Tensor:
     
     return final_result
 
-
-
 @torch.compile(backend='inductor', mode='max-autotune')
-def pscan(x_in: torch.Tensor, func: nn.Module) -> torch.Tensor:
-    """
-    Performs a parallel scan using a provided binary operator `func`.
-    If `func` is associative, this is equivalent to a sequential scan.
-    If `func` is not associative, this computes a fixed binary-tree reduction
-    and broadcast, which is a different operation.
-
-    Args:
-        x_in (torch.Tensor): Input sequence of shape (B, T, C).
-        func (nn.Module): A module implementing a binary operator f(a, b).
-
-    Returns:
-        torch.Tensor: The result of the scan, shape (B, T, C).
-    """
-    # Store original shape and dimensions
+def pscan(x_in: torch.Tensor, func: nn.Module, ident: torch.Tensor) -> torch.Tensor:
     original_shape = x_in.shape
     B, T, C = original_shape
     device = x_in.device
     dtype = x_in.dtype
 
     # --- 1. Padding ---
-    # Pad sequence length T to the next power of 2
+    next_pow_of_2 = 2**math.ceil(math.log2(T))
+    if T == next_pow_of_2:
+        x = x_in
+    else:
+        padding_size = next_pow_of_2 - T
+        identity_padding = ident.expand(B, padding_size, C)
+        x = torch.cat([x_in, identity_padding], dim=1)
+
+    a = x.clone()
+    num_items = a.shape[1]
+    num_levels = int(math.log2(num_items))
+
+    # --- 2. Up-Sweep (Reduction Phase) ---
+    for d in range(num_levels):
+        stride = 2**d
+        indices = torch.arange(2*stride - 1, num_items, 2*stride, device=device)
+
+        # Use index_select (functional) instead of direct indexing for clarity
+        left_operands = torch.index_select(a, 1, indices - stride)
+        right_operands = torch.index_select(a, 1, indices)
+        
+        # Use index_put (functional) instead of in-place assignment
+        # This creates a new 'a' tensor, which torch.compile can handle.
+        # We need to provide indices for the batch dimension too.
+        batch_indices = torch.arange(B, device=device).unsqueeze(1)
+        # The indices tuple tells index_put which elements to update: (batch_idx, sequence_idx)
+        a = torch.index_put(a, (batch_indices, indices), func(left_operands, right_operands))
+
+    # --- 3. Down-Sweep (Scan Phase) ---
+    # **CRITICAL CHANGE**: Replace slice assignment with torch.cat
+    # This is much friendlier to the compiler.
+    a = torch.cat([a[:, :-1, :], ident.expand(B, 1, C)], dim=1)
+
+    for d in range(num_levels - 1, -1, -1):
+        stride = 2**d
+        indices = torch.arange(2*stride - 1, num_items, 2*stride, device=device)
+        batch_indices = torch.arange(B, device=device).unsqueeze(1)
+
+        # Select the values we need *before* any modification
+        left_val = torch.index_select(a, 1, indices - stride)
+        right_val = torch.index_select(a, 1, indices)
+
+        # **CRITICAL CHANGE**: Perform the swap and update using two index_put calls
+        # 1. Put the right_val into the left_pos
+        a = torch.index_put(a, (batch_indices, indices - stride), right_val)
+        # 2. Put the result of func(right_val, left_val) into the right_pos
+        a = torch.index_put(a, (batch_indices, indices), func(right_val, left_val))
+
+    inclusive_scan_padded = func(a, x)
+    final_result = inclusive_scan_padded[:, :T, :].reshape(original_shape)
+    
+    return final_result
+
+@torch.compile(backend='inductor', mode='max-autotune')
+def pscan2(x_in: torch.Tensor, func: nn.Module, ident: torch.tensor) -> torch.Tensor:
+    original_shape = x_in.shape
+    B, T, C = original_shape
+    device = x_in.device
+    dtype = x_in.dtype
+
     next_pow_of_2 = 2**math.ceil(math.log2(T))
     
     if T == next_pow_of_2:
         x = x_in
     else:
         padding_size = next_pow_of_2 - T
-        # The identity element for an MLP is not well-defined.
-        # Zero-padding is the most neutral choice.
-        # This assumes f(x, 0) ~= x, which the MLP might learn.
-        identity_padding = torch.zeros(B, padding_size, C, device=device, dtype=dtype)
+        identity_padding = ident.expand(B, padding_size, C)
         x = torch.cat([x_in, identity_padding], dim=1)
 
-    # --- The standard Blelloch scan requires two separate arrays for clarity ---
-    # `a` will store the results of the up-sweep
     a = x.clone()
     num_items = a.shape[1]
     num_levels = int(math.log2(num_items))
 
-    # --- 2. Up-Sweep (Reduction Phase) ---
-    # At each level d, we combine elements 2^d apart.
     for d in range(num_levels):
         stride = 2**d
-        # Apply func to pairs of elements and update the right element of the pair
-        # This is done in-place for efficiency
-        # The indices are tricky: we operate on elements [2*stride-1, 4*stride-1, ...]
         indices = torch.arange(2*stride - 1, num_items, 2*stride, device=device)
         
-        # Select left and right operands
         left_operands = a[:, indices - stride, :]
         right_operands = a[:, indices, :]
         
-        # Apply the binary operator
         a[:, indices, :] = func(left_operands, right_operands)
 
 
-    # --- 3. Down-Sweep (Scan Phase) ---
-    # Clear the last element to be the identity element
-    a[:, -1, :] = 0.0 #should this be a learnable?
+    a[:, -1, :] = ident.expand(B, 1, C).clone()
 
     # At each level d (from top down), we propagate values
     for d in range(num_levels - 1, -1, -1):
@@ -572,38 +601,59 @@ def fft_trunc_tsquish(x):
     xc = torch.complex(halfft.real[:,t//4:-t//4,:],halfft.imag[:,t//4:-t//4,:])
     return torch.fft.ifft(xc,dim=1).real
 
-def fft_trunc_squish(x, target=None, dim=-1):
+def rfft_trunc_squish(x, target_dim=None, dim=-1, band = "low"):
     c = x.size(dim)
 
-    if target is None:
-        target = c // 2
+    if target_dim is None:
+        target_dim = c // 2
     
-    ff_x = torch.fft.fft(x, dim=dim)
+    ff_x = torch.fft.rfft(x, dim=dim)
     
-    margin = (c - target) // 2
+    match band:
+        case "low":
+            start = 0
+            end = target_dim
+        case "mid":
+            center = c//2
+            start = center - target_dim//2
+            end = center + target_dim//2
+        case "high":
+            start = -target_dim
+            end = -1
+        case _:
+            pass
     
     slicer = [slice(None)] * x.ndim 
-    if margin > 0:
-      slicer[dim] = slice(margin, -margin)
+    slicer[dim] = slice(start, end)
     
     ff_x_trunc = ff_x[tuple(slicer)]
 
-    o = torch.fft.ifft(ff_x_trunc, dim=dim).real
+    o = torch.fft.irfft(ff_x_trunc, dim=dim).real
 
     return o
 
-def fft_trunc_csquish(x, target = None):
+
+def fft_trunc_csquish(x, target_dim = None, band = "low"):
     b,t,c = x.size()
-    halfft = torch.fft.fft(x,dim=-1)
-    if(target is None):
-        target = c//2
-    margin = c//2- target//2
-    xc = torch.complex(halfft.real[:,:,margin:-margin],halfft.imag[:,:,margin:-margin])
-    #if(xc.isnan().any):
-    #    print("nan complx")
-    o = torch.fft.ifft(xc,dim=-1).real
-    #if(o.isnan().any):
-    #    print("nan out")
+    halfft = torch.fft.rfft(x,dim=-1)
+    if(target_dim is None):
+        target_dim = c//2
+    match band:
+        case "low":
+            start = 0
+            end = target_dim
+        case "mid":
+            center = c//2
+            start = center - target_dim//2
+            end = center + target_dim//2
+        case "high":
+            start = -target_dim
+            end = -1
+        case _:
+            pass
+
+    xc = torch.complex(halfft.real[:,:,start:end],halfft.imag[:,:,start:end])
+    o = torch.fft.irfft(xc,target_dim,dim=-1).real
     return o 
     
 def gaussian_kernel(grad, center_offset: float, sigma = 3.0, dim=None) -> torch.Tensor:
