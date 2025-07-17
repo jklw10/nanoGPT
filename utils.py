@@ -223,10 +223,10 @@ def pscan_naive(x: torch.Tensor, func: nn.Module, ident: torch.tensor) -> torch.
     if T == 0:
         return cumulative_prod
         
-    cumulative_prod[:, 0, :, :] = x[:, 0, :, :]
+    cumulative_prod[:, 0, :] = x[:, 0, :]
 
     for i in range(1, T):
-        cumulative_prod[:, i, :, :] = func(cumulative_prod[:, i-1, :, :], x[:, i, :, :])
+        cumulative_prod[:, i, :] = func(cumulative_prod[:, i-1, :], x[:, i, :])
     
     return cumulative_prod
 
@@ -380,7 +380,7 @@ def qcumprod(q: torch.Tensor) -> torch.Tensor:
     if T == 0:
         return cumulative_prod
         
-    cumulative_prod= q[:, 0, :, :]
+    cumulative_prod[:, 0, :, :] = q[:, 0, :, :]
 
     for i in range(1, T):
         cumulative_prod = quaternion_multiply(cumulative_prod, q[:, i, :, :])
