@@ -217,59 +217,18 @@ def pscan(x_in: torch.Tensor, func: nn.Module, ident: torch.Tensor) -> torch.Ten
     return final_result
 
 @torch.compile(backend='inductor', mode='max-autotune')
-def pscan2(x_in: torch.Tensor, func: nn.Module, ident: torch.tensor) -> torch.Tensor:
-    original_shape = x_in.shape
-    B, T, C = original_shape
-    device = x_in.device
-    dtype = x_in.dtype
+def pscan_naive(x: torch.Tensor, func: nn.Module, ident: torch.tensor) -> torch.Tensor:
+    T = x.shape[1]
+    cumulative_prod = torch.empty_like(x)
+    if T == 0:
+        return cumulative_prod
+        
+    cumulative_prod[:, 0, :, :] = x[:, 0, :, :]
 
-    next_pow_of_2 = 2**math.ceil(math.log2(T))
+    for i in range(1, T):
+        cumulative_prod[:, i, :, :] = func(cumulative_prod[:, i-1, :, :], x[:, i, :, :])
     
-    if T == next_pow_of_2:
-        x = x_in
-    else:
-        padding_size = next_pow_of_2 - T
-        identity_padding = ident.expand(B, padding_size, C)
-        x = torch.cat([x_in, identity_padding], dim=1)
-
-    a = x.clone()
-    num_items = a.shape[1]
-    num_levels = int(math.log2(num_items))
-
-    for d in range(num_levels):
-        stride = 2**d
-        indices = torch.arange(2*stride - 1, num_items, 2*stride, device=device)
-        
-        left_operands = a[:, indices - stride, :]
-        right_operands = a[:, indices, :]
-        
-        a[:, indices, :] = func(left_operands, right_operands)
-
-
-    a[:, -1, :] = ident.expand(B, 1, C).clone()
-
-    # At each level d (from top down), we propagate values
-    for d in range(num_levels - 1, -1, -1):
-        stride = 2**d
-        indices = torch.arange(2*stride - 1, num_items, 2*stride, device=device)
-        
-        # Select the left sum (temp) and the right element (which will become the new left sum)
-        temp = a[:, indices - stride, :]
-        
-        # Update the left element with the value from the right
-        a[:, indices - stride, :] = a[:, indices, :]
-        
-        # Update the right element by combining the stored temp value with the new left value
-        a[:, indices, :] = func(a[:, indices, :], temp)
-
-    # The result `a` is now an EXCLUSIVE scan.
-    # To make it INCLUSIVE, we combine it with the original input sequence.
-    inclusive_scan_padded = func(a, x)
-    
-    # --- 4. Unpad and Reshape ---
-    final_result = inclusive_scan_padded[:, :T, :].reshape(original_shape)
-    
-    return final_result
+    return cumulative_prod
 
 @torch.compile(backend='inductor', mode='max-autotune')
 def quaternion_inverse(q: torch.Tensor) -> torch.Tensor:
@@ -401,7 +360,7 @@ def naive_scan_quaternion_multiply_window(
     return torch.stack(outputs, dim=1)
 
 @torch.compile(backend='inductor', mode='max-autotune')
-def parallel_quaternion_scan(q: torch.Tensor) -> torch.Tensor:
+def parallel_quaternion_scan_naive(q: torch.Tensor) -> torch.Tensor:
     T = q.shape[1]
     cumulative_prod = torch.empty_like(q)
     if T == 0:

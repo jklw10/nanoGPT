@@ -145,7 +145,7 @@ class QrotAttention(nn.Module):
         #q = utils.parallel_quaternion_scan_log_n(q)
         #q = utils.fft_trunc_csquish(q.view(B, T, -1).to(torch.float32), C).to(x.dtype).view(B, T, C//4, 4)
         #q = utils.fft_trunc_csquish(q.view(B, T, -1).to(torch.float32), C).to(x.dtype).view(B, T, C)
-        q = utils.pscan(q, self.scanner, self.identity)#.view(B, T, C//4, 4)
+        q = utils.pscan_naive(q, self.scanner, self.identity)#.view(B, T, C//4, 4)
         #q2 = utils.pscan(q2, self.scanner, self.identity)
         
         #q = utils.fft_trunc_csquish(q.view(B, T, -1).to(torch.float32), C).to(x.dtype).view(B, T, C)
