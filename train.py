@@ -88,6 +88,7 @@ dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
+train_logging = False
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
@@ -636,7 +637,7 @@ if(True): #i hate white space significance. (this is for that profiler and i'm l
                 #        print(decode(outp[0].detach().cpu().numpy().tolist()))
                 #        print('---------------')
                 if losses['val'] < best_val_loss or always_save_checkpoint:
-                    best_val_loss = losses['val']
+                    best_val_loss = losses['val'].detach()
                     if(False and dataset == 'shakespeare_char'):
                         with torch.no_grad():
                             model.eval()
@@ -723,11 +724,11 @@ if(True): #i hate white space significance. (this is for that profiler and i'm l
         #t1 = time.time()
         #dt = t1 - t0
         #t0 = t1
-        if iter_num % log_interval == 0 and master_process and False:
+        if iter_num % log_interval == 0 and master_process and train_logging:
             t1 = time.time()
             # get loss as float. note: this is a CPU-GPU sync point
             # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-            lossf = loss.item() * gradient_accumulation_steps
+            lossf = loss.detach().item() * gradient_accumulation_steps
             #if local_iter_num >= 5: # let the training loop settle a bit
             #    mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             #    running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu

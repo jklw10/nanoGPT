@@ -291,9 +291,10 @@ class MemBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config)
-        self.attn = MemAttention(config)
         if(Qrotention):
             self.attn = QrotAttention(config)
+        else:
+            self.attn = MemAttention(config)
         self.ln_2 = LayerNorm(config)
         self.mlp = MLP(config)
 
@@ -408,13 +409,13 @@ class GPT(nn.Module):
             self.lm_head = Linear(config.n_embd, config.vocab_size * self.patch_max, bias=False)
         else:
             #it'd seem like this isn't worth optimized linear's hassle with apple's CCE loss 
-            self.lm_head = Linear(config.n_embd, config.vocab_size, bias=False)# optim.OptimizedLinear(config.n_embd, config.vocab_size, bias=False, batch_size=64)
+            self.lm_head = Linear(config.n_embd, config.vocab_size, bias=False)
             # with weight tying when using torch.compile() some warnings get generated:
             # "UserWarning: functional_call was passed multiple values for tied weights.
             # This behavior is deprecated and will be an error in future versions"
             # not 100% sure what this is, so far seems to be harmless. TODO investigate
             #apparently bad
-            #self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+            self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
         
         self.predict_weight = 0.01
         # init all weights
@@ -813,11 +814,7 @@ class GPT(nn.Module):
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        #self_lr = []
-        #for module in self.modules():
-        #    if isinstance(module, optim.OptimizedLinear):
-        #        for p in module.parameters():
-        #            self_lr.append(p)
+        
         optim_groups = [
             {'params': decay_params, 'weight_decay': weight_decay},
             {'params': nodecay_params, 'weight_decay': 0.0},
@@ -836,7 +833,6 @@ class GPT(nn.Module):
         else:
             optimizer = torch.optim.SGD(optim_groups, lr=learning_rate, **extra_args)
         
-        #optimizer = optim.AdaptiveLROptimizer(optim_groups, lr=learning_rate,model = self, **extra_args)
             #optimizer =torch.optim.Adadelta(optim_groups)#, **extra_args)# lr=learning_rate, **extra_args)
         print(f"using fused AdamW: {use_fused}")
 

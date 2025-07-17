@@ -518,6 +518,7 @@ def GradOrth(param, adjusted_grad):
     adjusted_grad = (g_orth_scaled.view_as(adjusted_grad))
     return adjusted_grad
 
+@torch.compile(backend='inductor', mode='max-autotune')
 def fftnorm(grad,center=0.5,sigma=0.5, dim=None):
     if(grad.ndim>=2):
         adjusted_grad = torch.fft.fft2(grad,dim=dim) 
@@ -533,6 +534,7 @@ def fftnorm(grad,center=0.5,sigma=0.5, dim=None):
         adjusted_grad = torch.complex(gk*(adjusted_grad.real),gk*(adjusted_grad.imag))
         return torch.fft.ifft(adjusted_grad).real
 
+@torch.compile(backend='inductor', mode='max-autotune')
 def fft_bmean_csquish_add(x, x2):
     b,t,c = x.size()
     halfft2 = torch.fft.fft(x2,dim=-1)
@@ -570,6 +572,7 @@ def fft_bmean_tsquish_add(x, x2):
     
     return torch.fft.ifft(xc,dim=1).real
 
+@torch.compile(backend='inductor', mode='max-autotune')
 def calculate_linear_chaos_loss(logits: torch.tensor, balance_lambda= 0.1 , target_chaos= 0.1 ) -> float:
     logits = logits.float()
     vocab_size = logits.size(-1)
@@ -595,12 +598,14 @@ def calculate_linear_chaos_loss(logits: torch.tensor, balance_lambda= 0.1 , targ
     
     return l_balance * balance_lambda, linear_chaosness.mean()
 
+@torch.compile(backend='inductor', mode='max-autotune')
 def fft_trunc_tsquish(x):
     b,t,c = x.size()
     halfft = torch.fft.fft(x,dim=1)
     xc = torch.complex(halfft.real[:,t//4:-t//4,:],halfft.imag[:,t//4:-t//4,:])
     return torch.fft.ifft(xc,dim=1).real
 
+@torch.compile(backend='inductor', mode='max-autotune')
 def rfft_trunc_squish(x, target_dim=None, dim=-1, band = "low"):
     c = x.size(dim)
 
@@ -633,6 +638,7 @@ def rfft_trunc_squish(x, target_dim=None, dim=-1, band = "low"):
     return o
 
 
+@torch.compile(backend='inductor', mode='max-autotune')
 def fft_trunc_csquish(x, target_dim = None, band = "low"):
     b,t,c = x.size()
     halfft = torch.fft.rfft(x,dim=-1)
