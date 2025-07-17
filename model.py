@@ -72,33 +72,20 @@ class Scanner(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.scanner = nn.Sequential(
-                #nn.LayerNorm(config.n_embd * 2), #untested
-                Linear(config.n_embd*2, config.n_embd*2),
+                nn.LayerNorm(config.n_embd * 2), #untested
+                Linear(config.n_embd*2, config.n_embd*4),
                 nn.GELU(),
-                Linear(config.n_embd*2, config.n_embd)
+                Linear(config.n_embd*4, config.n_embd)
             )
     def forward(self, x: torch.tensor, y: torch.tensor):
         return self.scanner( torch.cat((x,y),dim=-1))
-
-
-class fftScanner(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.scanner = nn.Sequential(
-                #nn.LayerNorm(config.n_embd * 2), #untested
-                Linear(config.n_embd, config.n_embd*2),
-                nn.GELU(),
-                Linear(config.n_embd*2, config.n_embd)
-            )
-    def forward(self, x: torch.tensor, y: torch.tensor):
-        return self.scanner(utils.fft_trunc_csquish(torch.cat((x,y),dim=-1).to(torch.float32), x.shape[2], "mid").to(x.dtype))
-        #return utils.fft_trunc_csquish(torch.cat((x,y),dim=-1).to(torch.float32), x.shape[2], "low").to(x.dtype)
 
 class QrotAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.c_attn =  Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        #self.c_attn3 =  Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn2 =  Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)
         
         #self.q_heads = Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)#doesn't scale well :/ maybe a different down projection.
         #self.v_head =  Linear(config.n_embd,  config.n_embd, bias=config.bias)
@@ -125,7 +112,8 @@ class QrotAttention(nn.Module):
 
     def forward(self, x: torch.tensor, mem=None,causal=True, k=None): #same signature to allow easy swapping.
         B, T, C = x.size() 
-        q, q2,  v = self.c_attn(x).split(self.n_embd, dim=2)
+        #q, q2,  v = self.c_attn3(x).split(self.n_embd, dim=2)
+        q,   v = self.c_attn2(x).split(self.n_embd, dim=2)
         #v = self.v_head(x)
         #q = self.q_heads(x)
         #q = torch.cat((q,q2),dim=-1)
