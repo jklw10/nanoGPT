@@ -5,6 +5,219 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import utils
+
+from torch.optim import Optimizer
+from typing import Iterable
+
+def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int):
+    """
+    Quintic Newton–Schulz orthogonalization of G.
+    Works only if G.ndim>=2; otherwise returns G unchanged.
+    """
+    if G.ndim < 2:
+        return G
+    a, b, c = 3.4445, -4.7750, 2.0315
+    X = G.to(torch.bfloat16)
+    transposed = False
+    # always do (XX^T)^{-1/2}
+    if X.size(-2) > X.size(-1):
+        X = X.transpose(-2, -1)
+        transposed = True
+    X = X / (X.norm(dim=(-2,-1), keepdim=True) + 1e-7)
+    for _ in range(steps):
+        A = X @ X.transpose(-2,-1)
+        B = b * A + c * (A @ A)
+        X = a * X + B @ X
+    if transposed:
+        X = X.transpose(-2, -1)
+    return X.to(G.dtype)
+
+def muon_update(grad: torch.Tensor,
+                buf: torch.Tensor,
+                beta: float,
+                ns_steps: int,
+                nesterov: bool,
+                ):
+    """
+    Muon-style momentum + NS orthogonalization of grad.
+    - buf ← β·buf + (1−β)·grad
+    - U = β·buf + (1−β)·grad  (if nesterov) or buf
+    - quintic NS on matrix-shaped U
+    - only apply magnitude-correction if grad.ndim>=2
+    """
+    # momentum buffer update
+    buf.lerp_(grad, 1 - beta)
+    # pick Nesterov vs plain
+    U = grad.lerp(buf, beta) if nesterov else buf
+
+    orig_shape = U.shape
+    if U.ndim > 2:
+        U_flat = U.view(U.size(0), -1)
+    else:
+        U_flat = U
+
+    # orthogonalize if possible
+    #U_flat = zeropower_via_newtonschulz5(U_flat, steps=ns_steps)
+    U_flat = zeropower_via_newtonschulz5(U_flat, steps=ns_steps)
+
+    # reshape back
+    if U.ndim > 2:
+        U = U_flat.view(orig_shape)
+    else:
+        U = U_flat
+    #U = utils.zca_newton_schulz(U,1e-10,2,2)worse.
+    # magnitude correction only for matrices or higher
+    if grad.ndim >= 2:
+        scale = max(1.0, grad.size(-2) / grad.size(-1)) ** 0.5
+    else:
+        scale = 1.0
+    return U * scale
+
+def orthograd_tangent(W: torch.Tensor, G: torch.Tensor):
+    """
+    Gram–Schmidt projection of G into the tangent at W on the sphere/Stiefel manifold.
+    Works for vectors (ndim==1) or matrices (ndim==2).
+    """
+    w = W.view(-1)
+    g = G.view(-1)
+    w_dot_w = w.dot(w) + 1e-30
+    proj    = w.dot(g) / w_dot_w
+    p_flat  = g - proj * w
+    return p_flat.view_as(G)
+
+class Phi2Optimizer(Optimizer):
+    """
+    Full Phi2 optimizer:
+      • AdamW preconditioning
+      • Midpoint two-step lookahead
+      • OrthoGrad projection on every grad
+      • Muon momentum + quintic NS
+    """
+
+    def __init__(self,
+                 params: Iterable[torch.nn.Parameter],
+                 lr: float = 3e-4,
+                 betas=(0.9, 0.999),
+                 eps: float = 1e-8,
+                 weight_decay: float = 0.01,
+                 two_step_alpha: float = 0.5,
+                 muon_beta: float = 0.95,
+                 muon_nesterov: bool = True,
+                 ns_steps: int = 5,
+                 fused: bool = False):
+        defaults = dict(lr=lr, betas=betas, eps=eps,
+                        weight_decay=weight_decay,
+                        two_step_alpha=two_step_alpha,
+                        muon_beta=muon_beta,
+                        muon_nesterov=muon_nesterov,
+                        ns_steps=ns_steps)
+        super().__init__(params, defaults)
+
+        # initialize all state entries to avoid KeyErrors
+        for group in self.param_groups:
+            for p in group['params']:
+                st = self.state[p]
+                st['step']       = 0
+                st['exp_avg']    = torch.zeros_like(p)
+                st['exp_avg_sq'] = torch.zeros_like(p)
+                st['muon_buf']   = torch.zeros_like(p)
+                st['P0']         = torch.zeros_like(p)
+                st['P']          = torch.zeros_like(p)
+
+    @torch.no_grad()
+    def step(self, closure):
+        """
+        1) closure @ W_t  → AdamW + OrthoGrad → st['P0']
+        2) W_half = W_t - lr*P0
+        3) closure @ W_half → OrthoGrad → combine → st['P']
+        4) U = muon_update(P, muon_buf)
+        5) W_{t+1} = W_t - lr*U
+        """
+        assert closure is not None, "Phi2Optimizer requires closure()"
+
+        # ——— 1) first forward/backward at W_t ———
+        with torch.enable_grad():
+            loss = closure()
+
+        # AdamW + OrthoGrad → P0
+        for group in self.param_groups:
+            β1, β2 = group['betas']
+            wd      = group['weight_decay']
+            lr      = group['lr']
+            eps     = group['eps']
+
+            for p in group['params']:
+                g = p.grad
+                if g is None:
+                    continue
+                st = self.state[p]
+                st['step'] += 1
+                t = st['step']
+
+                # decoupled weight decay
+                if wd:
+                    p.mul_(1 - lr * wd)
+
+                # Adam moments
+                st['exp_avg'].mul_(β1).add_(g, alpha=1-β1)
+                st['exp_avg_sq'].mul_(β2).addcmul_(g, g, value=1-β2)
+
+                # bias-corrected direction
+                bc1 = 1 - β1**t
+                bc2 = 1 - β2**t
+                denom = (st['exp_avg_sq'].sqrt() / math.sqrt(bc2)).add_(eps)
+                base_step = (st['exp_avg'] / bc1).div_(denom)
+
+                # project
+                P0 = orthograd_tangent(p, base_step)
+                st['P0'].copy_(P0)
+
+        # ——— 2) half-step to W_half ———
+        W_t = {}
+        for group in self.param_groups:
+            lr = group['lr']
+            for p in group['params']:
+                W_t[p] = p.data.clone()
+                p.data.copy_(W_t[p] - lr * self.state[p]['P0'])
+
+        # ——— 3) second forward/backward at W_half ———
+        self.zero_grad()
+        with torch.enable_grad():
+            loss = closure()
+
+        # combine P = (1-α)*P0 + α*P1
+        for group in self.param_groups:
+            α = group['two_step_alpha']
+            for p in group['params']:
+                st = self.state[p]
+                P  = st['P0'].clone()
+                g1 = p.grad
+                if g1 is not None:
+                    P1 = orthograd_tangent(p, g1)
+                    P  = (1-α)*st['P0'] + α*P1
+                st['P'].copy_(P)
+
+        # ——— 4) Muon + final update ———
+        for group in self.param_groups:
+            lr    = group['lr']
+            wd    = group['weight_decay']
+            mb    = group['muon_beta']
+            nest  = group['muon_nesterov']
+            ns    = group['ns_steps']
+
+            for p in group['params']:
+                st = self.state[p]
+                U  = muon_update(st['P'], st['muon_buf'], mb, ns, nest)
+
+                # final weight decay
+                if wd:
+                    p.mul_(1 - lr * wd)
+
+                # apply step
+                p.data.copy_(p.data - lr * U)
+
+        return loss
+
 #garbage heap file:
 class PatchEmbedder(nn.Module):
     def __init__(self, config):

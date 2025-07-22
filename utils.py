@@ -19,11 +19,17 @@ def unfunnyMulti(x, y):
     return torch.sign(x) * torch.abs((x ** 2) / (y + 1e-10))
 
 @torch.compile(backend='inductor', mode='max-autotune')
-def mmnorm(x, dim = -1, scale = None):  
-    if(scale is None):
-        scale = 1 + 2 / x.nelement() #changed recently
+def mmnorm(x: torch.tensor, dim = -1, scale = None):  
+    if scale is None: #batchsize independent
+        if not dim: 
+            numel_in_dim = x.nelement()
+        else:
+            numel_in_dim = math.prod([x.shape[d] for d in dim])
+        scale = 1 + 2 / numel_in_dim 
     w_avg = x.mean(dim=dim, keepdim=True)
-    w_range = torch.abs(x.max(dim=dim, keepdim=True)[0] - x.min(dim=dim, keepdim=True)[0] + 1e-10)
+    w_max = x.amax(dim=dim, keepdim=True)
+    w_min = x.amin(dim=dim, keepdim=True)
+    w_range = torch.abs(w_max - w_min + 1e-10)
     return ((x - w_avg) / w_range) * scale
 
 def fast_sin_leakyrelu(x):
@@ -184,16 +190,10 @@ def pscan(x_in: torch.Tensor, func: nn.Module, ident: torch.Tensor) -> torch.Ten
         left_operands = torch.index_select(a, 1, indices - stride)
         right_operands = torch.index_select(a, 1, indices)
         
-        # Use index_put (functional) instead of in-place assignment
-        # This creates a new 'a' tensor, which torch.compile can handle.
-        # We need to provide indices for the batch dimension too.
         batch_indices = torch.arange(B, device=device).unsqueeze(1)
-        # The indices tuple tells index_put which elements to update: (batch_idx, sequence_idx)
         a = torch.index_put(a, (batch_indices, indices), func(left_operands, right_operands))
 
     # --- 3. Down-Sweep (Scan Phase) ---
-    # **CRITICAL CHANGE**: Replace slice assignment with torch.cat
-    # This is much friendlier to the compiler.
     a = torch.cat([a[:, :-1, :], ident.expand(B, 1, C)], dim=1)
 
     for d in range(num_levels - 1, -1, -1):
@@ -205,10 +205,7 @@ def pscan(x_in: torch.Tensor, func: nn.Module, ident: torch.Tensor) -> torch.Ten
         left_val = torch.index_select(a, 1, indices - stride)
         right_val = torch.index_select(a, 1, indices)
 
-        # **CRITICAL CHANGE**: Perform the swap and update using two index_put calls
-        # 1. Put the right_val into the left_pos
         a = torch.index_put(a, (batch_indices, indices - stride), right_val)
-        # 2. Put the result of func(right_val, left_val) into the right_pos
         a = torch.index_put(a, (batch_indices, indices), func(right_val, left_val))
 
     inclusive_scan_padded = func(a, x)
@@ -557,6 +554,110 @@ def calculate_linear_chaos_loss(logits: torch.tensor, balance_lambda= 0.1 , targ
     
     return l_balance * balance_lambda, linear_chaosness.mean()
 
+ALPHA = 3.5
+BETA = 5.75
+
+def dissonance_curve(ratio):
+    x = torch.abs(ratio - 1.0)
+    diss = torch.exp(-ALPHA * x) - torch.exp(-BETA * x)
+    return F.relu(diss)
+def pairwise_dissonance_from_partials(frequencies, amplitudes):
+    """A helper to compute dissonance given a refined list of partials."""
+    num_partials = frequencies.shape[-1]
+    if num_partials < 2:
+        return torch.tensor(0.0, device=frequencies.device)
+
+    freq1 = frequencies.unsqueeze(-1)
+    amp1 = amplitudes.unsqueeze(-1)
+    freq2 = frequencies.unsqueeze(-2)
+    amp2 = amplitudes.unsqueeze(-2)
+
+    ratios = freq2 / (freq1 + 1e-8)
+    amp_factor = torch.min(amp1, amp2)
+    pairwise_dissonance = amp_factor * dissonance_curve(ratios)
+    
+    # Mask out self-comparisons. Padding is added to amplitudes of empty spectra,
+    # which can result in NaNs if we don't handle the diagonal.
+    mask = ~torch.eye(num_partials, num_partials, dtype=torch.bool, device=frequencies.device)
+    pairwise_dissonance = pairwise_dissonance * mask
+
+    total_dissonance = torch.nansum(pairwise_dissonance, dim=[-2, -1]) / 2.0
+    return total_dissonance
+
+
+def qisp_latent_dissonance_loss(embeddings, max_partials=16, peak_threshold=-25.0):
+    """
+    Calculates latent dissonance using Quadratic Interpolation of Spectral Peaks (QISP)
+    to get high-precision estimates of latent frequencies and amplitudes.
+    """
+    embeddings = embeddings.float()
+    batch_size, num_tokens, _ = embeddings.shape
+    
+    # --- 1. Get Latent Spectrum & Log Amplitudes ---
+    latent_amplitudes = torch.abs(torch.fft.rfft(embeddings, dim=-1))
+    flat_amps = latent_amplitudes.view(batch_size * num_tokens, -1)
+    
+    # Use log amplitudes for QISP and thresholding
+    log_amps = torch.log(flat_amps + 1e-12)
+
+    # --- 2. Find Peaks Vectorially ---
+    # A bin is a peak if it's greater than its left and right neighbors.
+    is_peak = (log_amps[:, 1:-1] > log_amps[:, :-2]) & (log_amps[:, 1:-1] > log_amps[:, 2:])
+    # Pad to restore original dimension
+    is_peak = F.pad(is_peak, (1, 1), 'constant', False)
+
+    # Apply threshold: a peak must also be strong enough relative to the max
+    max_log_amp = torch.max(log_amps, dim=1, keepdim=True)[0]
+    is_peak &= (log_amps > max_log_amp + peak_threshold)
+    is_peak[:, 0] = is_peak[:, -1] = False # Ignore peaks at the very edges
+
+    # --- 3. Select Top 'max_partials' Peaks per Spectrum ---
+    # To handle a variable number of peaks per spectrum, we focus on the strongest ones up to a limit.
+    # We multiply amps by the boolean mask so non-peaks are zero and won't be selected.
+    peak_amps = flat_amps * is_peak
+    
+    # topk gives us the amplitudes and indices of the strongest peaks
+    # Shape: [B*T, max_partials]
+    top_peak_amps, top_peak_indices = torch.topk(peak_amps, k=max_partials, dim=-1)
+    
+    # A mask to ignore padded zeros from spectra with < max_partials peaks
+    # Shape: [B*T, max_partials]
+    valid_peak_mask = top_peak_amps > 1e-9
+
+    # --- 4. Gather Neighbor Amplitudes for QISP ---
+    # We now have the indices of the peaks we care about. Gather their neighbors.
+    # `torch.gather` is the key to doing this without loops.
+    alpha_indices = torch.clamp(top_peak_indices - 1, 0)
+    beta_indices = top_peak_indices
+    gamma_indices = torch.clamp(top_peak_indices + 1, max=log_amps.shape[1]-1)
+
+    alpha = torch.gather(log_amps, 1, alpha_indices) # log_amp at k-1
+    beta = torch.gather(log_amps, 1, beta_indices)   # log_amp at k
+    gamma = torch.gather(log_amps, 1, gamma_indices) # log_amp at k+1
+
+    # --- 5. Apply Quinn's Second Estimator Formulas ---
+    # Denominator for both formulas
+    denom = (alpha - 2 * beta + gamma)
+    
+    # Frequency correction term (delta)
+    # Avoid division by zero for flat peaks
+    delta = 0.5 * (alpha - gamma) / (denom + 1e-9)
+    
+    # Refined Frequency: original bin index + correction. Add 1 to map bin index to freq.
+    refined_freqs = (top_peak_indices.float() + delta + 1.0) * valid_peak_mask
+
+    # Refined Amplitude (in log scale)
+    refined_log_amps = beta - 0.25 * (alpha - gamma) * delta
+    refined_amps = torch.exp(refined_log_amps) * valid_peak_mask
+    
+    # --- 6. Calculate Dissonance on Refined Partials ---
+    dissonance_per_spectrum = pairwise_dissonance_from_partials(refined_freqs, refined_amps)
+    
+    # Final loss is the mean over all tokens in the batch
+    loss = dissonance_per_spectrum.mean()
+    
+    return loss
+
 @torch.compile(backend='inductor', mode='max-autotune')
 def fft_trunc_tsquish(x):
     b,t,c = x.size()
@@ -592,7 +693,7 @@ def rfft_trunc_squish(x, target_dim=None, dim=-1, band = "low"):
     
     ff_x_trunc = ff_x[tuple(slicer)]
 
-    o = torch.fft.irfft(ff_x_trunc, dim=dim).real
+    o = torch.fft.irfft(ff_x_trunc,target_dim, dim=dim).real
 
     return o
 
