@@ -490,7 +490,7 @@ class GPT(nn.Module):
         else:
             pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
             tok_emb = self.transformer.wte(idx)
-            tok_emb += torch.randn_like(tok_emb,requires_grad=True)*1e-7
+            tok_emb += torch.randn_like(tok_emb,requires_grad=True)*1e-5
             pos_emb = self.transformer.wpe(pos) # position embeddings of shape (b, t, n_embd)
             if qope:
                 pos_emb = utils.maprotgate(pos_emb.view(b, t, self.config.n_embd//4, 4))
@@ -548,7 +548,7 @@ class GPT(nn.Module):
                 loss = self.convemb.loss(logits, patchtargets, pploss)
 
             if blockin and midchaos and self.training:
-                loss = loss + torch.nn.functional.mse_loss(block_inputs[2], torch.randn_like(block_inputs[1]))*1e-7
+                loss = loss + torch.nn.functional.mse_loss(block_inputs[2], torch.randn_like(block_inputs[1]))*1e-4
 
             if symloss and self.training:
                 for i in block_inputs:

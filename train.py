@@ -373,7 +373,7 @@ def estimate_loss():
     optimizer.zero_grad(set_to_none=True)
     return out
 
-lr_sin = True
+lr_sin = False
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
