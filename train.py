@@ -234,7 +234,7 @@ model.to(device)
 #switches
 best                = False
 
-gradorth            = False
+gradorth            = True
 mnorm_enabled       = False
 #wack
 dfw_enabled         = False
@@ -274,6 +274,18 @@ decaying = 1.0
 eigenInit = False
 
 lrfinder = False
+
+@torch.compile(backend='inductor', mode='max-autotune')
+def orthogonalize_gradients(grad, params):
+    w = params.view(-1)
+    g = grad.view(-1)
+    w_norm_sq = torch.dot(w, w) + 1e-30
+    proj = torch.dot(w, g) / w_norm_sq
+    g_orth = g - proj * w
+    g_norm = g.norm(2)
+    g_orth_norm = g_orth.norm(2) + 1e-30
+    g_orth_scaled = g_orth * (g_norm / g_orth_norm)
+    return g_orth_scaled.view_as(grad)
 
 
 @torch.compile(backend='inductor', mode='max-autotune')
@@ -421,7 +433,7 @@ def custom_gradient_adjustment(grad, param, weight_ema = None, gema = 0.0):
     if(gzca_enabled and d2):
         adjusted_grad = utils.zca_newton_schulz(adjusted_grad, zcastep, szcapow)
     if(gradorth and d2):
-        adjusted_grad = utils.GradOrth(param, adjusted_grad)
+        adjusted_grad = orthogonalize_gradients(adjusted_grad,param)
     if(ndiff_enabled):
         w_range = torch.abs(p.max() - p.min() + 1e-10)
         w_avg = param.nanmean()

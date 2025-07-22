@@ -52,7 +52,11 @@ repeatCenter    = False
 Qrotention      = False
 symloss         = False
 
-
+def qnorm(x):
+    b,t,c =x.size()
+    x = x.view(b, t, c//4, 4)
+    x = x /  torch.norm(x, p=2, dim=-1, keepdim=True)
+    return x.view(b, t, -1)
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -250,13 +254,61 @@ class MemAttention(nn.Module):
         k = k.view(B, T+self.mem_len, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T+self.mem_len, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
 
+        y.to(torch.int64)
         y = torch.nn.functional.scaled_dot_product_attention(q*(math.log(T)*self.qm), k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal= causal)
         y = y.transpose(1, 2).contiguous().view(B, T+self.mem_len, self.n_head * self.head_dim) 
         y = self.resid_dropout(self.c_proj(y))
 
         return y[:,self.mem_len:,:]
 
+class OrthoGrad(torch.optim.Optimizer):
+    def __init__(self, params, base_optimizer_cls=torch.optim.SGD, **base_optimizer_args):
+        """
+        A wrapper optimizer that projects gradients to be orthogonal
+        to the current parameters before performing an update.
 
+        Args:
+            params (iterable): Iterable of parameters to optimize.
+            base_optimizer_cls (Optimizer class): The base optimizer class
+                (e.g., torch.optim.SGD, torch.optim.AdamW).
+            **base_optimizer_args: Arguments for the base optimizer.
+                For example, lr=1e-3, weight_decay=1e-2, etc.
+        """
+        # Minimal defaults for OrthoGrad itself (nothing special needed).
+        defaults = {}
+        super().__init__(params, defaults)
+
+        # Create the wrapped/base optimizer using *our* param_groups.
+        self.base_optimizer = base_optimizer_cls(self.param_groups, **base_optimizer_args)
+
+    @staticmethod
+    def _orthogonalize_gradients(params):
+        """
+        Projects the gradient g to be orthogonal to the current weights w.
+
+        g_orth = g - ( (w·g)/(w·w + eps) ) * w
+
+        And then re-scales g_orth to have the same norm as g.
+        """
+        with torch.no_grad():
+            for p in params:
+                if p.grad is not None:
+                    w = p.view(-1)
+                    g = p.grad.view(-1)
+
+                    w_norm_sq = torch.dot(w, w) + 1e-30
+                    proj = torch.dot(w, g) / w_norm_sq
+                    g_orth = g - proj * w
+
+                    g_norm = g.norm(2)
+                    g_orth_norm = g_orth.norm(2) + 1e-30
+                    g_orth_scaled = g_orth * (g_norm / g_orth_norm)
+
+                    p.grad.copy_(g_orth_scaled.view_as(p.grad))
+
+    def step(self, closure=None):
+        for group in self.param_groups:
+            self._orthogonalize_gradients(group['params'])
 
 class LearnableSpiral4D(nn.Module):
     def __init__(self, init_freq=1.0, init_amp=1.0):
@@ -483,9 +535,13 @@ class GPT(nn.Module):
         else:
             pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
             tok_emb = self.transformer.wte(idx)
+            tok_emb += torch.randn_like(tok_emb,requires_grad=True)*0.001
             pos_emb = self.transformer.wpe(pos) # position embeddings of shape (b, t, n_embd)
             if qope:
-                x = self.qoper(tok_emb,pos_emb.expand(b,t,self.config.n_embd),False,False)
+                pos_emb = utils.maprotgate(pos_emb.view(b, t, self.config.n_embd//4, 4))
+                x = utils.quaternion_multiply(tok_emb.view(b, t, self.config.n_embd//4, 4),pos_emb) 
+                x = x.view(b,t,self.config.n_embd)
+                #x = self.qoper(tok_emb,pos_emb.expand(b,t,self.config.n_embd),False,False)
             else:
                 x = tok_emb + pos_emb
         x = self.transformer.drop(x)
@@ -503,11 +559,12 @@ class GPT(nn.Module):
             fh = utils.fft_trunc_csquish(x)
         if spl or symloss:
             block_inputs = []
+
         if(Qrotention):
             x = x.view(b, t, self.config.n_embd//4, 4)
             x = x /  torch.norm(x, p=2, dim=-1, keepdim=True)
-        #ogx = x
-        x = x.view(b, t, -1)
+            x = x.view(b, t, -1)
+
         for i, block in enumerate(self.transformer.h):
             if spl or symloss:
                 block_inputs.append(x) 
@@ -535,6 +592,7 @@ class GPT(nn.Module):
             if(convemb):
                 loss = self.convemb.loss(logits, patchtargets, pploss)
             
+            loss = loss + torch.nn.functional.mse_loss(block_inputs[2], torch.randn_like(block_inputs[1]))*0.001
 
             if symloss and self.training:
                 for i in block_inputs:
@@ -748,11 +806,11 @@ class GPT(nn.Module):
     def mem_form(self, x, memory):
         #currently assumes mem size and block size are the same
         b, t, e = x.size()
-        squishmem      = utils.fft_trunc_tsquish(memory).expand(b, self.config.mem_block_size//2, self.config.n_embd) #(b, m//2,c)
-        selectedMemory = self.memory_selector(x, causal = False)[:,:self.config.mem_block_size,:] #(b, m, c)
-        selectedMemory = utils.fft_trunc_tsquish(selectedMemory) #(b, m//2,c)
-        mh1 = torch.cat([selectedMemory,squishmem],dim =1)       #(b, m,c)
-        mh1 = self.dreamer(mh1)
+        squishmem       = utils.fft_trunc_tsquish(memory).expand(b, self.config.mem_block_size//2, self.config.n_embd) #(b, m//2,c)
+        selectedMemory  = self.memory_selector(x, causal = False)[:,:self.config.mem_block_size,:] #(b, m, c)
+        selectedMemory  = utils.fft_trunc_tsquish(selectedMemory) #(b, m//2,c)
+        mh1             = torch.cat([selectedMemory,squishmem],dim =1)       #(b, m,c)
+        mh1             = self.dreamer(mh1)
 
         return mh1#[:, :self.config.mem_block_size, :]
 
