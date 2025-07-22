@@ -453,7 +453,7 @@ class Patcher(nn.Module):
         
         patch_indices= patch_indices.narrow(-1,0,self.patch_max).contiguous()#trim the end, hacky, but eh.
 
-
+        
         pos_emb = pos_emb.flatten(start_dim=0,end_dim=-1).unsqueeze(0).unsqueeze(0).contiguous()
         toemb = pos_emb + torch.flatten(patch_embeds, start_dim=2, end_dim=-1)
         patch_embeds = self.embedder(toemb)

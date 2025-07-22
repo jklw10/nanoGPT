@@ -51,6 +51,9 @@ repeatCenter    = False
 
 Qrotention      = False
 symloss         = False
+midchaos        = True
+
+blockin         = spl or symloss or midchaos
 
 def qnorm(x):
     b,t,c =x.size()
@@ -261,54 +264,6 @@ class MemAttention(nn.Module):
 
         return y[:,self.mem_len:,:]
 
-class OrthoGrad(torch.optim.Optimizer):
-    def __init__(self, params, base_optimizer_cls=torch.optim.SGD, **base_optimizer_args):
-        """
-        A wrapper optimizer that projects gradients to be orthogonal
-        to the current parameters before performing an update.
-
-        Args:
-            params (iterable): Iterable of parameters to optimize.
-            base_optimizer_cls (Optimizer class): The base optimizer class
-                (e.g., torch.optim.SGD, torch.optim.AdamW).
-            **base_optimizer_args: Arguments for the base optimizer.
-                For example, lr=1e-3, weight_decay=1e-2, etc.
-        """
-        # Minimal defaults for OrthoGrad itself (nothing special needed).
-        defaults = {}
-        super().__init__(params, defaults)
-
-        # Create the wrapped/base optimizer using *our* param_groups.
-        self.base_optimizer = base_optimizer_cls(self.param_groups, **base_optimizer_args)
-
-    @staticmethod
-    def _orthogonalize_gradients(params):
-        """
-        Projects the gradient g to be orthogonal to the current weights w.
-
-        g_orth = g - ( (w·g)/(w·w + eps) ) * w
-
-        And then re-scales g_orth to have the same norm as g.
-        """
-        with torch.no_grad():
-            for p in params:
-                if p.grad is not None:
-                    w = p.view(-1)
-                    g = p.grad.view(-1)
-
-                    w_norm_sq = torch.dot(w, w) + 1e-30
-                    proj = torch.dot(w, g) / w_norm_sq
-                    g_orth = g - proj * w
-
-                    g_norm = g.norm(2)
-                    g_orth_norm = g_orth.norm(2) + 1e-30
-                    g_orth_scaled = g_orth * (g_norm / g_orth_norm)
-
-                    p.grad.copy_(g_orth_scaled.view_as(p.grad))
-
-    def step(self, closure=None):
-        for group in self.param_groups:
-            self._orthogonalize_gradients(group['params'])
 
 class LearnableSpiral4D(nn.Module):
     def __init__(self, init_freq=1.0, init_amp=1.0):
@@ -535,7 +490,7 @@ class GPT(nn.Module):
         else:
             pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
             tok_emb = self.transformer.wte(idx)
-            tok_emb += torch.randn_like(tok_emb,requires_grad=True)*0.001
+            tok_emb += torch.randn_like(tok_emb,requires_grad=True)*1e-6
             pos_emb = self.transformer.wpe(pos) # position embeddings of shape (b, t, n_embd)
             if qope:
                 pos_emb = utils.maprotgate(pos_emb.view(b, t, self.config.n_embd//4, 4))
@@ -557,7 +512,7 @@ class GPT(nn.Module):
 
         if mix_squish:
             fh = utils.fft_trunc_csquish(x)
-        if spl or symloss:
+        if blockin:
             block_inputs = []
 
         if(Qrotention):
@@ -566,7 +521,7 @@ class GPT(nn.Module):
             x = x.view(b, t, -1)
 
         for i, block in enumerate(self.transformer.h):
-            if spl or symloss:
+            if blockin:
                 block_inputs.append(x) 
             x = block(x) 
 
@@ -591,8 +546,9 @@ class GPT(nn.Module):
             #TODO: wavelet loss
             if(convemb):
                 loss = self.convemb.loss(logits, patchtargets, pploss)
-            
-            loss = loss + torch.nn.functional.mse_loss(block_inputs[2], torch.randn_like(block_inputs[1]))*0.001
+
+            if blockin and midchaos and self.training:
+                loss = loss + torch.nn.functional.mse_loss(block_inputs[2], torch.randn_like(block_inputs[1]))*1e-5
 
             if symloss and self.training:
                 for i in block_inputs:
