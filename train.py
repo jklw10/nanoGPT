@@ -34,6 +34,7 @@ from model import GPTConfig, GPT
 import optim
 import utils
 
+from torch.utils.data import Dataset, DataLoader
 
 torch._dynamo.optimize()
 #torch._inductor.config.force_disable_caches = True
@@ -95,6 +96,7 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
 
+
 #torch._dynamo.reset() in case of cache corruption throw it off a bridge.
 
 # various inits, derived attributes, I/O setup
@@ -130,7 +132,6 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-# poor man's data loader
 data_dir = os.path.join('data', dataset)
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
@@ -234,7 +235,7 @@ model.to(device)
 #switches
 best                = False
 
-gradorth            = True
+gradorth            = False
 mnorm_enabled       = False
 #wack
 dfw_enabled         = False
@@ -246,6 +247,8 @@ grokfast            = False
 sign_enabled        = False
 
 #??
+acl1                = False
+
 wwhite_enabled      = False
 gsphere             = False
 ndiff_enabled       = False
@@ -274,7 +277,6 @@ decaying = 1.0
 eigenInit = False
 
 lrfinder = False
-
 @torch.compile(backend='inductor', mode='max-autotune')
 def orthogonalize_gradients(grad, params):
     w = params.view(-1)
@@ -299,31 +301,178 @@ def muon_update(grad: torch.tensor, momentum, beta=0.95, ns_steps=5, nesterov=Tr
     update = utils.zca_newton_schulz(update, 1e-10, 2, 2)
     #update *= max(1, grad.size(-2) / grad.size(-1))**0.5
     return update
-
+if(acl1):
+        saved_activations = {}
+        def save_hook(module, input, output):
+            saved_activations[module] = input[0]
 if(ghook):
-    
-    if(gdiff_enabled or dfw_enabled or muon):
-        weight_emas = [p.clone().detach() for p in model.parameters()]
-        #weight_emas = [torch.zeros_like(p) for p in model.parameters()]
-    else:
-        weight_emas =None
-    if (grokfast):
-        gema = [torch.zeros_like(p) for p in model.parameters()]
 
+    wemas = None
+    gema = 0
+    if(gdiff_enabled or dfw_enabled or muon):
+        if init_from!='resume':
+            wemas = [p.clone().detach()for p in model.parameters()]
+
+    if (grokfast):
+        gemas = [torch.zeros_like(p) for p in model.parameters()]
+    
     for i, p in enumerate(model.parameters()):
         if p.requires_grad:
-            if init_from!='resume' and weight_emas is not None:
-                weight_emas[i] = torch.randn_like(p) * p.size(0)
-            
-            if (grokfast):
-                p.register_hook(lambda grad, p=p, gema=gema[i]: custom_gradient_adjustment(grad, p, gema, decaying))
-            if(gdiff_enabled or dfw_enabled or muon ):
-                p.register_hook(lambda grad, p=p, weight_ema=weight_emas[i]: custom_gradient_adjustment(grad, p, weight_ema))
+            wema = None if wemas is None else wemas[i]
+            gema = None if gemas is None else gemas[i]
+            if(acl1):
+                p.register_forward_hook(save_hook)
+            p.register_hook(lambda grad, p=p, gema=gema, wema=wema: custom_gradient_adjustment(grad, p, gema=gema, wema=wema))
+
+
+
+def fft_squish(grad,center=0.5,sigma=0.5):
+    gk = utils.gaussian_kernel(grad, center, sigma)
+    if(grad.ndim>=2):
+        adjusted_grad = torch.fft.fft2(grad) 
+        return torch.fft.ifft2(gk*adjusted_grad).real
+    else:
+        adjusted_grad = torch.fft.fft(grad) 
+        return torch.fft.ifft(gk*adjusted_grad).real
+    
+
+#@torch.compile(backend='cudagraphs')
+def custom_gradient_adjustment(grad, param, wema = None, gema = 0.0):
+    if(grad is None):
+        return
+    input_size = grad.size(0)
+    adjusted_grad = torch.where(torch.isnan(grad), torch.zeros_like(grad), grad)
+    
+    if(gchaos):
+        adjusted_grad += torch.rand_like(adjusted_grad)*1e-3
+    if(gnorm): 
+        
+        grad_avg = adjusted_grad.nanmean()
+        grad_range = adjusted_grad.max() - adjusted_grad.min() + 1e-10
+        adjusted_grad = ((adjusted_grad - grad_avg) / grad_range)  * (2 - 2 / input_size) 
+    if(gchaos):
+        adjusted_grad += torch.rand_like(adjusted_grad)*1e-3
+    d2 = not (adjusted_grad.ndim < 2)
+    if(gsphere and d2): 
+        adjusted_grad = adjusted_grad / adjusted_grad.norm() # * (2 - 2 / input_size) 
+    if(gfft):
+        adjusted_grad = utils.rfft_trunc_squish(adjusted_grad)
+    if(sign_enabled):
+        adjusted_grad = torch.sign(torch.round(adjusted_grad)) 
+    if(gzca_enabled and d2):
+        adjusted_grad = utils.zca_newton_schulz(adjusted_grad, zcastep, szcapow)
+    if(gradorth and d2):
+        adjusted_grad = orthogonalize_gradients(adjusted_grad,param)
+    if(ndiff_enabled):
+        w_range = torch.abs(p.max() - p.min() + 1e-10)
+        w_avg = param.nanmean()
+        norm = ((param - w_avg) / w_range) * (1 + 2 / input_size) 
+        normgrad = norm - param
+        adjusted_grad *= torch.abs(adjusted_grad - normgrad)
+
+    if muon and d2:
+        adjusted_grad = muon_update(adjusted_grad, wema)
+        #weight_ema += 0.01 * (adjusted_grad - weight_ema)
+    if acl1:
+        adjusted_grad *= torch.norm(p.data*saved_activations[p], p=1.618033988749)
+    
+    if(gdiff_enabled or dfw_enabled):
+        wema += 0.01 * (adjusted_grad - wema)
+
+    #if(gdiff_enabled ):
+    #    awdiff = weight_ema - adjusted_grad 
+    #    gn = adjusted_grad.flatten().norm()
+    #    eman = weight_ema.flatten().norm()
+    #    awdot = torch.dot(weight_ema.flatten()/eman, adjusted_grad.flatten()/gn)
+    #    #npar = torch.abs(param)
+    #    npar = torch.abs(eman-gn)# 1.0-awdot + # torch.square(torch.abs(awdiff)) 
+    #    gdiff = 1.0 / torch.abs(npar) 
+    #    adjusted_grad *= gdiff 
+
+    if(gdiff_enabled and d2):
+        awdiff = wema - param 
+
+        npar = torch.abs(wema)
+        npar += torch.abs(adjusted_grad - awdiff) 
+        gdiff = 1.0 / torch.abs(npar)
+        adjusted_grad *= gdiff 
+    
+    if(grokfast):
+        gema += 0.9999 * (adjusted_grad - gema)
+        adjusted_grad += gema * 2
+        adjusted_grad /= 3
+    if(ggauss):
+        gema += 0.1
+
+        gk = utils.gaussian_kernel(adjusted_grad,math.sin(gema),3)
+        adjusted_grad = gk * adjusted_grad
+    #if(gfast):
+    #    surprise += 0.98 * (adjusted_grad - surprise)
+    #    adjusted_grad = funnyMulti(adjusted_grad,surprise)
+    return adjusted_grad 
+
+
+def wfunny(model):
+        for i, p in enumerate(model.parameters()):
+            if p.requires_grad:
+                #if p.dim() > 0:
+                p.data  = funnyMulti(wemas[i],p.data)
+
+def wunfunny(model):
+        for i, p in enumerate(model.parameters()):
+            if p.requires_grad:
+                #if p.dim() > 0:
+                p.data  = unfunnyMulti(p.data, wemas[i])
+
+
+def funnyMulti(x, y):
+    return torch.sign(x) * torch.sqrt(torch.abs(x * y))
+
+def unfunnyMulti(x, y):
+    return torch.sign(x) * torch.abs((x ** 2) / y)
+
+@torch.compile(backend='inductor', mode='max-autotune')
+def wnorm(model):
+    for p in model.parameters():
+        if p.requires_grad:
+            if p.ndim >= 2:
+                a = 1.0
             else:
-                g = 0
-                p.register_hook(lambda grad, p=p, gema=g: custom_gradient_adjustment(grad, p, gema=gema))
+                continue
+                a = 1e-5
+            with torch.no_grad():
+                pstep = snormstep(p, a) 
+                p.data.sub_(pstep)
+
+def snormstep(p, alpha):
+    return (p.data - utils.mmnorm(p.data,dim=[-1,-2])) * alpha 
+
+@torch.compile(backend='inductor', mode='max-autotune')
+def softwnorm(model, alpha = swna):
+    for i, p in enumerate(model.parameters()):
+        if p.requires_grad:
+            with torch.no_grad():
+                if p.ndim >= 2:
+                    a = alpha
+                else:
+                    continue
+                    a = 0 #alpha / 20
+
+                pstep = snormstep(p, a) 
+                p.data.sub_(pstep)
 
 
+def wwhite(model):
+    for p in model.parameters():
+        if p.requires_grad:
+            with torch.no_grad():
+                p.data.sub_(p.data-utils.zca_newton_schulz(p.data), alpha = 1e-5)
+
+def justnorm(x, idim=-1):
+    dtype = x.dtype
+    x = x.float()
+    res = (x / x.norm(p=2, dim=idim, keepdim=True)).to(dtype=dtype) 
+    return res
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 #scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
@@ -399,159 +548,12 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+#X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 
-def fft_squish(grad,center=0.5,sigma=0.5):
-    gk = utils.gaussian_kernel(grad, center, sigma)
-    if(grad.ndim>=2):
-        adjusted_grad = torch.fft.fft2(grad) 
-        return torch.fft.ifft2(gk*adjusted_grad).real
-    else:
-        adjusted_grad = torch.fft.fft(grad) 
-        return torch.fft.ifft(gk*adjusted_grad).real
-    
-
-#@torch.compile(backend='cudagraphs')
-def custom_gradient_adjustment(grad, param, weight_ema = None, gema = 0.0):
-    if(grad is None):
-        return
-    input_size = grad.size(0)
-    adjusted_grad = torch.where(torch.isnan(grad), torch.zeros_like(grad), grad)
-    if(gchaos):
-        adjusted_grad += torch.rand_like(adjusted_grad)*1e-5
-    
-    if(gnorm): 
-        
-        grad_avg = adjusted_grad.nanmean()
-        grad_range = adjusted_grad.max() - adjusted_grad.min() + 1e-10
-        adjusted_grad = ((adjusted_grad - grad_avg) / grad_range)  * (2 - 2 / input_size) 
-    d2 = not (adjusted_grad.ndim < 2)
-    if(gsphere and d2): 
-        adjusted_grad = adjusted_grad / adjusted_grad.norm() # * (2 - 2 / input_size) 
-    if(gfft):
-        adjusted_grad = utils.rfft_trunc_squish(adjusted_grad)
-    if(sign_enabled):
-        adjusted_grad = torch.sign(torch.round(adjusted_grad)) 
-    if(gzca_enabled and d2):
-        adjusted_grad = utils.zca_newton_schulz(adjusted_grad, zcastep, szcapow)
-    if(gradorth and d2):
-        adjusted_grad = orthogonalize_gradients(adjusted_grad,param)
-    if(ndiff_enabled):
-        w_range = torch.abs(p.max() - p.min() + 1e-10)
-        w_avg = param.nanmean()
-        norm = ((param - w_avg) / w_range) * (1 + 2 / input_size) 
-        normgrad = norm - param
-        adjusted_grad *= torch.abs(adjusted_grad - normgrad)
-
-    if muon and d2:
-        adjusted_grad = muon_update(adjusted_grad, weight_ema)
-        #weight_ema += 0.01 * (adjusted_grad - weight_ema)
-    
-
-    if(gdiff_enabled or dfw_enabled):
-        weight_ema += 0.01 * (adjusted_grad - weight_ema)
-
-    #if(gdiff_enabled ):
-    #    awdiff = weight_ema - adjusted_grad 
-    #    gn = adjusted_grad.flatten().norm()
-    #    eman = weight_ema.flatten().norm()
-    #    awdot = torch.dot(weight_ema.flatten()/eman, adjusted_grad.flatten()/gn)
-    #    #npar = torch.abs(param)
-    #    npar = torch.abs(eman-gn)# 1.0-awdot + # torch.square(torch.abs(awdiff)) 
-    #    gdiff = 1.0 / torch.abs(npar) 
-    #    adjusted_grad *= gdiff 
-
-    if(gdiff_enabled and d2):
-        awdiff = weight_ema - param 
-
-        npar = torch.abs(weight_ema)
-        npar += torch.abs(adjusted_grad - awdiff) 
-        gdiff = 1.0 / torch.abs(npar)
-        adjusted_grad *= gdiff 
-    
-    if(grokfast):
-        gema += 0.9999 * (adjusted_grad - gema)
-        adjusted_grad += gema * 2
-        adjusted_grad /= 3
-    if(ggauss):
-        gema += 0.1
-
-        gk = utils.gaussian_kernel(adjusted_grad,math.sin(gema),3)
-        adjusted_grad = gk * adjusted_grad
-    #if(gfast):
-    #    surprise += 0.98 * (adjusted_grad - surprise)
-    #    adjusted_grad = funnyMulti(adjusted_grad,surprise)
-    return adjusted_grad 
-
-
-def wfunny(model):
-        for i, p in enumerate(model.parameters()):
-            if p.requires_grad:
-                #if p.dim() > 0:
-                p.data  = funnyMulti(weight_emas[i],p.data)
-
-def wunfunny(model):
-        for i, p in enumerate(model.parameters()):
-            if p.requires_grad:
-                #if p.dim() > 0:
-                p.data  = unfunnyMulti(p.data, weight_emas[i])
-
-
-def funnyMulti(x, y):
-    return torch.sign(x) * torch.sqrt(torch.abs(x * y))
-
-def unfunnyMulti(x, y):
-    return torch.sign(x) * torch.abs((x ** 2) / y)
-
-#@torch.compile(backend='cudagraphs')
-def wnorm(model):
-    for p in model.parameters():
-        if p.requires_grad:
-            if p.ndim >= 2:
-                a = 1.0
-            else:
-                continue
-                a = 1e-5
-            with torch.no_grad():
-                pstep = snormstep(p, a) 
-                p.data = p.data - pstep 
-
-@torch.compile(backend='cudagraphs')
-def snormstep(p, alpha):
-    scale = 1 + 2 / p.data.nelement()
-    w_avg = p.data.nanmean()
-    w_range = torch.abs(p.data.max() - p.data.min() + 1e-10) / scale
-    return (p.data - ((p.data - w_avg) / w_range)  ) * alpha 
-
-#@torch.compile(backend='cudagraphs')
-def softwnorm(model, alpha = swna):
-    for i, p in enumerate(model.parameters()):
-        if p.requires_grad:
-            if p.ndim >= 2:
-                a = alpha
-            else:
-                continue
-                a = 0 #alpha / 20
-            with torch.no_grad():
-                pstep = snormstep(p, a) 
-                p.data = p.data - pstep 
-
-
-def wwhite(model):
-    for p in model.parameters():
-        if p.requires_grad:
-            with torch.no_grad():
-                p.data = p.data + 1e-5*(p.data-utils.zca_newton_schulz(p.data))
-
-def justnorm(x, idim=-1):
-    dtype = x.dtype
-    x = x.float()
-    res = (x / x.norm(p=2, dim=idim, keepdim=True)).to(dtype=dtype) 
-    return res
 
 scaler.is_enabled = False
 scaler = None
@@ -565,20 +567,15 @@ torch.cuda.empty_cache()
 def model_step(iter_num, tl, best_val_loss):
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
-    if(lrfinder):
-        lr = 1
-
-    if(wwhite_enabled):
-        wwhite(model)
-    if(wnorm_enabled):
-        wnorm(model)
-    if(swnorm_enabled):
-        if(decay):
-            softwnorm(model, lr/20)
-        else:
-            softwnorm(model)#, 1e-5)
-    if(dfw_enabled):
-        wfunny(model)  
+    with torch.no_grad():
+        if(lrfinder):
+            lr = 1
+        if(wwhite_enabled):
+            wwhite(model)
+        if(wnorm_enabled):
+            wnorm(model)#, 1e-5)
+        if(dfw_enabled):
+            wfunny(model)  
     
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
@@ -627,7 +624,7 @@ def model_step(iter_num, tl, best_val_loss):
         loss = loss.mean(dim=0)
         loss.mean().backward()
         return loss
-    #_ = closure()
+    _ = closure()
     #loss.backward()
         
     torch.cuda.empty_cache()
@@ -641,14 +638,17 @@ def model_step(iter_num, tl, best_val_loss):
             #mod.prestep(loss)
 
     # step the optimizer and scaler if training in fp16
-    optimizer.step(closure)
+    optimizer.step()
 
     for mod in model.modules():
         if isinstance(mod, optim.OptimizedLinear):
             mod.poststep()
 
     optimizer.zero_grad(set_to_none=True)
-
+    
+    if(swnorm_enabled):
+        softwnorm(model)
+    model.resetsink()
     if iter_num > max_iters:
         return 0, False
     return iter_num + 1, True, best_val_loss

@@ -370,6 +370,8 @@ class Softmaxless_attention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
+
+
 class Patcher(nn.Module):
     def __init__(self, config):
         super().__init__()

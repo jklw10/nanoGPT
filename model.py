@@ -51,15 +51,15 @@ repeatCenter    = False
 
 Qrotention      = False
 symloss         = False
-midchaos        = True
+midchaos        = False
 
 blockin         = spl or symloss or midchaos
 
-def qnorm(x):
-    b,t,c =x.size()
+def quatnorm(x):
+    b,t,c = x.size()
     x = x.view(b, t, c//4, 4)
     x = x /  torch.norm(x, p=2, dim=-1, keepdim=True)
-    return x.view(b, t, -1)
+    return x.view(b, t, c)
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -394,7 +394,6 @@ class GPTConfig:
     internal_vocab_size: int = 0
     internal_block_size: int = 30
     device='cuda'
-    #optim: str = 'SGD'
     optimizer: str = 'adam'
     mem_block_size: int = 8
     batch_size = 64
@@ -459,6 +458,7 @@ class GPT(nn.Module):
             #apparently bad
             self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
         
+        self.gradsink = nn.Parameter(torch.randn(config.n_embd))
         self.predict_weight = 0.01
         # init all weights
         self.apply(self._init_weights)
@@ -470,6 +470,9 @@ class GPT(nn.Module):
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
+    def resetsink(self):
+        with torch.no_grad():
+            self.gradsink.data = torch.randn(self.config.n_embd, device=self.gradsink.device)
 
     def forward(self, idx, targets=None):
         #self.config.step += 1.0
@@ -490,7 +493,6 @@ class GPT(nn.Module):
         else:
             pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
             tok_emb = self.transformer.wte(idx)
-            tok_emb += torch.randn_like(tok_emb,requires_grad=True)*1e-5
             pos_emb = self.transformer.wpe(pos) # position embeddings of shape (b, t, n_embd)
             if qope:
                 pos_emb = utils.maprotgate(pos_emb.view(b, t, self.config.n_embd//4, 4))
@@ -515,11 +517,10 @@ class GPT(nn.Module):
         if blockin:
             block_inputs = []
 
-        if(Qrotention):
-            x = x.view(b, t, self.config.n_embd//4, 4)
-            x = x /  torch.norm(x, p=2, dim=-1, keepdim=True)
-            x = x.view(b, t, -1)
-
+        #if(Qrotention):
+        x = quatnorm(x)
+        #tok_emb += self.gradsink * 1e-5
+        
         for i, block in enumerate(self.transformer.h):
             if blockin:
                 block_inputs.append(x) 
@@ -548,7 +549,7 @@ class GPT(nn.Module):
                 loss = self.convemb.loss(logits, patchtargets, pploss)
 
             if blockin and midchaos and self.training:
-                loss = loss + torch.nn.functional.mse_loss(block_inputs[2], torch.randn_like(block_inputs[1]))*1e-4
+                loss = loss + torch.nn.functional.mse_loss(utils.mmnorm(block_inputs[2], dim=[-1,-2]), utils.zca_newton_schulz(block_inputs[2].view(-1, self.config.n_embd)).view(b, t, self.config.n_embd))*1e-2
 
             if symloss and self.training:
                 for i in block_inputs:
@@ -570,51 +571,33 @@ class GPT(nn.Module):
     def self_grad_fwd(self, targets, x):
         device = x.device
         b, t, c = x.size()
-        if mix_squish:
-            fh = utils.fft_trunc_csquish(x)
-        if spl or symloss:
-            block_inputs = []
         x = x.view(b, t, self.config.n_embd//4, 4)
         x = x /  torch.norm(x, p=2, dim=-1, keepdim=True)
-        #ogx = x
         x = x.view(b, t, -1)
         for i, block in enumerate(self.transformer.h):
-            if spl or symloss:
-                block_inputs.append(x) 
             x = block(x) 
 
-            if mix_squish:
-                if self.config.mix_mask[i]:
-                    sh = utils.fft_trunc_csquish(x)
-                    x = torch.stack([sh,fh],dim =-1).flatten(start_dim=-2,end_dim=-1)
-          
         x = self.transformer.ln_f(x)
+        loss = linear_cross_entropy(x.to(torch.bfloat16), self.lm_head.weight.to(torch.bfloat16), targets, impl='torch_compile', reduction='mean')
+        loss.backward()
+        blockingrad = 0
+        for i, block in enumerate(self.transformer.h):
+            gradguess = block(blockingrad) 
+
         if targets is not None:
             logits = None# self.lm_head(x)
             reduction= 'none'
             if(not self.training):
                 reduction = 'mean'
-            #    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='mean')
-            #else:
-            #    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none').view(b,t)
+
             loss = linear_cross_entropy(x.to(torch.bfloat16), self.lm_head.weight.to(torch.bfloat16), targets, impl='torch_compile', reduction=reduction)
             
-            if symloss and self.training:
-                for i in block_inputs:
-                    loss = loss + utils.qisp_latent_dissonance_loss(i) * 0.01
-                    #lcloss, lmean = utils.calculate_linear_chaos_loss(i, balance_lambda=1.0,target_chaos=self.laim)
-                    #self.laim = max(lmean.detach(),self.laim)
-                    #loss = loss + lcloss#utils.calculate_linear_chaos_loss(i, balance_lambda=0.1,target_chaos=0.5)
-                    #loss = loss + 0.001 * torch.nn.functional.mse_loss(torch.abs(torch.fft.fft(i)),torch.softmax(torch.abs(torch.fft.fft(i)), -1))
-            if(spl and self.training):
-                loss = loss + self.self_prediction_loss(block_inputs,x) #* self.predict_weight #* 0.001
-                
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.lm_head(x[:, [-1], :])
             loss = None
 
         return logits, loss
+    
     def mem_mix_fwd(self, targets, x):
         b, t, e = x.size()
         block_inputs = []
