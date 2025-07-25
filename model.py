@@ -12,6 +12,7 @@ import inspect
 from dataclasses import dataclass
 
 from pytorch_wavelets import DWT1DForward
+from sympy import false
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -52,6 +53,8 @@ repeatCenter    = False
 Qrotention      = False
 symloss         = False
 midchaos        = False
+
+acl1            = True
 
 blockin         = spl or symloss or midchaos
 
@@ -458,14 +461,56 @@ class GPT(nn.Module):
             #apparently bad
             self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
         
+        if(acl1):
+            self.feature_dim_squished = 10
+            self.all_activations = None
+            #self.saved_activations = []
+            self.mmlposize = 25
+            i=0
+            for name, module in self.named_modules():
+                if isinstance(module, nn.Linear):
+                    # Each hook is created with its specific index (its slot)
+                    def create_hook(slot_index):
+                        def save_hook(module, input, output):
+                            # This hook will only execute if the master tensor has been created
+                            if self.all_activations is not None:
+                                # Process the activation
+                                squished = utils.rfft_trunc_squish(output.to(torch.float32), target_dim=self.feature_dim_squished)
+                                self.all_activations[:, :, slot_index, :] = squished
+                        return save_hook
+    
+                    # Register the hook for the current linear layer
+                    module.register_forward_hook(create_hook(i))
+                    i +=1
+            self.num_slots = i
+            #for name, module in self.named_modules():
+            #    if(isinstance(module, Linear)):
+            #        def create_hook(n):
+            #            def save_hook(module, input, output):
+            #                # 'n' is the name captured from the outer scope
+            #                self.saved_activations.append(utils.rfft_trunc_squish(output.to(torch.float32), target_dim=10))
+            #            return save_hook
+#
+            #        # Register the newly created, name-aware hook
+            #        module.register_forward_hook(create_hook(name))
+
+            self.aux_mlp = torch.nn.Sequential(
+                            torch.nn.Linear(10,self.mmlposize*2),
+                            torch.nn.GELU(),
+                            torch.nn.Linear(self.mmlposize*2,self.mmlposize ),
+
+                        )
+            
+                    
+
         self.gradsink = nn.Parameter(torch.randn(config.n_embd))
         self.predict_weight = 0.01
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
-        for pn, p in self.named_parameters():
+        for pn, module in self.named_parameters():
             if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+                torch.nn.init.normal_(module, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
         self.laim = 0.1
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
@@ -479,6 +524,11 @@ class GPT(nn.Module):
         #torch.compiler.cudagraph_mark_step_begin()
         device = idx.device
         b, t = idx.size()
+        self.all_activations = torch.zeros(
+            b, t, self.num_slots, self.feature_dim_squished,
+            device=idx.device,
+            dtype=torch.float32 
+        )
         #end_tok=torch.as_tensor(self.end_patch_token_id, device=device, dtype=torch.long)
         #patch_max=torch.as_tensor(self.patch_max, device=device, dtype=torch.long)
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -495,8 +545,14 @@ class GPT(nn.Module):
             tok_emb = self.transformer.wte(idx)
             pos_emb = self.transformer.wpe(pos) # position embeddings of shape (b, t, n_embd)
             if qope:
-                pos_emb = utils.maprotgate(pos_emb.view(b, t, self.config.n_embd//4, 4))
-                x = utils.quaternion_multiply(tok_emb.view(b, t, self.config.n_embd//4, 4),pos_emb) 
+                pos_emb = pos_emb.view(1, t, self.config.n_embd//4, 4)
+                tok_emb = tok_emb.view(b, t, self.config.n_embd//4, 4)
+                g1 = torch.sigmoid(pos_emb[...,0].view(1, t, self.config.n_embd//4, 1))
+                g2 = torch.sigmoid(tok_emb[...,0].view(b, t, self.config.n_embd//4, 1))
+                pos_emb = utils.exponential_map(pos_emb[...,1:]*g1*g2)
+
+                #pos_emb = utils.maprotgate(pos_emb.view(1, t, self.config.n_embd//4, 4))
+                x = utils.quaternion_multiply(tok_emb, pos_emb) 
                 x = x.view(b,t,self.config.n_embd)
                 #x = self.qoper(tok_emb,pos_emb.expand(b,t,self.config.n_embd),False,False)
             else:
@@ -548,6 +604,77 @@ class GPT(nn.Module):
             if(convemb):
                 loss = self.convemb.loss(logits, patchtargets, pploss)
 
+            if acl1 and self.training:
+                acl = 0.0
+                combined_activations = self.all_activations# torch.cat(self.saved_activations, dim=1)
+                ab, at, asl, ac = combined_activations.size()
+                combined_activations = combined_activations.permute(0, 2, 1, 3).reshape(ab * asl, at, ac)
+                ab = ab*asl
+                dact=combined_activations#.detach()
+                pred = self.aux_mlp(dact)
+                noise = torch.randn_like(pred[0,...]).expand(ab,at,self.mmlposize)
+                #L1 = torch.nn.functional.mse_loss(pred, noise)
+                #
+                #grads = torch.autograd.grad(L1, self.aux_mlp.parameters(), create_graph=True)
+                ##with torch.no_grad():
+                #updated_params = [
+                #    p - 0.01 * g if g is not None else p
+                #    for p, g in zip(self.aux_mlp.parameters(), grads)
+                #]
+                ## Manually apply the updated weights
+                #h = torch.nn.functional.linear(combined_activations, updated_params[0], updated_params[1])
+                #h = torch.nn.functional.gelu(h)#.view(b,t,-1)
+                #pred = torch.nn.functional.linear(h, updated_params[2], updated_params[3])#.view(b,t,self.mmlposize)
+                #L2 = L1
+                L2 = torch.nn.functional.mse_loss(pred, noise,reduction="none").mean(dim=[-1,-2])
+                L2 = utils.mmnorm(L2, scale=1) + 0.5
+                gk = utils.gaussian_kernel_batched(dact, L2, 3*L2)  
+                                #print(gk.size())
+                acl = (torch.norm(combined_activations, p=1.618033988749) * gk).mean() * 0.0001
+                if(False):
+                    for name, module in self.named_modules():
+                        if isinstance(module, Linear) and name in self.saved_activations:
+
+                            #print("runs")
+                            #with torch.no_grad():
+
+                            #for p in self.aux_mlp.parameters():
+                            #    if p.grad is not None:
+                            #        p.grad.zero_()
+                            #self.aux_mlp.zero_grad(set_to_none=True)
+                            activation = self.saved_activations[name]
+                            d_activation = activation#.detach()
+                            pred = self.aux_mlp(d_activation)
+                            noise = torch.randn_like(pred[0,...]).expand(b,t,self.mmlposize)
+                            #L1 = torch.nn.functional.mse_loss(pred, noise) #changed
+                            #L.backward(create_graph=True)
+                            #moptim.zero_grad(set_to_none=True)
+                            #with torch.no_grad():
+                            #for i, p in enumerate(aux_mlp.parameters()):
+                            #    p.sub_(p.grad*0.01)
+                            #grads = torch.autograd.grad(L1, self.aux_mlp.parameters(), create_graph=False)
+                            #with torch.no_grad():
+                            #    updated_params = [
+                            #        p - 0.01 * g.detach() if g is not None else p
+                            #        for p, g in zip(self.aux_mlp.parameters(), grads)
+                            #    ]
+#   
+                            #    # Manually apply the updated weights
+                            #    h = torch.nn.functional.linear(d_activation, updated_params[0], updated_params[1])
+                            #    h = torch.nn.functional.gelu(h).view(b,t,-1)
+                            #    pred = torch.nn.functional.linear(h, updated_params[2], updated_params[3]).view(b,t,self.mmlposize)
+                            #L2 = L1
+                            L2 = torch.nn.functional.mse_loss(pred, noise,reduction="none").mean(dim=[-1,-2])
+                            L2 = utils.mmnorm(L2, scale=1) + 0.5
+                            gk = utils.gaussian_kernel_batched(activation, L2, 3*L2)  
+
+                            #print(gk.size())
+                            acl += (torch.norm(activation, p=1.618033988749) * gk).mean() * 0.0001
+                            #print("succ")
+                            #loss = loss + acl
+
+                loss = loss + acl
+
             if blockin and midchaos and self.training:
                 loss = loss + torch.nn.functional.mse_loss(utils.mmnorm(block_inputs[2], dim=[-1,-2]), utils.zca_newton_schulz(block_inputs[2].view(-1, self.config.n_embd)).view(b, t, self.config.n_embd))*1e-2
 
@@ -568,6 +695,42 @@ class GPT(nn.Module):
 
         return logits, loss
     
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        # start with all of the candidate parameters
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        # filter out those that do not require grad
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0},
+            #{'params': self_lr, 'lr': 1.0},
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == 'cuda'
+        extra_args = dict(fused=True) if use_fused else dict()
+        match self.config.optimizer:
+            case "adam":
+                optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+            case "sgd":
+                optimizer = torch.optim.SGD(optim_groups, lr=learning_rate, **extra_args)
+            case "phi2":
+                optimizer = wackmodel.Phi2Optimizer(optim_groups,lr=learning_rate, **extra_args)
+            
+            #optimizer =torch.optim.Adadelta(optim_groups)#, **extra_args)# lr=learning_rate, **extra_args)
+        print(f"using fused AdamW: {use_fused}")
+                        
+        return optimizer
+
     def self_grad_fwd(self, targets, x):
         device = x.device
         b, t, c = x.size()
@@ -887,40 +1050,7 @@ class GPT(nn.Module):
 
         return model
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0},
-            #{'params': self_lr, 'lr': 1.0},
-        ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        match self.config.optimizer:
-            case "adam":
-                optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-            case "sgd":
-                optimizer = torch.optim.SGD(optim_groups, lr=learning_rate, **extra_args)
-            case "phi2":
-                optimizer = wackmodel.Phi2Optimizer(optim_groups,lr=learning_rate, **extra_args)
-            #optimizer =torch.optim.Adadelta(optim_groups)#, **extra_args)# lr=learning_rate, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
-
-        return optimizer
+    
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
         """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """

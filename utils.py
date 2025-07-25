@@ -21,7 +21,7 @@ def unfunnyMulti(x, y):
 @torch.compile(backend='inductor', mode='max-autotune')
 def mmnorm(x: torch.tensor, dim = -1, scale = None):  
     if scale is None: #batchsize independent
-        if not dim: 
+        if not dim or x.ndim == 1: 
             numel_in_dim = x.nelement()
         else:
             numel_in_dim = math.prod([x.shape[d] for d in dim])
@@ -460,19 +460,68 @@ def zca_newton_schulz(G, epsilon=1e-5, steps=5, power_iters=10):
     
     return torch.matmul(G, W)
 
+def wfunny(model, wemas):
+    for i, p in enumerate(model.parameters()):
+        if p.requires_grad:
+            #if p.dim() > 0:
+            p.data  = funnyMulti(wemas[i],p.data)
+
+def wunfunny(model, wemas):
+    for i, p in enumerate(model.parameters()):
+        if p.requires_grad:
+            #if p.dim() > 0:
+            p.data  = unfunnyMulti(p.data, wemas[i])
+
+def snormstep(p, alpha):
+    return (p.data - mmnorm(p.data,dim=[-1,-2])) * alpha 
 
 @torch.compile(backend='inductor', mode='max-autotune')
-def GradOrth(param, adjusted_grad):
-    w = param.view(-1)
-    g = adjusted_grad.view(-1)
+def softwnorm(model, alpha = 1e-5):
+    for i, p in enumerate(model.parameters()):
+        if p.requires_grad:
+            with torch.no_grad():
+                if p.ndim >= 2:
+                    a = alpha
+                else:
+                    continue
+                    a = 0 #alpha / 20
+
+                pstep = snormstep(p, a) 
+                p.data.sub_(pstep)
+
+
+def wwhite(model):
+    for p in model.parameters():
+        if p.requires_grad:
+            with torch.no_grad():
+                p.data.sub_(p.data-zca_newton_schulz(p.data), alpha = 1e-5)
+
+def justnorm(x, idim=-1):
+    dtype = x.dtype
+    x = x.float()
+    res = (x / x.norm(p=2, dim=idim, keepdim=True)).to(dtype=dtype) 
+    return res
+@torch.compile(backend='inductor', mode='max-autotune')
+def orthogonalize_gradients(grad, params):
+    w = params.view(-1)
+    g = grad.view(-1)
     w_norm_sq = torch.dot(w, w) + 1e-30
     proj = torch.dot(w, g) / w_norm_sq
     g_orth = g - proj * w
     g_norm = g.norm(2)
     g_orth_norm = g_orth.norm(2) + 1e-30
     g_orth_scaled = g_orth * (g_norm / g_orth_norm)
-    adjusted_grad = (g_orth_scaled.view_as(adjusted_grad))
-    return adjusted_grad
+    return g_orth_scaled.view_as(grad)
+
+@torch.compile(backend='inductor', mode='max-autotune')
+def fft_gauss(grad,center=0.5,sigma=0.5):
+    gk = gaussian_kernel(grad, center, sigma)
+    if(grad.ndim>=2):
+        adjusted_grad = torch.fft.fft2(grad) 
+        return torch.fft.ifft2(gk*adjusted_grad).real
+    else:
+        adjusted_grad = torch.fft.fft(grad) 
+        return torch.fft.ifft(gk*adjusted_grad).real
 
 @torch.compile(backend='inductor', mode='max-autotune')
 def fftnorm(grad,center=0.5,sigma=0.5, dim=None):
@@ -722,13 +771,16 @@ def fft_trunc_csquish(x, target_dim = None, band = "low"):
     o = torch.fft.irfft(xc,target_dim,dim=-1).real
     return o 
     
+@torch.compile(backend='inductor', mode='max-autotune')
 def gaussian_kernel(grad, center_offset: float, sigma = 3.0, dim=None) -> torch.Tensor:
     size = grad.size(dim)
     device= grad.device
     dtype= grad.dtype
     
     # Calculate total elements and validate input
-    num_elements = torch.prod(torch.tensor(size, dtype=dtype, device=device))
+    
+    num_elements = torch.prod(torch.tensor(grad.size(dim)))
+    #num_elements = grad.numel
     # Generate position indices
     indices = torch.arange(num_elements, dtype=dtype, device=device)
     
@@ -741,7 +793,33 @@ def gaussian_kernel(grad, center_offset: float, sigma = 3.0, dim=None) -> torch.
     kernel = torch.exp(-(indices - center).pow(2) / (2 * sigma**2))
     return kernel.view(size)
 
+@torch.compile(backend='inductor', mode='max-autotune')
+def gaussian_kernel_batched(activation_tensor: torch.Tensor, 
+                              center_offset: torch.Tensor, 
+                              sigma: torch.Tensor) -> torch.Tensor:
+    
+    b, t, features = activation_tensor.shape
+    device = activation_tensor.device
+    dtype = activation_tensor.dtype
 
+    # Generate position indices for the feature dimension
+    # Shape: (features,)
+    indices = torch.arange(features, dtype=dtype, device=device)
+
+    # Unsqueeze center and sigma to allow broadcasting with indices
+    # center becomes (b, t, 1), sigma becomes (b, t, 1)
+    # indices is (features,). Broadcasting results in a (b, t, features) tensor.
+    center = center_offset.unsqueeze(-1) * (features - 1)
+    sigma = sigma.unsqueeze(-1) * (features - 1)
+    
+    # Avoid division by zero for sigma
+    sigma = torch.clamp(sigma, min=1e-6)
+
+    # Compute Gaussian values
+    # The shapes are: (features,) - (b, t, 1) -> (b, t, features)
+    kernel = torch.exp(-(indices - center).pow(2) / (2 * sigma**2))
+    
+    return kernel
 
 def mmdiem( a :torch.Tensor,b :torch.Tensor):
     numel = a.numel()# torch.sqrt(torch.ones(1,device=a.device,dtype=a.dtype)* a.numel())

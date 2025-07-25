@@ -30,8 +30,11 @@ import torch._dynamo
 import torch._inductor.config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
-from model import GPTConfig, GPT
+import torch.optim.adam
+import torch.optim.adamw
+from model import MLP, GPTConfig, GPT
 import optim
+from tritonpscan import gelu
 import utils
 
 from torch.utils.data import Dataset, DataLoader
@@ -247,7 +250,6 @@ grokfast            = False
 sign_enabled        = False
 
 #??
-acl1                = False
 
 wwhite_enabled      = False
 gsphere             = False
@@ -277,36 +279,12 @@ decaying = 1.0
 eigenInit = False
 
 lrfinder = False
-@torch.compile(backend='inductor', mode='max-autotune')
-def orthogonalize_gradients(grad, params):
-    w = params.view(-1)
-    g = grad.view(-1)
-    w_norm_sq = torch.dot(w, w) + 1e-30
-    proj = torch.dot(w, g) / w_norm_sq
-    g_orth = g - proj * w
-    g_norm = g.norm(2)
-    g_orth_norm = g_orth.norm(2) + 1e-30
-    g_orth_scaled = g_orth * (g_norm / g_orth_norm)
-    return g_orth_scaled.view_as(grad)
 
 
-@torch.compile(backend='inductor', mode='max-autotune')
-def muon_update(grad: torch.tensor, momentum, beta=0.95, ns_steps=5, nesterov=True):
-    #momentum.lerp_(grad.detach(), 1 - beta)
-    update = utils.mmnorm(grad, dim = [-1,-2])
-    #update = grad / torch.norm(grad, "fro", dim =[-1], keepdim = True)
-    #update = grad.lerp_(momentum, beta) if nesterov else momentum
-    if update.ndim == 4: # for the case of conv filters
-        update = update.view(len(update), -1)
-    update = utils.zca_newton_schulz(update, 1e-10, 2, 2)
-    #update *= max(1, grad.size(-2) / grad.size(-1))**0.5
-    return update
-if(acl1):
-        saved_activations = {}
-        def save_hook(module, input, output):
-            saved_activations[module] = input[0]
+
+
 if(ghook):
-
+    gemas = None
     wemas = None
     gema = 0
     if(gdiff_enabled or dfw_enabled or muon):
@@ -320,21 +298,9 @@ if(ghook):
         if p.requires_grad:
             wema = None if wemas is None else wemas[i]
             gema = None if gemas is None else gemas[i]
-            if(acl1):
-                p.register_forward_hook(save_hook)
+            
             p.register_hook(lambda grad, p=p, gema=gema, wema=wema: custom_gradient_adjustment(grad, p, gema=gema, wema=wema))
 
-
-
-def fft_squish(grad,center=0.5,sigma=0.5):
-    gk = utils.gaussian_kernel(grad, center, sigma)
-    if(grad.ndim>=2):
-        adjusted_grad = torch.fft.fft2(grad) 
-        return torch.fft.ifft2(gk*adjusted_grad).real
-    else:
-        adjusted_grad = torch.fft.fft(grad) 
-        return torch.fft.ifft(gk*adjusted_grad).real
-    
 
 #@torch.compile(backend='cudagraphs')
 def custom_gradient_adjustment(grad, param, wema = None, gema = 0.0):
@@ -342,6 +308,7 @@ def custom_gradient_adjustment(grad, param, wema = None, gema = 0.0):
         return
     input_size = grad.size(0)
     adjusted_grad = torch.where(torch.isnan(grad), torch.zeros_like(grad), grad)
+    
     
     if(gchaos):
         adjusted_grad += torch.rand_like(adjusted_grad)*1e-3
@@ -362,7 +329,7 @@ def custom_gradient_adjustment(grad, param, wema = None, gema = 0.0):
     if(gzca_enabled and d2):
         adjusted_grad = utils.zca_newton_schulz(adjusted_grad, zcastep, szcapow)
     if(gradorth and d2):
-        adjusted_grad = orthogonalize_gradients(adjusted_grad,param)
+        adjusted_grad = utils.orthogonalize_gradients(adjusted_grad,param)
     if(ndiff_enabled):
         w_range = torch.abs(p.max() - p.min() + 1e-10)
         w_avg = param.nanmean()
@@ -370,11 +337,8 @@ def custom_gradient_adjustment(grad, param, wema = None, gema = 0.0):
         normgrad = norm - param
         adjusted_grad *= torch.abs(adjusted_grad - normgrad)
 
-    if muon and d2:
-        adjusted_grad = muon_update(adjusted_grad, wema)
         #weight_ema += 0.01 * (adjusted_grad - weight_ema)
-    if acl1:
-        adjusted_grad *= torch.norm(p.data*saved_activations[p], p=1.618033988749)
+    
     
     if(gdiff_enabled or dfw_enabled):
         wema += 0.01 * (adjusted_grad - wema)
@@ -412,67 +376,6 @@ def custom_gradient_adjustment(grad, param, wema = None, gema = 0.0):
     return adjusted_grad 
 
 
-def wfunny(model):
-        for i, p in enumerate(model.parameters()):
-            if p.requires_grad:
-                #if p.dim() > 0:
-                p.data  = funnyMulti(wemas[i],p.data)
-
-def wunfunny(model):
-        for i, p in enumerate(model.parameters()):
-            if p.requires_grad:
-                #if p.dim() > 0:
-                p.data  = unfunnyMulti(p.data, wemas[i])
-
-
-def funnyMulti(x, y):
-    return torch.sign(x) * torch.sqrt(torch.abs(x * y))
-
-def unfunnyMulti(x, y):
-    return torch.sign(x) * torch.abs((x ** 2) / y)
-
-@torch.compile(backend='inductor', mode='max-autotune')
-def wnorm(model):
-    for p in model.parameters():
-        if p.requires_grad:
-            if p.ndim >= 2:
-                a = 1.0
-            else:
-                continue
-                a = 1e-5
-            with torch.no_grad():
-                pstep = snormstep(p, a) 
-                p.data.sub_(pstep)
-
-def snormstep(p, alpha):
-    return (p.data - utils.mmnorm(p.data,dim=[-1,-2])) * alpha 
-
-@torch.compile(backend='inductor', mode='max-autotune')
-def softwnorm(model, alpha = swna):
-    for i, p in enumerate(model.parameters()):
-        if p.requires_grad:
-            with torch.no_grad():
-                if p.ndim >= 2:
-                    a = alpha
-                else:
-                    continue
-                    a = 0 #alpha / 20
-
-                pstep = snormstep(p, a) 
-                p.data.sub_(pstep)
-
-
-def wwhite(model):
-    for p in model.parameters():
-        if p.requires_grad:
-            with torch.no_grad():
-                p.data.sub_(p.data-utils.zca_newton_schulz(p.data), alpha = 1e-5)
-
-def justnorm(x, idim=-1):
-    dtype = x.dtype
-    x = x.float()
-    res = (x / x.norm(p=2, dim=idim, keepdim=True)).to(dtype=dtype) 
-    return res
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 #scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
@@ -567,15 +470,7 @@ torch.cuda.empty_cache()
 def model_step(iter_num, tl, best_val_loss):
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
-    with torch.no_grad():
-        if(lrfinder):
-            lr = 1
-        if(wwhite_enabled):
-            wwhite(model)
-        if(wnorm_enabled):
-            wnorm(model)#, 1e-5)
-        if(dfw_enabled):
-            wfunny(model)  
+    
     
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
@@ -645,10 +540,20 @@ def model_step(iter_num, tl, best_val_loss):
             mod.poststep()
 
     optimizer.zero_grad(set_to_none=True)
-    
-    if(swnorm_enabled):
-        softwnorm(model)
-    model.resetsink()
+
+    with torch.no_grad():
+        if(lrfinder):
+            lr = 1
+        if(wwhite_enabled):
+            utils.wwhite(model,wemas)
+        if(wnorm_enabled):
+            utils.swnorm(model,1.0)#, 1e-5)
+        if(dfw_enabled):
+            utils.wfunny(model)  
+        if(swnorm_enabled):
+            utils.softwnorm(model)
+        model.resetsink()
+
     if iter_num > max_iters:
         return 0, False
     return iter_num + 1, True, best_val_loss
