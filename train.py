@@ -24,17 +24,13 @@ import pickle
 from contextlib import nullcontext
 
 import numpy as np
-from sympy import true
 import torch
 import torch._dynamo
 import torch._inductor.config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
-import torch.optim.adam
-import torch.optim.adamw
 from model import MLP, GPTConfig, GPT
 import optim
-from tritonpscan import gelu
 import utils
 
 from torch.utils.data import Dataset, DataLoader
@@ -235,6 +231,7 @@ if block_size < model.config.block_size:
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
 
+force_gc = False
 #switches
 best                = False
 
@@ -460,12 +457,9 @@ running_mfu = -1.0
 
 scaler.is_enabled = False
 scaler = None
-
-gc.collect()
-torch.cuda.empty_cache()
-#losses = estimate_loss()
-gc.collect()
-torch.cuda.empty_cache()
+if(force_gc):
+    gc.collect()
+    torch.cuda.empty_cache()
 
 def model_step(iter_num, tl, best_val_loss):
     # determine and set the learning rate for this iteration
@@ -476,8 +470,11 @@ def model_step(iter_num, tl, best_val_loss):
         param_group['lr'] = lr
     if iter_num % eval_interval == 0 and master_process: 
         if(iter_num > 0):
-            gc.collect()
-            torch.cuda.empty_cache()
+            
+            if(force_gc):
+                gc.collect()
+                torch.cuda.empty_cache()
+            
             t1 = time.time()
             losses = estimate_loss()
             t2 = time.time()
@@ -506,7 +503,9 @@ def model_step(iter_num, tl, best_val_loss):
             
             print(f"train loss {losses['train']:.4f}, val loss {losses['val']:.4f} : step {iter_num:{len(str(max_iters))}d} : saved {saved} , total time {(t1-tl)*1000:.2f}ms, validation time {(t2-t1)*1000:.2f}ms")
             
-        torch.cuda.empty_cache()
+        
+        if(force_gc):
+            torch.cuda.empty_cache()
     if iter_num == 0 and eval_only:
         return 0, False
     
@@ -521,8 +520,10 @@ def model_step(iter_num, tl, best_val_loss):
         return loss
     _ = closure()
     #loss.backward()
-        
-    torch.cuda.empty_cache()
+    
+    if(force_gc):
+        torch.cuda.empty_cache()  
+    
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
