@@ -613,19 +613,19 @@ class GPT(nn.Module):
                 dact=combined_activations#.detach()
                 pred = self.aux_mlp(dact)
                 noise = torch.randn_like(pred[0,...]).expand(ab,at,self.mmlposize)
-                #L1 = torch.nn.functional.mse_loss(pred, noise)
-                #
-                #grads = torch.autograd.grad(L1, self.aux_mlp.parameters(), create_graph=True)
-                ##with torch.no_grad():
-                #updated_params = [
-                #    p - 0.01 * g if g is not None else p
-                #    for p, g in zip(self.aux_mlp.parameters(), grads)
-                #]
-                ## Manually apply the updated weights
-                #h = torch.nn.functional.linear(combined_activations, updated_params[0], updated_params[1])
-                #h = torch.nn.functional.gelu(h)#.view(b,t,-1)
-                #pred = torch.nn.functional.linear(h, updated_params[2], updated_params[3])#.view(b,t,self.mmlposize)
-                #L2 = L1
+                L1 = torch.nn.functional.mse_loss(pred, noise)
+                
+                grads = torch.autograd.grad(L1, self.aux_mlp.parameters(), create_graph=True)
+                #with torch.no_grad():
+                updated_params = [
+                    p - 0.01 * g if g is not None else p
+                    for p, g in zip(self.aux_mlp.parameters(), grads)
+                ]
+                # Manually apply the updated weights
+                h = torch.nn.functional.linear(combined_activations, updated_params[0], updated_params[1])
+                h = torch.nn.functional.gelu(h)#.view(b,t,-1)
+                pred = torch.nn.functional.linear(h, updated_params[2], updated_params[3])#.view(b,t,self.mmlposize)
+                
                 L2 = torch.nn.functional.mse_loss(pred, noise,reduction="none").mean(dim=[-1,-2])
                 L2 = utils.mmnorm(L2, scale=1) + 0.5
                 gk = utils.gaussian_kernel_batched(dact, L2, 3*L2)  
