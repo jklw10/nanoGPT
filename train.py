@@ -96,7 +96,7 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 
 
 
-#torch._dynamo.reset() in case of cache corruption throw it off a bridge.
+#torch._dynamo.reset() #in case of cache corruption throw it off a bridge.
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -132,7 +132,7 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 data_dir = os.path.join('data', dataset)
-def get_batch(split):
+def get_batch(split, sequential = False):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     if split == 'train':
@@ -140,7 +140,12 @@ def get_batch(split):
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
     #print(f"datalen {len(data)}")
-    ix = torch.randint(len(data) - block_size, (batch_size,))
+    if(sequential):
+        max_start_index = len(data) - block_size - batch_size
+        start_ix = torch.randint(max_start_index, (1,)).item()
+        ix = range(start_ix, start_ix + batch_size)
+    else:
+        ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     
@@ -235,7 +240,6 @@ force_gc = False
 #switches
 best                = False
 
-gradorth            = False
 mnorm_enabled       = False
 #wack
 dfw_enabled         = False
@@ -247,26 +251,29 @@ grokfast            = False
 sign_enabled        = False
 
 #??
-
+gradorth            = True
 wwhite_enabled      = False
+
 gsphere             = False
 ndiff_enabled       = False
 gchaos              = False #or best
 ggauss              = False #or best
 
+decay_wa            = False
 #known good
 gfft                = False #or best
 gnorm               = False #or best
 gzca_enabled        = False #or best
 swnorm_enabled      = False or best
 
-muon = False
+
+muon                = False
 #for fftmem owt: 1e-5
 #for fftmem skspr: 5e-5
-swna = 1e-6
-
-zcastep = 2 #2, 5
-szcapow = 2 #2, 10
+#swna                = 1.0e-5
+#swwa                = 1.0e-5
+zcastep             = 2 #2, 5
+szcapow             = 2 #2, 10
 
 ghook = gdiff_enabled or ndiff_enabled or gnorm or dfw_enabled or grokfast or gfft or gzca_enabled or sign_enabled or gsphere or ggauss or gchaos or gradorth or muon
 
@@ -283,7 +290,6 @@ lrfinder = False
 if(ghook):
     gemas = None
     wemas = None
-    gema = 0
     if(gdiff_enabled or dfw_enabled or muon):
         if init_from!='resume':
             wemas = [p.clone().detach()for p in model.parameters()]
@@ -294,13 +300,13 @@ if(ghook):
     for i, p in enumerate(model.parameters()):
         if p.requires_grad:
             wema = None if wemas is None else wemas[i]
-            gema = None if gemas is None else gemas[i]
+            gema = 0.0 if gemas is None else gemas[i]
             
             p.register_hook(lambda grad, p=p, gema=gema, wema=wema: custom_gradient_adjustment(grad, p, gema=gema, wema=wema))
 
 
-#@torch.compile(backend='cudagraphs')
-def custom_gradient_adjustment(grad, param, wema = None, gema = 0.0):
+@torch.compile(backend='inductor', mode='max-autotune')
+def custom_gradient_adjustment(grad, param, wema = None, gema = None):
     if(grad is None):
         return
     input_size = grad.size(0)
@@ -365,11 +371,8 @@ def custom_gradient_adjustment(grad, param, wema = None, gema = 0.0):
     if(ggauss):
         gema += 0.1
 
-        gk = utils.gaussian_kernel(adjusted_grad,math.sin(gema),3)
+        gk = utils.gaussian_kernel(adjusted_grad,torch.sin(gema),3)
         adjusted_grad = gk * adjusted_grad
-    #if(gfast):
-    #    surprise += 0.98 * (adjusted_grad - surprise)
-    #    adjusted_grad = funnyMulti(adjusted_grad,surprise)
     return adjusted_grad 
 
 
@@ -510,15 +513,16 @@ def model_step(iter_num, tl, best_val_loss):
         return 0, False
     
     
-    X, Y = get_batch('train')
+    X, Y = get_batch('train',True)
     def closure():
         torch.compiler.cudagraph_mark_step_begin()
         logits, loss = model(X, Y)
         loss = loss / gradient_accumulation_steps 
         loss = loss.mean(dim=0)
-        loss.mean().backward()
+        #loss.mean().backward()
         return loss
-    _ = closure()
+    l1 = closure()
+    l1.mean().backward()
     #loss.backward()
     
     if(force_gc):
@@ -535,6 +539,13 @@ def model_step(iter_num, tl, best_val_loss):
 
     # step the optimizer and scaler if training in fp16
     optimizer.step()
+    
+    #optimizer.zero_grad(set_to_none=True)
+    #l2 = closure()
+    #rdiff = (l2 - l1.detach() )
+    #loss = l2 * (rdiff-rdiff.mean())
+    #loss.mean().backward()
+    #optimizer.step()
 
     for mod in model.modules():
         if isinstance(mod, optim.OptimizedLinear):
@@ -543,20 +554,30 @@ def model_step(iter_num, tl, best_val_loss):
     optimizer.zero_grad(set_to_none=True)
 
     with torch.no_grad():
+        
+        if(decay_wa):
+            lrgpu = torch.tensor(lr,device='cuda') 
         if(lrfinder):
             lr = 1
-        if(wwhite_enabled):
-            utils.wwhite(model,wemas)
-        if(wnorm_enabled):
-            utils.swnorm(model,1.0)#, 1e-5)
-        if(dfw_enabled):
-            utils.wfunny(model)  
         if(swnorm_enabled):
-            utils.softwnorm(model)
+            if(decay_wa):
+                swna = lrgpu/20.0
+            else:
+                swna = 1e-5
+            utils.softwnorm(model, swna)
+        if(wwhite_enabled):
+            if(decay_wa):
+                swwa = lrgpu/20.0
+            else:
+                swwa = 1e-5
+            utils.wwhite(model, swwa)
+        if(dfw_enabled):
+            utils.wfunny(model, wemas)  
+        
         model.resetsink()
 
     if iter_num > max_iters:
-        return 0, False
+        return 0, False, best_val_loss
     return iter_num + 1, True, best_val_loss
 run = True
 tl = time.time()

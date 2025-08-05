@@ -11,8 +11,8 @@ import math
 import inspect
 from dataclasses import dataclass
 
+from numpy import float32
 from pytorch_wavelets import DWT1DForward
-from sympy import false
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -54,9 +54,13 @@ Qrotention      = False
 symloss         = False
 midchaos        = False
 
-acl1            = True
+topoloss        = False
+acebtl          = False
+acl1            = False
 
-blockin         = spl or symloss or midchaos
+auxmod          = acl1 or acebtl #or topoloss
+
+blockin         = spl or symloss or midchaos or topoloss
 
 def quatnorm(x):
     b,t,c = x.size()
@@ -80,12 +84,88 @@ class LayerNorm(nn.Module):
             return torch.tanh(input*self.weight)
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+class LearnableFourierResampler(nn.Module):
+    def __init__(self, input_dim: int, output_dim: int, num_filters: int):
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.num_filters = num_filters
+
+        # A single set of learnable frequencies defines the filter bank.
+        # We initialize them based on the input dimension for stability.
+        self.frequencies = nn.Parameter(torch.linspace(1, input_dim // 2, num_filters))
+        
+        # We need two separate time axes: one for analysis, one for synthesis.
+        t_in = torch.linspace(0, 1, input_dim, device=self.frequencies.device)
+        t_out = torch.linspace(0, 1, output_dim, device=self.frequencies.device)
+        self.register_buffer("t_in", t_in)
+        self.register_buffer("t_out", t_out)
+
+    def _get_bases(self):
+        """Helper to generate both analysis and synthesis bases."""
+        freqs = self.frequencies.unsqueeze(1)
+        
+        # Analysis bases (for the input signal)
+        arg_in = 2 * math.pi * freqs * self.t_in.unsqueeze(0)
+        sin_basis_in = torch.sin(arg_in)
+        cos_basis_in = torch.cos(arg_in)
+        
+        # Synthesis bases (for the output signal)
+        arg_out = 2 * math.pi * freqs * self.t_out.unsqueeze(0)
+        sin_basis_out = torch.sin(arg_out)
+        cos_basis_out = torch.cos(arg_out)
+        
+        return sin_basis_in, cos_basis_in, sin_basis_out, cos_basis_out
+
+    def forward(self, x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape [..., input_dim, ...].
+            dim (int): The dimension to resample.
+        """
+        # --- Preparation ---
+        assert x.shape[dim] == self.input_dim, \
+            f"Input tensor dim {dim} has size {x.shape[dim]}, " \
+            f"but module was initialized with input_dim {self.input_dim}."
+            
+        x_permuted = x.transpose(dim, -1)
+        original_shape = x_permuted.shape
+        x_flattened = x_permuted.reshape(-1, self.input_dim)
+        
+        # --- 1. ANALYSIS ---
+        # Get all four basis sets.
+        sin_basis_in, cos_basis_in, sin_basis_out, cos_basis_out = self._get_bases()
+        
+        # Project input signal onto the ANALYSIS bases to get coefficients.
+        c_sin = torch.einsum('ns,fs->nf', x_flattened, sin_basis_in)
+        c_cos = torch.einsum('ns,fs->nf', x_flattened, cos_basis_in)
+        
+        # `c_sin` and `c_cos` are the compressed representation.
+        
+        # --- 2. SYNTHESIS ---
+        # Reconstruct a new signal by doing a weighted sum of the SYNTHESIS bases.
+        sin_recon = torch.einsum('nf,fs->ns', c_sin, sin_basis_out)
+        cos_recon = torch.einsum('nf,fs->ns', c_cos, cos_basis_out)
+        
+        # The new signal is the sum of the components.
+        x_reconstructed = sin_recon + cos_recon # Shape: [N, output_dim]
+        
+        # --- Reshape Output ---
+        # The last dimension now has size `output_dim`.
+        output_shape = original_shape[:-1] + (self.output_dim,)
+        output = x_reconstructed.view(output_shape)
+        
+        # Put the processed dimension back where it was.
+        output = output.transpose(dim, -1)
+        
+        return output
 class Scanner(nn.Module):
     def __init__(self, config):
         super().__init__()
         #self.ln = nn.LayerNorm(config.n_embd * 2)
-        self.linear_1 = nn.Linear(config.n_embd * 2, config.n_embd )
+        #self.linear_1 = nn.Linear(config.n_embd * 2, config.n_embd )
         self.d = config.n_embd
+        self.sampler = LearnableFourierResampler(config.n_embd * 2, config.n_embd, 64)
         #self.act = nn.GELU()
         #self.linear_2 = nn.Linear(config.n_embd * 4, config.n_embd)
         #self.lin = nn.Linear(config.n_embd, config.n_embd)
@@ -97,18 +177,18 @@ class Scanner(nn.Module):
         #z = self.act(z)
         #z = self.linear_2(z)
         #z = self.act2(z)
-        z = z / z.norm("fro",dim=-1,keepdim=True)
-        z = torch.fft.fft(z.to(torch.float32),self.d*2, dim =-1)
+        #z = z / z.norm("fro",dim=-1,keepdim=True)
+        #z = torch.fft.fft(z.to(torch.float32),self.d*2, dim =-1)
         #z = self.linear_1(z.real)
-        
-        xc = torch.complex(self.linear_1(z.real).to(torch.float32), self.linear_1(z.imag).to(torch.float32))
-        z = torch.fft.ifft(xc.to(torch.float32),self.d, dim =-1).to(torch.bfloat16)
+        z=self.sampler(z)
+        #xc = torch.complex(self.linear_1(z.real).to(torch.float32), self.linear_1(z.imag).to(torch.float32))
+        #z = torch.fft.ifft(xc.to(torch.float32),self.d, dim =-1).to(torch.bfloat16)
 
         #z = utils.rfft_trunc_squish(z.to(torch.float32),x.shape[-1]).to(torch.bfloat16)
         #z = self.lin(z)
         #z = self.act(z)
         #z = x*y#
-        #z = utils.mmnorm(z)
+        z = utils.mmnorm(z)
         return z
 #class Scanner(nn.Module):
 #    def __init__(self, config):
@@ -293,12 +373,12 @@ class LearnableSpiral4D(nn.Module):
         if x.shape[-1] != 1:
             output = output.view(b,t,c*4)
         return output
-
+fxor = False
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc    = Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        if(qrot):
+        if(qrot or fxor):
             self.c_proj  = Linear( 2*config.n_embd, config.n_embd, bias=config.bias)
         else:
             self.gelu    = nn.GELU()
@@ -309,7 +389,10 @@ class MLP(nn.Module):
     def forward(self, x):
         x = self.c_fc(x)
         dt = x.dtype
-        if(qrot):
+        if(fxor):
+            x,y = x.chunk(2, dim=-1)
+            x = utils.float_xor_inductor_friendly(x,y)
+        elif(qrot):
             b,t,n=x.shape
             x4d = x.view(b, t, self.n_embd, 4) # Reshape to (batch, seq_len, n_embd, 4)
             x_norm = torch.clamp_min(x4d.norm(dim=-1, keepdim=True), 1e-10) # Calculate norm along the last dimension (dim=3 or -1), keep dimensions
@@ -330,7 +413,7 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
-    
+
 
 class MemBlock(nn.Module):
     def __init__(self, config):
@@ -402,6 +485,40 @@ class GPTConfig:
     batch_size = 64
     step = 0
 
+wn = torch.nn.utils.parametrizations.weight_norm
+class wnormlearnloss(nn.Module):
+    def __init__(self, dims):
+        super().__init__()
+        # Create one learnable log_sigma_sq parameter for each loss
+        self.head = nn.Sequential(
+                wn(Linear(dims, dims*2),dim=None),
+                nn.GELU(),
+                wn(Linear(dims*2, dims*2),dim=None),
+                nn.GELU(),
+                wn(Linear(dims*2, 1))
+            )
+
+    def forward(self, x):
+        loss = self.head(x)
+        return F.softplus(loss).mean()
+
+class UncertaintyWeightedLoss(nn.Module):
+    def __init__(self, num_losses: int):
+        super().__init__()
+        # Create one learnable log_sigma_sq parameter for each loss
+        self.log_sigmas_sq = nn.Parameter(torch.zeros(num_losses), requires_grad=True)
+
+    def forward(self, *losses):
+        total_loss = 0
+        for i, loss in enumerate(losses):
+            precision = torch.exp(-self.log_sigmas_sq[i])
+            regularization = self.log_sigmas_sq[i]
+            
+            total_loss += precision * loss + regularization
+            
+        return total_loss
+
+    
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -418,6 +535,7 @@ class GPT(nn.Module):
         config.internal_block_size = config.block_size
         
         blocks = nn.ModuleList([MemBlock(config) for _ in range(config.n_layer)])
+        self.denoiser = MemBlock(config) 
         
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -461,11 +579,13 @@ class GPT(nn.Module):
             #apparently bad
             self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
         
-        if(acl1):
-            self.feature_dim_squished = 10
+
+
+        if(auxmod):
+            self.auxmlpin = 25
+            self.auxmlpout = 25
             self.all_activations = None
             #self.saved_activations = []
-            self.mmlposize = 25
             i=0
             for name, module in self.named_modules():
                 if isinstance(module, nn.Linear):
@@ -475,7 +595,10 @@ class GPT(nn.Module):
                             # This hook will only execute if the master tensor has been created
                             if self.all_activations is not None:
                                 # Process the activation
-                                squished = utils.rfft_trunc_squish(output.to(torch.float32), target_dim=self.feature_dim_squished)
+                                if(output.shape[-1] == self.auxmlpin):
+                                    squished = output #no need to squish.
+                                else:
+                                    squished = utils.rfft_trunc_squish(output.to(torch.float32), target_dim=self.auxmlpin)
                                 self.all_activations[:, :, slot_index, :] = squished
                         return save_hook
     
@@ -483,26 +606,18 @@ class GPT(nn.Module):
                     module.register_forward_hook(create_hook(i))
                     i +=1
             self.num_slots = i
-            #for name, module in self.named_modules():
-            #    if(isinstance(module, Linear)):
-            #        def create_hook(n):
-            #            def save_hook(module, input, output):
-            #                # 'n' is the name captured from the outer scope
-            #                self.saved_activations.append(utils.rfft_trunc_squish(output.to(torch.float32), target_dim=10))
-            #            return save_hook
-#
-            #        # Register the newly created, name-aware hook
-            #        module.register_forward_hook(create_hook(name))
-
+            
             self.aux_mlp = torch.nn.Sequential(
-                            torch.nn.Linear(10,self.mmlposize*2),
+                            torch.nn.Linear(self.auxmlpin,self.auxmlpout*2),
                             torch.nn.GELU(),
-                            torch.nn.Linear(self.mmlposize*2,self.mmlposize ),
+                            torch.nn.Linear(self.auxmlpout*2,self.auxmlpout ),
 
                         )
-            
-                    
-
+        if topoloss:
+            self.ucl = UncertaintyWeightedLoss(3)  
+        if mix_squish:
+            self.fcomp = LearnableFourierResampler(config.n_embd,config.n_embd//2,config.n_embd//2)
+        #self.wnl = wnormlearnloss(config.n_embd*4)
         self.gradsink = nn.Parameter(torch.randn(config.n_embd))
         self.predict_weight = 0.01
         # init all weights
@@ -524,11 +639,12 @@ class GPT(nn.Module):
         #torch.compiler.cudagraph_mark_step_begin()
         device = idx.device
         b, t = idx.size()
-        self.all_activations = torch.zeros(
-            b, t, self.num_slots, self.feature_dim_squished,
-            device=idx.device,
-            dtype=torch.float32 
-        )
+        if auxmod:
+            self.all_activations = torch.zeros(
+               b, t, self.num_slots, self.auxmlpin,
+               device=idx.device,
+               dtype=torch.float32 
+            )
         #end_tok=torch.as_tensor(self.end_patch_token_id, device=device, dtype=torch.long)
         #patch_max=torch.as_tensor(self.patch_max, device=device, dtype=torch.long)
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -568,8 +684,6 @@ class GPT(nn.Module):
             else:
                 return self.mem_fwd(targets, x)
 
-        if mix_squish:
-            fh = utils.fft_trunc_csquish(x)
         if blockin:
             block_inputs = []
 
@@ -577,16 +691,29 @@ class GPT(nn.Module):
         x = quatnorm(x)
         #tok_emb += self.gradsink * 1e-5
         
+        if mix_squish:
+            fh = self.fcomp(x,dim=-1)
         for i, block in enumerate(self.transformer.h):
-            if blockin:
-                block_inputs.append(x) 
-            x = block(x) 
 
             if mix_squish:
-                if self.config.mix_mask[i]:
-                    sh = utils.fft_trunc_csquish(x)
+                if (i>1):# and i < self.config.n_layer-1):
+                    sh = self.fcomp(x,dim=-1)
                     x = torch.stack([sh,fh],dim =-1).flatten(start_dim=-2,end_dim=-1)
-          
+            if blockin:
+                block_inputs.append(x) 
+            
+            x = block(x) 
+        #noise = torch.randn_like(x)
+        #nguess = self.denoiser(x+noise)
+        #dnloss = F.mse_loss(nguess,noise)
+        #x = x - self.denoiser(x)
+        if acebtl:
+            x, acl = self.acebtl(x, tok_emb)
+        #noise = torch.randn_like(x)
+        #nguess = self.denoiser(x+noise)
+        #dnloss = F.mse_loss(nguess,noise,reduction="none").mean(dim=2)
+        #x = x * F.sigmoid(1/dnloss).unsqueeze(-1)
+
         x = self.transformer.ln_f(x)
         if targets is not None:
             logits = None# self.lm_head(x)
@@ -596,7 +723,9 @@ class GPT(nn.Module):
             #    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='mean')
             #else:
             #    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none').view(b,t)
+           
             loss = linear_cross_entropy(x.to(torch.bfloat16), self.lm_head.weight.to(torch.bfloat16), targets, impl='torch_compile', reduction=reduction)
+            #loss = loss+dnloss
             
             #loss = F.cross_entropy(logits, targets, ignore_index=-1, reduction=reduction) 
             #loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=reduction).view(b,t)
@@ -604,89 +733,30 @@ class GPT(nn.Module):
             if(convemb):
                 loss = self.convemb.loss(logits, patchtargets, pploss)
 
-            if acl1 and self.training:
-                acl = 0.0
-                combined_activations = self.all_activations# torch.cat(self.saved_activations, dim=1)
-                ab, at, asl, ac = combined_activations.size()
-                combined_activations = combined_activations.permute(0, 2, 1, 3).reshape(ab * asl, at, ac)
-                ab = ab*asl
-                dact=combined_activations#.detach()
-                pred = self.aux_mlp(dact)
-                noise = torch.randn_like(pred[0,...]).expand(ab,at,self.mmlposize)
-                L1 = torch.nn.functional.mse_loss(pred, noise)
+            if self.training:
                 
-                grads = torch.autograd.grad(L1, self.aux_mlp.parameters(), create_graph=True)
-                #with torch.no_grad():
-                updated_params = [
-                    p - 0.01 * g if g is not None else p
-                    for p, g in zip(self.aux_mlp.parameters(), grads)
-                ]
-                # Manually apply the updated weights
-                h = torch.nn.functional.linear(combined_activations, updated_params[0], updated_params[1])
-                h = torch.nn.functional.gelu(h)#.view(b,t,-1)
-                pred = torch.nn.functional.linear(h, updated_params[2], updated_params[3])#.view(b,t,self.mmlposize)
-                
-                L2 = torch.nn.functional.mse_loss(pred, noise,reduction="none").mean(dim=[-1,-2])
-                L2 = utils.mmnorm(L2, scale=1) + 0.5
-                gk = utils.gaussian_kernel_batched(dact, L2, 3*L2)  
-                                #print(gk.size())
-                acl = (torch.norm(combined_activations, p=1.618033988749) * gk).mean() * 0.0001
-                if(False):
-                    for name, module in self.named_modules():
-                        if isinstance(module, Linear) and name in self.saved_activations:
+                #loss = loss + utils.compute_criticality_loss(self)
 
-                            #print("runs")
-                            #with torch.no_grad():
 
-                            #for p in self.aux_mlp.parameters():
-                            #    if p.grad is not None:
-                            #        p.grad.zero_()
-                            #self.aux_mlp.zero_grad(set_to_none=True)
-                            activation = self.saved_activations[name]
-                            d_activation = activation#.detach()
-                            pred = self.aux_mlp(d_activation)
-                            noise = torch.randn_like(pred[0,...]).expand(b,t,self.mmlposize)
-                            #L1 = torch.nn.functional.mse_loss(pred, noise) #changed
-                            #L.backward(create_graph=True)
-                            #moptim.zero_grad(set_to_none=True)
-                            #with torch.no_grad():
-                            #for i, p in enumerate(aux_mlp.parameters()):
-                            #    p.sub_(p.grad*0.01)
-                            #grads = torch.autograd.grad(L1, self.aux_mlp.parameters(), create_graph=False)
-                            #with torch.no_grad():
-                            #    updated_params = [
-                            #        p - 0.01 * g.detach() if g is not None else p
-                            #        for p, g in zip(self.aux_mlp.parameters(), grads)
-                            #    ]
-#   
-                            #    # Manually apply the updated weights
-                            #    h = torch.nn.functional.linear(d_activation, updated_params[0], updated_params[1])
-                            #    h = torch.nn.functional.gelu(h).view(b,t,-1)
-                            #    pred = torch.nn.functional.linear(h, updated_params[2], updated_params[3]).view(b,t,self.mmlposize)
-                            #L2 = L1
-                            L2 = torch.nn.functional.mse_loss(pred, noise,reduction="none").mean(dim=[-1,-2])
-                            L2 = utils.mmnorm(L2, scale=1) + 0.5
-                            gk = utils.gaussian_kernel_batched(activation, L2, 3*L2)  
 
-                            #print(gk.size())
-                            acl += (torch.norm(activation, p=1.618033988749) * gk).mean() * 0.0001
-                            #print("succ")
-                            #loss = loss + acl
+                if auxmod:
+                    if topoloss:
+                        pass
+                    if acebtl:
+                        loss = loss+acl     
+                    
+                if midchaos:
+                    loss = loss + torch.nn.functional.mse_loss(utils.mmnorm(block_inputs[2], dim=[-1,-2]), utils.zca_newton_schulz(block_inputs[2].view(-1, self.config.n_embd)).view(b, t, self.config.n_embd))*1e-2
 
-                loss = loss + acl
-
-            if blockin and midchaos and self.training:
-                loss = loss + torch.nn.functional.mse_loss(utils.mmnorm(block_inputs[2], dim=[-1,-2]), utils.zca_newton_schulz(block_inputs[2].view(-1, self.config.n_embd)).view(b, t, self.config.n_embd))*1e-2
-
-            if symloss and self.training:
-                for i in block_inputs:
-                    loss = loss + utils.qisp_latent_dissonance_loss(i) * 0.01
-                    #lcloss, lmean = utils.calculate_linear_chaos_loss(i, balance_lambda=1.0,target_chaos=self.laim)
-                    #self.laim = max(lmean.detach(),self.laim)
-                    #loss = loss + lcloss#utils.calculate_linear_chaos_loss(i, balance_lambda=0.1,target_chaos=0.5)
-                    #loss = loss + 0.001 * torch.nn.functional.mse_loss(torch.abs(torch.fft.fft(i)),torch.softmax(torch.abs(torch.fft.fft(i)), -1))
-            if(spl and self.training):
-                loss = loss + self.self_prediction_loss(block_inputs,x) #* self.predict_weight #* 0.001
+                if symloss:
+                    for i in block_inputs:
+                        loss = loss + utils.qisp_latent_dissonance_loss(i) * 0.01
+                        #lcloss, lmean = utils.calculate_linear_chaos_loss(i, balance_lambda=1.0,target_chaos=self.laim)
+                        #self.laim = max(lmean.detach(),self.laim)
+                        #loss = loss + lcloss#utils.calculate_linear_chaos_loss(i, balance_lambda=0.1,target_chaos=0.5)
+                        #loss = loss + 0.001 * torch.nn.functional.mse_loss(torch.abs(torch.fft.fft(i)),torch.softmax(torch.abs(torch.fft.fft(i)), -1))
+                if spl:
+                    loss = loss + self.self_prediction_loss(block_inputs,x) #* self.predict_weight #* 0.001
                 
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
@@ -694,7 +764,53 @@ class GPT(nn.Module):
             loss = None
 
         return logits, loss
+
+    def acebtl(self, x, tok_emb):
+        if(self.auxmlpin != self.config.n_embd):
+            xsquish = utils.rfft_trunc_squish(x,target_dim=self.auxmlpin)
+        else:
+            xsquish = x
+                #with torch.enable_grad():
+        pred = self.aux_mlp(xsquish)
+
+        if self.training:
+                    #xsquish= xsquish[:,:-1,:] # utils.rfft_trunc_squish(x[:,:-1,:],target_dim=self.auxmlpin)
+                    #pred = pred[:,:-1,:]# self.aux_mlp(xsquish)
+            if(self.auxmlpout != self.config.n_embd):
+                auxtarget = utils.rfft_trunc_squish(tok_emb[:,1:,:],target_dim=self.auxmlpout) #too lazy to embed the targets sue me.
+            else:
+                auxtarget = tok_emb[:,1:,:]
+            L1 = torch.nn.functional.mse_loss(pred[:,:-1,:], auxtarget)
+                    #for i in range(4):
+            grads = torch.autograd.grad(L1, self.aux_mlp.parameters(), create_graph=True)
+                    #with torch.no_grad():
+            updated_params = [
+                        p - 0.1 * g if g is not None else p
+                        for p, g in zip(self.aux_mlp.parameters(), grads)
+                    ]
+                    # Manually apply the updated weights
+            h = torch.nn.functional.linear(xsquish, updated_params[0], updated_params[1])
+            h = torch.nn.functional.gelu(h)
+            pred = torch.nn.functional.linear(h, updated_params[2], updated_params[3])
+            L1 = torch.nn.functional.mse_loss(pred[:,:-1,:], auxtarget)
+                    
+                    #if not self.training:
+                    #    self.aux_mlp.zero_grad(set_to_none=True) #ensure no cheating probably not needed
+            acl = L1 #added to loss
+                #else:
+        if(self.auxmlpout != self.config.n_embd):
+            pf = torch.fft.rfft(pred.to(torch.float32),self.auxmlpout)
+            xf = torch.fft.rfft(x.to(torch.float32),self.config.n_embd) 
+            nc = pf.shape[-1]
+            nt = pf.shape[-2]
+            xf[:,:nt,:nc] = pf #surgery! could be mistaken for torture!
+        else:
+            x = pred
+                
+        x = torch.fft.irfft(xf,self.config.n_embd)
+        return x,acl
     
+
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}

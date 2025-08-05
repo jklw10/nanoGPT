@@ -16,7 +16,7 @@ dataset = 'openwebtext'
 gradient_accumulation_steps = 1
 batch_size = 64    
 
-block_size = 512  
+block_size = 64  
 
 n_layer = 4
 n_head = 6 
@@ -24,7 +24,7 @@ n_embd = 228
 dropout = 0.0 
 
 learning_rate = 1e-3
-max_iters = 100000
+max_iters = 200000
 lr_decay_iters = 30000 
 min_lr = 1e-4 
 warmup_iters = 100

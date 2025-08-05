@@ -19,12 +19,41 @@ def unfunnyMulti(x, y):
     return torch.sign(x) * torch.abs((x ** 2) / (y + 1e-10))
 
 @torch.compile(backend='inductor', mode='max-autotune')
+def compute_criticality_loss(model: nn.Module, lambda_crit: float = 1.0):
+    total_crit_loss = 0.0
+    
+    for module in model.modules():
+        if isinstance(module, nn.Linear):
+            weight = module.weight
+            if weight.dim() < 2:
+                continue
+
+            fan_in = weight.shape[1]
+            
+            # The target variance Kaiming He initialization
+            # change based on activation function.
+            target_variance = 2.0 / fan_in
+
+            actual_variance = torch.var(weight)
+
+            variance_loss = (actual_variance - target_variance) ** 2
+            total_crit_loss += variance_loss
+
+    return lambda_crit * total_crit_loss
+
+def dimnumel(x: torch.tensor, dim):
+    if not dim or x.ndim == 1: 
+        return x.nelement()
+    else:
+        if isinstance(dim, int):
+            return x.size(dim)
+        else:
+            return math.prod([x.shape[d] for d in dim])
+    
+@torch.compile(backend='inductor', mode='max-autotune')
 def mmnorm(x: torch.tensor, dim = -1, scale = None):  
     if scale is None: #batchsize independent
-        if not dim or x.ndim == 1: 
-            numel_in_dim = x.nelement()
-        else:
-            numel_in_dim = math.prod([x.shape[d] for d in dim])
+        numel_in_dim = dimnumel(x,dim)
         scale = 1 + 2 / numel_in_dim 
     w_avg = x.mean(dim=dim, keepdim=True)
     w_max = x.amax(dim=dim, keepdim=True)
@@ -460,17 +489,19 @@ def zca_newton_schulz(G, epsilon=1e-5, steps=5, power_iters=10):
     
     return torch.matmul(G, W)
 
+@torch.compile(backend='inductor', mode='max-autotune')
 def wfunny(model, wemas):
     for i, p in enumerate(model.parameters()):
         if p.requires_grad:
             #if p.dim() > 0:
-            p.data  = funnyMulti(wemas[i],p.data)
+            p.data.copy_(funnyMulti(wemas[i],p.data))
 
+@torch.compile(backend='inductor', mode='max-autotune')
 def wunfunny(model, wemas):
     for i, p in enumerate(model.parameters()):
         if p.requires_grad:
             #if p.dim() > 0:
-            p.data  = unfunnyMulti(p.data, wemas[i])
+            p.data.copy_(unfunnyMulti(p.data, wemas[i]))
 
 def snormstep(p, alpha):
     return (p.data - mmnorm(p.data,dim=[-1,-2])) * alpha 
@@ -490,11 +521,15 @@ def softwnorm(model, alpha = 1e-5):
                 p.data.sub_(pstep)
 
 
-def wwhite(model):
+@torch.compile(backend='inductor', mode='max-autotune')
+def wwhite(model, alpha= 1e-5):
     for p in model.parameters():
         if p.requires_grad:
             with torch.no_grad():
-                p.data.sub_(p.data-zca_newton_schulz(p.data), alpha = 1e-5)
+                if p.ndim < 2:
+                    continue
+                pstep = p.data-zca_newton_schulz(p.data)
+                p.data.sub_(pstep * alpha)
 
 def justnorm(x, idim=-1):
     dtype = x.dtype
@@ -505,39 +540,27 @@ def justnorm(x, idim=-1):
 def orthogonalize_gradients(grad, params):
     w = params.view(-1)
     g = grad.view(-1)
+
     w_norm_sq = torch.dot(w, w) + 1e-30
     proj = torch.dot(w, g) / w_norm_sq
+
     g_orth = g - proj * w
+
     g_norm = g.norm(2)
     g_orth_norm = g_orth.norm(2) + 1e-30
     g_orth_scaled = g_orth * (g_norm / g_orth_norm)
+
     return g_orth_scaled.view_as(grad)
 
 @torch.compile(backend='inductor', mode='max-autotune')
 def fft_gauss(grad,center=0.5,sigma=0.5):
     gk = gaussian_kernel(grad, center, sigma)
     if(grad.ndim>=2):
-        adjusted_grad = torch.fft.fft2(grad) 
-        return torch.fft.ifft2(gk*adjusted_grad).real
+        adjusted_grad = torch.fft.rfft2(grad) 
+        return torch.fft.irfft2(gk*adjusted_grad).real
     else:
-        adjusted_grad = torch.fft.fft(grad) 
-        return torch.fft.ifft(gk*adjusted_grad).real
-
-@torch.compile(backend='inductor', mode='max-autotune')
-def fftnorm(grad,center=0.5,sigma=0.5, dim=None):
-    if(grad.ndim>=2):
-        adjusted_grad = torch.fft.fft2(grad,dim=dim) 
-        #bump width centered on 0 (phase), width of sigma 0.1
-        gk = gaussian_kernel(adjusted_grad.real, center, sigma, dim = dim)
-        adjusted_grad = torch.complex(gk*(adjusted_grad.real),gk*(adjusted_grad.imag))
-        return torch.fft.ifft2(adjusted_grad,dim=dim).real
-    else:
-        adjusted_grad = torch.fft.fft(grad,dim=dim) 
-        #bump width centered on 0 (phase), width of sigma 0.1
-        gk = gaussian_kernel(adjusted_grad.real, center, sigma)
-        #print(gk)
-        adjusted_grad = torch.complex(gk*(adjusted_grad.real),gk*(adjusted_grad.imag))
-        return torch.fft.ifft(adjusted_grad).real
+        adjusted_grad = torch.fft.rfft(grad) 
+        return torch.fft.irfft(gk*adjusted_grad).real
 
 @torch.compile(backend='inductor', mode='max-autotune')
 def fft_bmean_csquish_add(x, x2):
@@ -552,19 +575,6 @@ def fft_bmean_csquish_add(x, x2):
     
     return torch.fft.ifft(xc,dim=-1).real
 
-
-#def fft_bmean_csquish_add(x, x2):
-#    b,t,c = x.size()
-#    halfft2 = torch.fft.fft(x2,dim=-1)
-#    halfft = torch.fft.fft(x,dim=-1)
-#    xc = halfft
-#    if((x2 != 0).any()):
-#        xc += halfft2
-#        xc /= 2
-#    xc = torch.complex(xc.real[:,:,c//4:-c//4],xc.imag[:,:,c//4:-c//4])
-#    
-#    return torch.fft.ifft(xc,dim=-1).real
-
 def fft_bmean_tsquish_add(x, x2):
     b,t,c = x.size()
     halfft2 = torch.fft.fft(x2,dim=1)
@@ -576,7 +586,20 @@ def fft_bmean_tsquish_add(x, x2):
         xc /= 2
     
     return torch.fft.ifft(xc,dim=1).real
+def topological_adjacency_loss(x: torch.Tensor):
+    xroll = torch.roll(x,1,dims=-1)
+    return F.mse_loss(x, xroll)
 
+def float_xor_inductor_friendly(x, y):
+    large_x = torch.abs(x) > 1
+    large_y = torch.abs(y) > 1
+
+    result = torch.where(~large_x & large_y, -y, x)
+
+    signs_differ = torch.sign(x) != torch.sign(y)
+    result = torch.where(large_x & large_y & signs_differ, torch.tanh(1.0-abs(result)), torch.sign(result) + torch.tanh(result))
+    
+    return result
 @torch.compile(backend='inductor', mode='max-autotune')
 def calculate_linear_chaos_loss(logits: torch.tensor, balance_lambda= 0.1 , target_chaos= 0.1 ) -> float:
     logits = logits.float()
@@ -610,6 +633,7 @@ def dissonance_curve(ratio):
     x = torch.abs(ratio - 1.0)
     diss = torch.exp(-ALPHA * x) - torch.exp(-BETA * x)
     return F.relu(diss)
+
 def pairwise_dissonance_from_partials(frequencies, amplitudes):
     """A helper to compute dissonance given a refined list of partials."""
     num_partials = frequencies.shape[-1]

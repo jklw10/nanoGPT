@@ -371,7 +371,78 @@ class Softmaxless_attention(nn.Module):
         return y
 
 
+class FourierFilterBank(nn.Module):
+    """
+    A learnable filter bank that can project a signal onto a set of
+    learnable sine/cosine basis functions (encode) and reconstruct a signal
+    from those coefficients (decode).
 
+    Args:
+        op_dim (int): The dimension of the signal to be processed.
+        num_filters (int): The number of learnable frequency filters.
+    """
+    def __init__(self, op_dim: int, num_filters: int):
+        super().__init__()
+        self.op_dim = op_dim
+        self.num_filters = num_filters
+
+        self.frequencies = nn.Parameter(torch.linspace(1, op_dim // 2, num_filters))
+        
+        t = torch.linspace(0, 1, op_dim, device=self.frequencies.device)
+        self.register_buffer("t", t)
+
+    def _get_bases(self):
+        """Helper function to generate the sine and cosine basis vectors."""
+        freqs = self.frequencies.unsqueeze(1)
+        t_view = self.t.unsqueeze(0)
+        arg = 2 * math.pi * freqs * t_view
+        return torch.sin(arg), torch.cos(arg) # [num_filters, op_dim]
+
+    def ndfft(self, x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        """
+        Analyzes a signal, projecting it onto the learnable frequency bases.
+        Input: Tensor of shape [..., op_dim, ...]
+        Output: Tensor of shape [..., num_filters * 2, ...]
+        """
+        x_permuted = x.transpose(dim, -1)
+        original_shape = x_permuted.shape
+        x_flattened = x_permuted.reshape(-1, self.op_dim)
+        
+        sin_basis, cos_basis = self._get_bases()
+        c_sin = torch.einsum('ns,fs->nf', x_flattened, sin_basis)
+        c_cos = torch.einsum('ns,fs->nf', x_flattened, cos_basis)
+        features = torch.cat([c_sin, c_cos], dim=-1)
+        
+        output_shape = original_shape[:-1] + (self.num_filters * 2,)
+        output = features.view(output_shape)
+        return output
+
+    def indfft(self, features: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        """
+        Synthesizes a signal from a set of Fourier coefficients.
+        Input: Tensor of shape [..., num_filters * 2, ...]
+        Output: Tensor of shape [..., op_dim, ...]
+        """
+        features_permuted = features.transpose(dim, -1)
+        original_shape = features_permuted.shape
+        features_flattened = features_permuted.reshape(-1, self.num_filters * 2)
+
+        c_sin, c_cos = torch.chunk(features_flattened, 2, dim=-1) # [N, num_filters]
+        
+        sin_basis, cos_basis = self._get_bases() # [num_filters, op_dim]
+        
+        sin_recon = torch.einsum('nf,fs->ns', c_sin, sin_basis)
+        cos_recon = torch.einsum('nf,fs->ns', c_cos, cos_basis)
+        
+        x_reconstructed = sin_recon + cos_recon
+        
+        output_shape = original_shape[:-1] + (self.op_dim,)
+        output = x_reconstructed.view(output_shape)
+        return output
+
+    def forward(self, x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        """By default, the forward pass is the encoding step."""
+        return self.ndfft(x, dim=dim)
 class Patcher(nn.Module):
     def __init__(self, config):
         super().__init__()
