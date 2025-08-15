@@ -236,7 +236,7 @@ if block_size < model.config.block_size:
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
 
-force_gc = False
+force_gc            = False
 #switches
 best                = False
 
@@ -249,9 +249,10 @@ wnorm_enabled       = False
 gdiff_enabled       = False
 grokfast            = False
 sign_enabled        = False
-
+seqbatch            = False
 #??
-gradorth            = True
+gradorth            = False
+gwrot               = False
 wwhite_enabled      = False
 
 gsphere             = False
@@ -266,23 +267,23 @@ gnorm               = False #or best
 gzca_enabled        = False #or best
 swnorm_enabled      = False or best
 
-
 muon                = False
-#for fftmem owt: 1e-5
-#for fftmem skspr: 5e-5
-#swna                = 1.0e-5
-#swwa                = 1.0e-5
+#for fftmem owt: 1e-5 #beta2 dependent
+#for fftmem skspr: 5e-5 #beta2 dependent
+#no clue why this way of passing is needed here but not for the bools. love python
+config["swna"]      = 1e-4 if dataset == "openwebtext" else 1
+config["swwa"]      = 1.0e-5 if dataset == "openwebtext" else 1e-4
 zcastep             = 2 #2, 5
 szcapow             = 2 #2, 10
 
-ghook = gdiff_enabled or ndiff_enabled or gnorm or dfw_enabled or grokfast or gfft or gzca_enabled or sign_enabled or gsphere or ggauss or gchaos or gradorth or muon
+ghook = gwrot or gdiff_enabled or ndiff_enabled or gnorm or dfw_enabled or grokfast or gfft or gzca_enabled or sign_enabled or gsphere or ggauss or gchaos or gradorth or muon
 
-decay = False
+decay               = False
 decaying = 1.0
 
-eigenInit = False
+eigenInit           = False
 
-lrfinder = False
+lrfinder            = False
 
 
 
@@ -300,7 +301,7 @@ if(ghook):
     for i, p in enumerate(model.parameters()):
         if p.requires_grad:
             wema = None if wemas is None else wemas[i]
-            gema = 0.0 if gemas is None else gemas[i]
+            gema = None if gemas is None else gemas[i]
             
             p.register_hook(lambda grad, p=p, gema=gema, wema=wema: custom_gradient_adjustment(grad, p, gema=gema, wema=wema))
 
@@ -311,8 +312,14 @@ def custom_gradient_adjustment(grad, param, wema = None, gema = None):
         return
     input_size = grad.size(0)
     adjusted_grad = torch.where(torch.isnan(grad), torch.zeros_like(grad), grad)
-    
-    
+    device = grad.device
+    d2 = not (adjusted_grad.ndim < 2)
+    if(gradorth and d2):
+        adjusted_grad = utils.orthogonalize_gradients(adjusted_grad,param)
+    if gwrot:
+        rgrad = utils.rotate_gradient(adjusted_grad,param)
+        alpha = 0.1
+        adjusted_grad = (1 - alpha) * grad + alpha * rgrad
     if(gchaos):
         adjusted_grad += torch.rand_like(adjusted_grad)*1e-3
     if(gnorm): 
@@ -322,17 +329,17 @@ def custom_gradient_adjustment(grad, param, wema = None, gema = None):
         adjusted_grad = ((adjusted_grad - grad_avg) / grad_range)  * (2 - 2 / input_size) 
     if(gchaos):
         adjusted_grad += torch.rand_like(adjusted_grad)*1e-3
-    d2 = not (adjusted_grad.ndim < 2)
     if(gsphere and d2): 
         adjusted_grad = adjusted_grad / adjusted_grad.norm() # * (2 - 2 / input_size) 
+    
+    center = torch.tensor(0.5,device=device)
+    width = torch.tensor(3,device=device)
     if(gfft):
-        adjusted_grad = utils.rfft_trunc_squish(adjusted_grad)
+        adjusted_grad = utils.fft_gauss(adjusted_grad,center,width)
     if(sign_enabled):
         adjusted_grad = torch.sign(torch.round(adjusted_grad)) 
     if(gzca_enabled and d2):
         adjusted_grad = utils.zca_newton_schulz(adjusted_grad, zcastep, szcapow)
-    if(gradorth and d2):
-        adjusted_grad = utils.orthogonalize_gradients(adjusted_grad,param)
     if(ndiff_enabled):
         w_range = torch.abs(p.max() - p.min() + 1e-10)
         w_avg = param.nanmean()
@@ -368,10 +375,9 @@ def custom_gradient_adjustment(grad, param, wema = None, gema = None):
         gema += 0.9999 * (adjusted_grad - gema)
         adjusted_grad += gema * 2
         adjusted_grad /= 3
-    if(ggauss):
-        gema += 0.1
-
-        gk = utils.gaussian_kernel(adjusted_grad,torch.sin(gema),3)
+    if(ggauss and d2):
+        #gema += 0.1
+        gk = utils.gaussian_kernel_batched(adjusted_grad, center, width)
         adjusted_grad = gk * adjusted_grad
     return adjusted_grad 
 
@@ -464,7 +470,7 @@ if(force_gc):
     gc.collect()
     torch.cuda.empty_cache()
 
-def model_step(iter_num, tl, best_val_loss):
+def model_step(iter_num, tl, best_val_loss, config):
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     
@@ -510,10 +516,10 @@ def model_step(iter_num, tl, best_val_loss):
         if(force_gc):
             torch.cuda.empty_cache()
     if iter_num == 0 and eval_only:
-        return 0, False
+        return 0, False, best_val_loss
     
     
-    X, Y = get_batch('train',True)
+    X, Y = get_batch('train',seqbatch)
     def closure():
         torch.compiler.cudagraph_mark_step_begin()
         logits, loss = model(X, Y)
@@ -551,7 +557,7 @@ def model_step(iter_num, tl, best_val_loss):
         if isinstance(mod, optim.OptimizedLinear):
             mod.poststep()
 
-    optimizer.zero_grad(set_to_none=True)
+    #optimizer.zero_grad(set_to_none=True)
 
     with torch.no_grad():
         
@@ -563,19 +569,20 @@ def model_step(iter_num, tl, best_val_loss):
             if(decay_wa):
                 swna = lrgpu/20.0
             else:
-                swna = 1e-5
+                swna = config["swna"]
             utils.softwnorm(model, swna)
         if(wwhite_enabled):
             if(decay_wa):
                 swwa = lrgpu/20.0
             else:
-                swwa = 1e-5
+                swwa = config["swwa"]
             utils.wwhite(model, swwa)
         if(dfw_enabled):
             utils.wfunny(model, wemas)  
         
         model.resetsink()
 
+    optimizer.zero_grad(set_to_none=True)
     if iter_num > max_iters:
         return 0, False, best_val_loss
     return iter_num + 1, True, best_val_loss
@@ -584,7 +591,7 @@ tl = time.time()
 while run:
     if iter_num % eval_interval == 3:
         tl= time.time()
-    iter_num, run, best_val_loss = model_step(iter_num, tl, best_val_loss)
+    iter_num, run, best_val_loss = model_step(iter_num, tl, best_val_loss, config)
 torch.save(checkpoint, os.path.join(out_dir, 'fckpt.pt'))
 
 if ddp:

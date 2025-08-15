@@ -33,7 +33,9 @@ ssmax           = True
 mtp             = False
 #ungraded
 fftmem          = False
-mmnorm          = False
+mmnorm          = True
+#good in owt
+qnorm           = False
 #good in shkspr
 mix_squish      = False
 mem_mix_squish  = False #or fftmem
@@ -56,7 +58,7 @@ midchaos        = False
 
 topoloss        = False
 acebtl          = False
-acl1            = False
+acl1            = False # unimplemented
 
 auxmod          = acl1 or acebtl #or topoloss
 
@@ -81,7 +83,8 @@ class LayerNorm(nn.Module):
         #if(tests):
         #    return input
         if(mmnorm):
-            return torch.tanh(input*self.weight)
+            return torch.tanh(input)*self.weight.norm(p=2,keepdim=True)
+           # return utils.acwrap(input*self.weight, torch.tanh, self.bias)
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
 class LearnableFourierResampler(nn.Module):
@@ -159,6 +162,7 @@ class LearnableFourierResampler(nn.Module):
         output = output.transpose(dim, -1)
         
         return output
+    
 class Scanner(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -374,6 +378,8 @@ class LearnableSpiral4D(nn.Module):
             output = output.view(b,t,c*4)
         return output
 fxor = False
+
+
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -384,6 +390,7 @@ class MLP(nn.Module):
             self.gelu    = nn.GELU()
             self.c_proj  = Linear( 4*config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
+        self.rx0 = nn.Parameter(torch.zeros(4*config.n_embd))
         self.n_embd = config.n_embd
 
     def forward(self, x):
@@ -404,7 +411,14 @@ class MLP(nn.Module):
             x = x_rotated.view(b, t, 2 * self.n_embd)
             #x = utils.fft_trunc_csquish(x) #meh
         else:
+            #xn = x.norm(p=2,keepdim=True) + 1e-10
+            #print(xn)
+            #x  = F.gelu(xn - self.rx0)*x / xn
             x = self.gelu(x)
+            #x = utils.acwrap(x, F.gelu)
+            #print(x)
+            #x = self.gelu(x) + x2
+            #x =  utils.acwrap(x,F.relu)
             #relu = torch.nn.functional.leaky_relu
             #x2 = relu(x).to(torch.complex64)
             #x2 = torch.pow((x2[...,:self.n_embd*2]),(x2[...,self.n_embd*2:]))
@@ -615,8 +629,16 @@ class GPT(nn.Module):
                         )
         if topoloss:
             self.ucl = UncertaintyWeightedLoss(3)  
-        if mix_squish:
-            self.fcomp = LearnableFourierResampler(config.n_embd,config.n_embd//2,config.n_embd//2)
+        #if mix_squish:
+        self.fcomp = LearnableFourierResampler(config.n_embd,config.n_embd//2,config.n_embd//4)
+        self.decomp = torch.nn.Sequential(
+                            torch.nn.Linear(config.n_embd//2,config.n_embd),
+                            torch.nn.GELU(),
+                            torch.nn.Linear(config.n_embd,config.n_embd*2 ),
+                            torch.nn.GELU(),
+                            torch.nn.Linear(config.n_embd*2,config.n_embd ),
+
+                        )
         #self.wnl = wnormlearnloss(config.n_embd*4)
         self.gradsink = nn.Parameter(torch.randn(config.n_embd))
         self.predict_weight = 0.01
@@ -688,27 +710,37 @@ class GPT(nn.Module):
             block_inputs = []
 
         #if(Qrotention):
-        x = quatnorm(x)
+        if qnorm:
+            x = quatnorm(x) #doesn't work in shakespeare char by default
         #tok_emb += self.gradsink * 1e-5
         
         if mix_squish:
             fh = self.fcomp(x,dim=-1)
         for i, block in enumerate(self.transformer.h):
-
-            if mix_squish:
-                if (i>1):# and i < self.config.n_layer-1):
+            #if (i==1):
+            #    fs = torch.fft.rfft(x, self.config.n_embd-2)
+            #    x = torch.cat([fs.real, fs.imag],dim=-1)
+            if (i>1):
+                if mix_squish:
+                    # and i < self.config.n_layer-1):
                     sh = self.fcomp(x,dim=-1)
                     x = torch.stack([sh,fh],dim =-1).flatten(start_dim=-2,end_dim=-1)
             if blockin:
                 block_inputs.append(x) 
             
+            #xcomp = self.fcomp(x)
+            #xguess = self.decomp(xcomp)
+            #dcloss = F.mse_loss(x,xguess,reduction="none")#.mean(dim=2)
+            #x = x + x * F.tanh(dcloss)
             x = block(x) 
-        #noise = torch.randn_like(x)
-        #nguess = self.denoiser(x+noise)
-        #dnloss = F.mse_loss(nguess,noise)
-        #x = x - self.denoiser(x)
+
         if acebtl:
             x, acl = self.acebtl(x, tok_emb)
+        
+        #xcomp = self.fcomp(x)
+        #xguess = self.decomp(xcomp)
+        #dcloss = F.mse_loss(x,xguess,reduction="none")#.mean(dim=2)
+        #x = x + x * F.tanh(dcloss)#* F.sigmoid(1/dcloss)#.unsqueeze(-1)
         #noise = torch.randn_like(x)
         #nguess = self.denoiser(x+noise)
         #dnloss = F.mse_loss(nguess,noise,reduction="none").mean(dim=2)

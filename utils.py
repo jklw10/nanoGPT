@@ -191,6 +191,13 @@ def parallel_quaternion_scan_log_n(q_in: torch.Tensor) -> torch.Tensor:
     return final_result
 
 @torch.compile(backend='inductor', mode='max-autotune')
+def quatnorm(x):
+    b,t,c = x.size()
+    x = x.view(b, t, c//4, 4)
+    x = x /  torch.norm(x, p=2, dim=-1, keepdim=True)
+    return x.view(b, t, c)
+
+@torch.compile(backend='inductor', mode='max-autotune')
 def pscan(x_in: torch.Tensor, func: nn.Module, ident: torch.Tensor) -> torch.Tensor:
     original_shape = x_in.shape
     B, T, C = original_shape
@@ -503,8 +510,8 @@ def wunfunny(model, wemas):
             #if p.dim() > 0:
             p.data.copy_(unfunnyMulti(p.data, wemas[i]))
 
-def snormstep(p, alpha):
-    return (p.data - mmnorm(p.data,dim=[-1,-2])) * alpha 
+def snormstep(p, alpha, dim):
+    return (p.data - mmnorm(p.data,dim=dim)) * alpha 
 
 @torch.compile(backend='inductor', mode='max-autotune')
 def softwnorm(model, alpha = 1e-5):
@@ -513,13 +520,22 @@ def softwnorm(model, alpha = 1e-5):
             with torch.no_grad():
                 if p.ndim >= 2:
                     a = alpha
+                    dim = [-1,-2]
                 else:
-                    continue
-                    a = 0 #alpha / 20
+                    a = alpha * 1e-5
+                    dim = [-1]
 
-                pstep = snormstep(p, a) 
+                pstep = snormstep(p, a, dim) 
+                #pstep = (p.data - (p.data / p.data.norm(p=2,dim=dim,keepdim=True)))*a
                 p.data.sub_(pstep)
 
+
+@torch.compile(backend='inductor', mode='max-autotune')
+def acwrap(x, ac, z0 = None):
+    if(z0 is None):
+        z0=0.0
+    xn = x.norm(p=2,keepdim=True)+1e-10
+    return ac(xn-z0)*x/xn
 
 @torch.compile(backend='inductor', mode='max-autotune')
 def wwhite(model, alpha= 1e-5):
@@ -536,6 +552,7 @@ def justnorm(x, idim=-1):
     x = x.float()
     res = (x / x.norm(p=2, dim=idim, keepdim=True)).to(dtype=dtype) 
     return res
+
 @torch.compile(backend='inductor', mode='max-autotune')
 def orthogonalize_gradients(grad, params):
     w = params.view(-1)
@@ -553,14 +570,63 @@ def orthogonalize_gradients(grad, params):
     return g_orth_scaled.view_as(grad)
 
 @torch.compile(backend='inductor', mode='max-autotune')
+def rotate_gradient(grad, params):
+    
+    original_shape = grad.shape
+    device = grad.device
+    dtype = grad.dtype
+    
+    g_flat = grad.view(-1)
+    p_flat = params.view(-1)
+    
+    n_elements = g_flat.shape[0]
+    remainder = n_elements % 4
+    if remainder != 0:
+        pad_size = 4 - remainder
+        g_flat = F.pad(g_flat, (0, pad_size))
+        p_flat = F.pad(p_flat, (0, pad_size))
+        n_elements = g_flat.shape[0]
+        
+    g_groups = g_flat.view(-1, 4) # Shape: [num_groups, 4]
+    p_groups = p_flat.view(-1, 4) # Shape: [num_groups, 4]
+    
+    target_indices = torch.argmin(p_groups, dim=1) # Shape: [num_groups]
+    
+    v_target_groups = F.one_hot(target_indices, num_classes=4).to(dtype) # Shape: [num_groups, 4]
+    
+    v_source_groups = g_groups
+
+    v_source_u = F.normalize(v_source_groups, p=2, dim=1)
+    
+    u = v_source_u - v_target_groups # Shape: [num_groups, 4]
+    
+    u_dot_source = torch.sum(u * v_source_groups, dim=1, keepdim=True) # Shape: [num_groups, 1]
+    u_dot_u = torch.sum(u * u, dim=1, keepdim=True) # Shape: [num_groups, 1]
+    
+    u_dot_u.clamp_(min=1e-30)
+
+    scale = 2 * u_dot_source / u_dot_u # Shape: [num_groups, 1]
+    
+    rotated_groups = v_source_groups - scale * u # Shape: [num_groups, 4]
+
+    rotated_flat = rotated_groups.view(-1)
+    
+    if remainder != 0:
+        rotated_flat = rotated_flat[:-pad_size]
+
+    return rotated_flat.view(original_shape)
+
+@torch.compile(backend='inductor', mode='max-autotune')
 def fft_gauss(grad,center=0.5,sigma=0.5):
-    gk = gaussian_kernel(grad, center, sigma)
+    original_shape = grad.shape
     if(grad.ndim>=2):
         adjusted_grad = torch.fft.rfft2(grad) 
-        return torch.fft.irfft2(gk*adjusted_grad).real
+        gk = gaussian_kernel_batched(adjusted_grad, center, sigma)
+        return torch.fft.irfft2(gk*adjusted_grad,s=original_shape[-2:]).real
     else:
         adjusted_grad = torch.fft.rfft(grad) 
-        return torch.fft.irfft(gk*adjusted_grad).real
+        gk = gaussian_kernel_batched(adjusted_grad, center, sigma)
+        return torch.fft.irfft(gk*adjusted_grad,n=original_shape[-1]).real
 
 @torch.compile(backend='inductor', mode='max-autotune')
 def fft_bmean_csquish_add(x, x2):
@@ -796,14 +862,14 @@ def fft_trunc_csquish(x, target_dim = None, band = "low"):
     return o 
     
 @torch.compile(backend='inductor', mode='max-autotune')
-def gaussian_kernel(grad, center_offset: float, sigma = 3.0, dim=None) -> torch.Tensor:
+def gaussian_kernel(grad, center_offset: torch.Tensor, sigma = 3.0, dim=None) -> torch.Tensor:
     size = grad.size(dim)
     device= grad.device
     dtype= grad.dtype
     
     # Calculate total elements and validate input
     
-    num_elements = torch.prod(torch.tensor(grad.size(dim)))
+    num_elements = size
     #num_elements = grad.numel
     # Generate position indices
     indices = torch.arange(num_elements, dtype=dtype, device=device)
@@ -822,7 +888,7 @@ def gaussian_kernel_batched(activation_tensor: torch.Tensor,
                               center_offset: torch.Tensor, 
                               sigma: torch.Tensor) -> torch.Tensor:
     
-    b, t, features = activation_tensor.shape
+    features = activation_tensor.shape[-1]
     device = activation_tensor.device
     dtype = activation_tensor.dtype
 
