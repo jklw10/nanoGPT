@@ -50,7 +50,7 @@ class Scanner(nn.Module):
         z = torch.cat((y, x), dim=-1)
         z=self.sampler(z)
         
-        z = utils.mmnorm(z)
+        z = utils.range_norm(z)
         return z
 
 class SSMBlock(nn.Module):
@@ -155,8 +155,8 @@ class Block(nn.Module):
     def spl(self, x):
         predicted_output = self(-x, causal = False)
         sploss = F.mse_loss(
-            utils.mmnorm(predicted_output.flatten()),
-            utils.mmnorm(self.block_input.flatten())
+            utils.range_norm(predicted_output.flatten()),
+            utils.range_norm(self.block_input.flatten())
         ) 
         return sploss
     

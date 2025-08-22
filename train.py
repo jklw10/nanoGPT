@@ -251,6 +251,7 @@ grokfast            = False
 sign_enabled        = False
 seqbatch            = False
 #??
+wscrnorm            = False 
 gradorth            = False
 gwrot               = False
 wwhite_enabled      = False
@@ -271,7 +272,7 @@ muon                = False
 #for fftmem owt: 1e-5 #beta2 dependent
 #for fftmem skspr: 5e-5 #beta2 dependent
 #no clue why this way of passing is needed here but not for the bools. love python
-config["swna"]      = 1e-4 if dataset == "openwebtext" else 1
+config["swna"]      = 1e-4 if dataset == "openwebtext" else 1e-4
 config["swwa"]      = 1.0e-5 if dataset == "openwebtext" else 1e-4
 zcastep             = 2 #2, 5
 szcapow             = 2 #2, 10
@@ -470,6 +471,7 @@ if(force_gc):
     gc.collect()
     torch.cuda.empty_cache()
 
+#@torch.compile(backend='inductor', mode='max-autotune')
 def model_step(iter_num, tl, best_val_loss, config):
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
@@ -558,24 +560,22 @@ def model_step(iter_num, tl, best_val_loss, config):
             mod.poststep()
 
     #optimizer.zero_grad(set_to_none=True)
-
     with torch.no_grad():
         
-        if(decay_wa):
-            lrgpu = torch.tensor(lr,device='cuda') 
-        if(lrfinder):
+        if decay_wa:
+            lrgpu = torch.tensor(lr, device='cuda') 
+        if lrfinder:
             lr = 1
-        if(swnorm_enabled):
-            if(decay_wa):
-                swna = lrgpu/20.0
-            else:
-                swna = config["swna"]
+        if wscrnorm:
+            wscrna = lrgpu/20.0 if decay_wa else config["swna"]
+            utils.wscrnorm(model, wscrna)
+
+        if swnorm_enabled:
+            swna = lrgpu/20.0 if decay_wa else config["swna"]
             utils.softwnorm(model, swna)
-        if(wwhite_enabled):
-            if(decay_wa):
-                swwa = lrgpu/20.0
-            else:
-                swwa = config["swwa"]
+
+        if wwhite_enabled:
+            swwa = lrgpu/20.0 if decay_wa else config["swwa"]
             utils.wwhite(model, swwa)
         if(dfw_enabled):
             utils.wfunny(model, wemas)  

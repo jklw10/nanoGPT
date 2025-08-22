@@ -51,7 +51,7 @@ def dimnumel(x: torch.tensor, dim):
             return math.prod([x.shape[d] for d in dim])
     
 @torch.compile(backend='inductor', mode='max-autotune')
-def mmnorm(x: torch.tensor, dim = -1, scale = None):  
+def range_norm(x: torch.tensor, dim = -1, scale = None):  
     if scale is None: #batchsize independent
         numel_in_dim = dimnumel(x,dim)
         scale = 1 + 2 / numel_in_dim 
@@ -60,6 +60,80 @@ def mmnorm(x: torch.tensor, dim = -1, scale = None):
     w_min = x.amin(dim=dim, keepdim=True)
     w_range = torch.abs(w_max - w_min + 1e-10)
     return ((x - w_avg) / w_range) * scale
+
+@torch.compile(backend='inductor', mode='max-autotune')
+def apply_on_dim(x: torch.Tensor, func, dim, keepdim=True, **kwargs):
+    if isinstance(dim, int):
+        dims_to_reduce = (dim,)
+    else:
+        dims_to_reduce = tuple(dim)
+    
+    actual_dims = tuple(d % x.dim() for d in dims_to_reduce)
+
+    all_dims = list(range(x.dim()))
+    kept_dims = [d for d in all_dims if d not in actual_dims]
+    
+    x_reordered = x.permute(*kept_dims, *actual_dims)
+    
+    kept_shape = [x.shape[d] for d in kept_dims]
+    x_flattened = x_reordered.reshape(*kept_shape, -1)
+
+    result_flat = func(x_flattened, dim=-1, **kwargs)
+
+    if not keepdim:
+        return result_flat
+
+    broadcast_shape = list(x.shape)
+    for d in actual_dims:
+        broadcast_shape[d] = 1
+    
+    result_flat_kept = func(x_flattened, dim=-1, keepdim=keepdim, **kwargs)
+
+    return result_flat_kept.reshape(broadcast_shape)
+
+@torch.compile(backend='inductor', mode='max-autotune')
+def soft_range_clip_norm(x: torch.tensor, dim = -1, perc = 0.01, scale = None):  
+    if scale is None: #batchsize independent
+        numel_in_dim = dimnumel(x,dim)
+        scale = 1 + 2 / numel_in_dim 
+    #xr = x.reshape(B, -1)
+    #val_lower = torch.quantile(xr, perc, interpolation="lower",  dim=1, keepdim=True).reshape(B,1,1)
+    #val_upper = torch.quantile(xr, perc, interpolation="higher", dim=1, keepdim=True).reshape(B,1,1)
+    
+    val_lower = apply_on_dim(x, torch.quantile, dim, keepdim=True, q=perc, interpolation="lower")
+    val_upper = apply_on_dim(x, torch.quantile, dim, keepdim=True, q=1-perc, interpolation="higher")
+    x_clipped = torch.clamp(x, min=val_lower, max=val_upper)
+    x_softclip = x_clipped + F.tanh(x-x_clipped)
+    
+    w_avg = x_softclip.mean(dim=dim, keepdim=True)
+    w_max = x_softclip.amax(dim=dim, keepdim=True)
+    w_min = x_softclip.amin(dim=dim, keepdim=True)
+    w_range = torch.abs(w_max - w_min + 1e-10)
+    return ((x_softclip - w_avg) / w_range) * scale
+
+@torch.compile(backend='inductor', mode='max-autotune')
+def minmaxnorm(x, dim = -1):
+    xmin = x.amin(dim=dim, keepdim=True)
+    xmax = x.amax(dim=dim, keepdim=True) 
+    return (x - xmin) / ( xmax - xmin)
+
+
+@torch.compile(backend='inductor', mode='max-autotune')
+def softclipnorm(x: torch.tensor, dim = -1, perc = 0.01):
+    B, T, D = x.shape
+    xr = x.reshape(B, -1)
+    val_lower = torch.quantile(xr, perc, interpolation="lower",  dim=1, keepdim=True).reshape(B,1,1)
+    val_upper = torch.quantile(xr, perc, interpolation="higher", dim=1, keepdim=True).reshape(B,1,1)
+
+    x_clipped = torch.clamp(x, min=val_lower, max=val_upper)
+    x_softclip = x_clipped + F.tanh(x-x_clipped)
+    
+    x_min_robust = x_softclip.amin(dim=dim, keepdim=True)
+    x_max_robust = x_softclip.amax(dim=dim, keepdim=True)
+    x_range_robust = x_max_robust - x_min_robust + 1e-10
+
+    # Detach the scaling factors to not affect their own gradients
+    return (x_softclip - x_min_robust) / x_range_robust
 
 def fast_sin_leakyrelu(x):
      base = F.leaky_relu(x)
@@ -511,7 +585,7 @@ def wunfunny(model, wemas):
             p.data.copy_(unfunnyMulti(p.data, wemas[i]))
 
 def snormstep(p, alpha, dim):
-    return (p.data - mmnorm(p.data,dim=dim)) * alpha 
+    return (p.data - range_norm(p.data,dim=dim)) * alpha 
 
 @torch.compile(backend='inductor', mode='max-autotune')
 def softwnorm(model, alpha = 1e-5):
@@ -529,6 +603,22 @@ def softwnorm(model, alpha = 1e-5):
                 #pstep = (p.data - (p.data / p.data.norm(p=2,dim=dim,keepdim=True)))*a
                 p.data.sub_(pstep)
 
+
+@torch.compile(backend='inductor', mode='max-autotune')
+def wscrnorm(model, alpha = 1e-5):
+    for i, p in enumerate(model.parameters()):
+        if p.requires_grad:
+            with torch.no_grad():
+                if p.ndim >= 2:
+                    a = alpha
+                    dim = [-1,-2]
+                else:
+                    a = alpha * 1e-5
+                    dim = [-1]
+
+                pstep = (p.data - soft_range_clip_norm(p.data, dim=dim)) * a 
+                #pstep = (p.data - (p.data / p.data.norm(p=2,dim=dim,keepdim=True)))*a
+                p.data.sub_(pstep)
 
 @torch.compile(backend='inductor', mode='max-autotune')
 def acwrap(x, ac, z0 = None):

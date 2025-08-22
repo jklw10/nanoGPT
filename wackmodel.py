@@ -443,6 +443,7 @@ class FourierFilterBank(nn.Module):
     def forward(self, x: torch.Tensor, dim: int = -1) -> torch.Tensor:
         """By default, the forward pass is the encoding step."""
         return self.ndfft(x, dim=dim)
+    
 class Patcher(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -633,7 +634,7 @@ class eBlock(nn.Module):
     def forward(self, x):
         x = x + self.attn(x)
         x = x + self.mlp(x)
-        x = utils.mmnorm(x)
+        x = utils.range_norm(x)
         return x
 class CausalSelfAttention(nn.Module):
     

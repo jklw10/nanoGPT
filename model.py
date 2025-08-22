@@ -32,8 +32,9 @@ diffSplits      = 1
 ssmax           = True
 mtp             = False
 #ungraded
-fftmem          = False
-mmnorm          = True
+fftmem          = True
+mmnorm          = False
+normless        = False
 #good in owt
 qnorm           = False
 #good in shkspr
@@ -56,19 +57,18 @@ Qrotention      = False
 symloss         = False
 midchaos        = False
 
+specl           = False
 topoloss        = False
 acebtl          = False
 acl1            = False # unimplemented
 
+nmix            = False
+losspred        = False
+
 auxmod          = acl1 or acebtl #or topoloss
 
-blockin         = spl or symloss or midchaos or topoloss
+blockin         = spl or symloss or midchaos or topoloss or specl
 
-def quatnorm(x):
-    b,t,c = x.size()
-    x = x.view(b, t, c//4, 4)
-    x = x /  torch.norm(x, p=2, dim=-1, keepdim=True)
-    return x.view(b, t, c)
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -82,10 +82,63 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         #if(tests):
         #    return input
+        if(normless):
+            return input
         if(mmnorm):
-            return torch.tanh(input)*self.weight.norm(p=2,keepdim=True)
+            return utils.soft_range_clip_norm(input, dim=-1, scale=self.weight) 
+            #return torch.tanh(input)*self.weight.norm(p=2,keepdim=True)
            # return utils.acwrap(input*self.weight, torch.tanh, self.bias)
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+
+
+class PrecomputedFourierResampler(nn.Module):
+    def __init__(self, input_dim: int, output_dim: int, num_filters: int):
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.num_filters = num_filters
+
+        frequencies = torch.linspace(1, input_dim // 2, num_filters)
+        self.register_buffer("frequencies", frequencies)
+        t_in = torch.linspace(0, 1, input_dim)
+        t_out = torch.linspace(0, 1, output_dim)
+        freqs = self.frequencies.unsqueeze(1)
+        arg_in = 2 * math.pi * freqs * t_in.unsqueeze(0)
+        self.register_buffer("sin_basis_in", torch.sin(arg_in))
+        self.register_buffer("cos_basis_in", torch.cos(arg_in))
+        arg_out = 2 * math.pi * freqs * t_out.unsqueeze(0)
+        self.register_buffer("sin_basis_out", torch.sin(arg_out))
+        self.register_buffer("cos_basis_out", torch.cos(arg_out))
+
+    def forward(self, x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+     
+        if x.shape[dim] != self.input_dim:
+            raise ValueError(
+                f"Input tensor dimension {dim} has size {x.shape[dim]}, "
+                f"but module was initialized with input_dim {self.input_dim}."
+            )
+
+        x_permuted = x.transpose(dim, -1)
+        original_shape = x_permuted.shape
+        x_flattened = x_permuted.reshape(-1, self.input_dim)
+
+        # the Fourier coefficients (the compressed representation).
+        c_sin = torch.einsum('ns,fs->nf', x_flattened, self.sin_basis_in)
+        c_cos = torch.einsum('ns,fs->nf', x_flattened, self.cos_basis_in)
+
+        # precomputed SYNTHESIS bases using the calculated coefficients.
+        sin_recon = torch.einsum('nf,fs->ns', c_sin, self.sin_basis_out)
+        cos_recon = torch.einsum('nf,fs->ns', c_cos, self.cos_basis_out)
+
+        x_reconstructed = sin_recon + cos_recon
+
+        output_shape = original_shape[:-1] + (self.output_dim,)
+        output = x_reconstructed.view(output_shape)
+        output = output.transpose(dim, -1).contiguous()
+
+        return output
+
+nlfft = True
 
 class LearnableFourierResampler(nn.Module):
     def __init__(self, input_dim: int, output_dim: int, num_filters: int):
@@ -159,66 +212,30 @@ class LearnableFourierResampler(nn.Module):
         output = x_reconstructed.view(output_shape)
         
         # Put the processed dimension back where it was.
-        output = output.transpose(dim, -1)
+        output = output.transpose(dim, -1).contiguous()
         
         return output
     
 class Scanner(nn.Module):
     def __init__(self, config):
         super().__init__()
-        #self.ln = nn.LayerNorm(config.n_embd * 2)
-        #self.linear_1 = nn.Linear(config.n_embd * 2, config.n_embd )
         self.d = config.n_embd
-        self.sampler = LearnableFourierResampler(config.n_embd * 2, config.n_embd, 64)
-        #self.act = nn.GELU()
-        #self.linear_2 = nn.Linear(config.n_embd * 4, config.n_embd)
-        #self.lin = nn.Linear(config.n_embd, config.n_embd)
+        self.sampler = PrecomputedFourierResampler(config.n_embd * 2, config.n_embd, 64)
 
     def forward(self, x: torch.Tensor, y: torch.Tensor):
         z = torch.cat((y, x), dim=-1)
-        #z = self.ln(z)
-        #z = self.linear_1(z)
-        #z = self.act(z)
-        #z = self.linear_2(z)
-        #z = self.act2(z)
-        #z = z / z.norm("fro",dim=-1,keepdim=True)
-        #z = torch.fft.fft(z.to(torch.float32),self.d*2, dim =-1)
-        #z = self.linear_1(z.real)
         z=self.sampler(z)
-        #xc = torch.complex(self.linear_1(z.real).to(torch.float32), self.linear_1(z.imag).to(torch.float32))
-        #z = torch.fft.ifft(xc.to(torch.float32),self.d, dim =-1).to(torch.bfloat16)
-
-        #z = utils.rfft_trunc_squish(z.to(torch.float32),x.shape[-1]).to(torch.bfloat16)
-        #z = self.lin(z)
-        #z = self.act(z)
-        #z = x*y#
-        z = utils.mmnorm(z)
+        z = utils.range_norm(z)
         return z
-#class Scanner(nn.Module):
-#    def __init__(self, config):
-#        super().__init__()
-#        self.scanner = nn.Sequential(
-#                nn.LayerNorm(config.n_embd * 2), #untested
-#                Linear(config.n_embd*2, config.n_embd*4),
-#                nn.GELU(),
-#                Linear(config.n_embd*4, config.n_embd)
-#            )
-#    def forward(self, x: torch.tensor, y: torch.tensor):
-#        return self.scanner( torch.cat((x,y),dim=-1))
 
 class QrotAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        #self.c_attn3 =  Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         self.c_attn2 =  Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)
         
-        #self.q_heads = Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)#doesn't scale well :/ maybe a different down projection.
-        #self.v_head =  Linear(config.n_embd,  config.n_embd, bias=config.bias)
-        
-        self.c_proj = Linear(config.n_embd,  config.n_embd, bias=config.bias) #todo
+        self.c_proj = Linear(config.n_embd,  config.n_embd, bias=config.bias)
 
-        #self.c_kattn = Linear(config.n_embd,  config.n_embd, bias=config.bias)
         self.scanner = Scanner(config)
         self.identity = nn.Parameter(torch.rand(config.n_embd))
         
@@ -232,61 +249,17 @@ class QrotAttention(nn.Module):
         self.win = config.block_size // config.n_layer
      
 
-    def forward(self, x: torch.tensor, mem=None,causal=True, k=None): #same signature to allow easy swapping.
+    def forward(self, x: torch.tensor): #same signature to allow easy swapping.
         B, T, C = x.size() 
-        #q, q2,  v = self.c_attn3(x).split(self.n_embd, dim=2)
         q,   v = self.c_attn2(x).split(self.n_embd, dim=2)
-        #v = self.v_head(x)
-        #q = self.q_heads(x)
-        #q = torch.cat((q,q2),dim=-1)
         QC = q.shape[2]
         
-        #q2 = q2.view(B, T, QC//4, 4)
-        #q = q.view(B, T, QC//4, 4)
-        #v = v.view(B, T, C//4, 4)
         q = q.view(B, T, QC)
         v = v.view(B, T, C)
 
-        #split, window T//n_layer, fft mix
-        #q = utils.maprotgate(q)
-        #q2 = utils.maprotgate(q)
-        #q2 = utils.scan_quaternion_multiply_window(q, self.win)
-        #q2 = self.c_kattn(q2.view(B, T, -1)).view(B, T, QC//4, 4)
-        #q = utils.fft_trunc_csquish(torch.cat((q,q2),dim=-2).view(B, T, -1).to(torch.float32), C).to(x.dtype).view(B, T, C//4, 4) #win premap
+        q = utils.pscan(q, self.scanner, self.identity)
         
-        #q2 = utils.maprotgate(q2)#winmul
-        #s = torch.sigmoid(q[..., 0].view(B, T, QC//4, 1))
-        #rot = q[..., 1:]
-        #q = utils.exponential_map(rot*s) 
-        #HQC = QC//2
-        
-        #q = utils.quaternion_multiply(q, q2)#winmul
-        
-        #q = utils.fft_trunc_csquish(torch.cat((q,q2),dim=-2).view(B, T, -1).to(torch.float32), C).to(x.dtype).view(B, T, C//4, 4)#winmix
-        #gates2 = utils.maprotgate(q[...,HQC:,:])
-        #q = utils.parallel_quaternion_scan_log_n(q)
-        #q = utils.fft_trunc_csquish(q.view(B, T, -1).to(torch.float32), C).to(x.dtype).view(B, T, C//4, 4)
-        #q = utils.fft_trunc_csquish(q.view(B, T, -1).to(torch.float32), C).to(x.dtype).view(B, T, C)
-        q = utils.pscan(q, self.scanner, self.identity)#.view(B, T, C//4, 4)
-        #q2 = utils.pscan(q2, self.scanner, self.identity)
-        
-        #q = utils.fft_trunc_csquish(q.view(B, T, -1).to(torch.float32), C).to(x.dtype).view(B, T, C)
-        #q = self.scanner(q,q2)
-        #q= q*q2
-        #q = utils.fft_trunc_csquish(torch.cat((q,q2),dim=-1).view(B, T, -1).to(torch.float32), C).to(x.dtype).view(B, T, C)
-        #q = utils.quaternion_multiply(gatescan, utils.parallel_quaternion_scan_log_n(gates2))
-        #q = self.q_proj(q.view(B, T, -1)).view(B, T, C//4, 4)
-        #q = self.attn_dropout(q)
-        #q = utils.fft_trunc_csquish(q.view(B, T, -1).to(torch.float32), C).to(x.dtype).view(B, T, C//4, 4)
-        #q = utils.quaternion_multiply(q[...,:C//4,:], q[...,C//4:,:])
-        #Y =  utils.quaternion_multiply(q, v)
-        #Y = self.scanner(q,v) #utils.quaternion_multiply(q, v)
-        
-        #Y = utils.fft_trunc_csquish(torch.cat((q,q2,v),dim=-1).to(torch.float32), C).to(x.dtype)
-        #q = utils.fft_trunc_csquish(torch.cat((q,q2),dim=-1).to(torch.float32), C, "low").to(x.dtype)
-        #Y = utils.fft_trunc_csquish(torch.cat((q,v),dim=-1).to(torch.float32), C, "low").to(x.dtype)
-        Y = q*v #utils.quaternion_multiply(q, v)
-        #Y = Y / torch.norm(Y, p=2, dim=-1, keepdim=True)
+        Y = q*v 
         Y = Y.view(B, T, -1)
         Y = self.c_proj(Y)
         Y = self.resid_dropout(Y)
@@ -323,33 +296,43 @@ class MemAttention(nn.Module):
             mask[t, self.mem_len + t + 1:] = float('-inf')
         self.register_buffer("attn_mask", mask)
 
-    def forward(self, x, mem=None,causal=True):
+    def forward(self, x, causal=True):
         B, T, C = x.size() 
-        
-        if mem is None:
-            q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-            q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-            k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-            v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
 
-            y = torch.nn.functional.scaled_dot_product_attention(q*(math.log(T)*self.qm),k,  v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal= causal)
+        y = torch.nn.functional.scaled_dot_product_attention(q*(math.log(T)*self.qm),k,  v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal= causal)
 
-            y = y.transpose(1, 2).contiguous().view(B, T, self.n_head * self.head_dim) 
-            y = self.resid_dropout(self.c_proj(y))
-
-            return y
-        
-        q, k, v = self.c_attn(torch.cat((mem,x),dim=1)).split(self.n_embd, dim=2)
-        q = q.view(B, T+self.mem_len, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-        k = k.view(B, T+self.mem_len, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T+self.mem_len, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-
-        y.to(torch.int64)
-        y = torch.nn.functional.scaled_dot_product_attention(q*(math.log(T)*self.qm), k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal= causal)
-        y = y.transpose(1, 2).contiguous().view(B, T+self.mem_len, self.n_head * self.head_dim) 
+        y = y.transpose(1, 2).contiguous().view(B, T, self.n_head * self.head_dim) 
         y = self.resid_dropout(self.c_proj(y))
 
-        return y[:,self.mem_len:,:]
+        return y
+    
+        #if mem is None:
+        #    q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        #    q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        #    k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        #    v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+#
+        #    y = torch.nn.functional.scaled_dot_product_attention(q*(math.log(T)*self.qm),k,  v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal= causal)
+#
+        #    y = y.transpose(1, 2).contiguous().view(B, T, self.n_head * self.head_dim) 
+        #    y = self.resid_dropout(self.c_proj(y))
+#
+        #    return y
+        #
+        #q, k, v = self.c_attn(torch.cat((mem,x),dim=1)).split(self.n_embd, dim=2)
+        #q = q.view(B, T+self.mem_len, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        #k = k.view(B, T+self.mem_len, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        #v = v.view(B, T+self.mem_len, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+#
+        #y = torch.nn.functional.scaled_dot_product_attention(q*(math.log(T+self.mem_len)*self.qm), k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal= causal)
+        #y = y.transpose(1, 2).contiguous().view(B, T+self.mem_len, self.n_head * self.head_dim) 
+        #y = self.resid_dropout(self.c_proj(y))
+#
+        #return y#[:,self.mem_len:,:].contiguous(), y[:,:self.mem_len,:].contiguous()
 
 
 class LearnableSpiral4D(nn.Module):
@@ -377,56 +360,46 @@ class LearnableSpiral4D(nn.Module):
         if x.shape[-1] != 1:
             output = output.view(b,t,c*4)
         return output
-fxor = False
 
 
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        if(qrot or fxor):
-            self.c_proj  = Linear( 2*config.n_embd, config.n_embd, bias=config.bias)
+        up = 4
+        self.c_fc    = Linear(config.n_embd, up * config.n_embd, bias=config.bias)
+        self.c_fc2    = Linear(config.n_embd, up * config.n_embd, bias=config.bias)
+        if(qrot):
+            self.c_proj  = Linear( 2 * config.n_embd, config.n_embd, bias=config.bias)
         else:
             self.gelu    = nn.GELU()
-            self.c_proj  = Linear( 4*config.n_embd, config.n_embd, bias=config.bias)
+            self.c_proj  = Linear( up * config.n_embd, config.n_embd, bias=config.bias)
+            self.c_proj2  = Linear( up * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
-        self.rx0 = nn.Parameter(torch.zeros(4*config.n_embd))
+        self.rx0 = nn.Parameter(torch.zeros(up * config.n_embd))
         self.n_embd = config.n_embd
 
     def forward(self, x):
         x = self.c_fc(x)
-        dt = x.dtype
-        if(fxor):
-            x,y = x.chunk(2, dim=-1)
-            x = utils.float_xor_inductor_friendly(x,y)
-        elif(qrot):
-            b,t,n=x.shape
-            x4d = x.view(b, t, self.n_embd, 4) # Reshape to (batch, seq_len, n_embd, 4)
-            x_norm = torch.clamp_min(x4d.norm(dim=-1, keepdim=True), 1e-10) # Calculate norm along the last dimension (dim=3 or -1), keep dimensions
-            x_normalized = x4d / x_norm             # Divide to normalize
-            rotors, rotated = x_normalized.chunk(2, dim=2) # Split along n_embd dimension
-            #xm,ym = x_norm.chunk(2, dim=2)
-            x_rotated = utils.quaternion_multiply(rotors, rotated) 
-            #x_rotated = x_rotated*self.gaprelu(x_norm-2)#*torch.sigmoid(xm+ym)#
-            x = x_rotated.view(b, t, 2 * self.n_embd)
-            #x = utils.fft_trunc_csquish(x) #meh
+        #x2 = self.c_fc2(x)
+        if(qrot):
+            x = self.qrot(x)
         else:
-            #xn = x.norm(p=2,keepdim=True) + 1e-10
-            #print(xn)
-            #x  = F.gelu(xn - self.rx0)*x / xn
             x = self.gelu(x)
-            #x = utils.acwrap(x, F.gelu)
-            #print(x)
-            #x = self.gelu(x) + x2
-            #x =  utils.acwrap(x,F.relu)
-            #relu = torch.nn.functional.leaky_relu
-            #x2 = relu(x).to(torch.complex64)
-            #x2 = torch.pow((x2[...,:self.n_embd*2]),(x2[...,self.n_embd*2:]))
-            ##x2 = x2[...,:self.n_embd*2]*x2[...,self.n_embd*2:]
-            #x = torch.cat((x2.real,x2.imag),dim=-1).to(dt)
         x = self.c_proj(x)
+        #x2 = self.c_proj2(x)
         x = self.dropout(x)
         return x
+
+    def qrot(self, x):
+        b,t,n=x.shape
+        x4d = x.view(b, t, self.n_embd, 4) # Reshape to (batch, seq_len, n_embd, 4)
+        x_norm = torch.clamp_min(x4d.norm(dim=-1, keepdim=True), 1e-10) # Calculate norm along the last dimension (dim=3 or -1), keep dimensions
+        x_normalized = x4d / x_norm             # Divide to normalize
+        rotors, rotated = x_normalized.chunk(2, dim=2) # Split along n_embd dimension
+            #xm,ym = x_norm.chunk(2, dim=2)
+        x_rotated = utils.quaternion_multiply(rotors, rotated) 
+            #x_rotated = x_rotated*self.gaprelu(x_norm-2)#*torch.sigmoid(xm+ym)#
+        return x_rotated.view(b, t, 2 * self.n_embd)
 
 
 class MemBlock(nn.Module):
@@ -439,28 +412,26 @@ class MemBlock(nn.Module):
             self.attn = MemAttention(config)
         self.ln_2 = LayerNorm(config)
         self.mlp = MLP(config)
+        self.register_buffer("block_input",torch.zeros([config.block_size, config.n_embd]))
+        if fftmem:
+            self.register_buffer("mem_input",torch.zeros([config.block_size, config.n_embd]))
 
-    def forward(self, x, mem = None, causal = True, k =None):
-        if(Qrotention):
-            x = x + self.attn(self.ln_1(x),mem,causal,k)
-        else:
-            x = x + self.attn(self.ln_1(x),mem,causal)
+    def forward(self, x,  causal = True):
+        self.block_input = x
+        x = x + self.attn(self.ln_1(x),causal)
         x = x + self.mlp(self.ln_2(x))
         return x
 
-    def spl(self, block_input, x, memory = None, k = None):
-        b, t, e = x.size()
-        target_output = block_input #store in block?
-        if memory is not None:
-            predicted_output = self(-x, -self.memory.expand(b, self.config.mem_block_size, self.config.n_embd), causal = False)
-        elif k is not None:
-            predicted_output = self(-x, k = k, causal = False)
-        else:
-            predicted_output = self(-x, causal = False)
-            
+    def spl(self, x, mem = None):
+        if mem is not None:
+            x = torch.cat([mem, x],dim=1)
+        predicted_output = self(-x, causal = False)
+        
+        if mem is not None:
+            predicted_output = predicted_output[:,mem.size(1):,:]
         sploss = F.mse_loss(
-            utils.mmnorm(predicted_output.flatten()),
-            utils.mmnorm(target_output.flatten())
+            utils.range_norm(predicted_output.flatten()),
+            utils.range_norm(self.block_input.flatten())
         ) 
         return sploss
     
@@ -469,14 +440,18 @@ class Dreamer(nn.Module):
         super().__init__()
         self.config = config
         self.block = MemBlock(config)
+        self.comp = LearnableFourierResampler(config.mem_block_size * 2, config.mem_block_size, 64)
         
     def forward(self, x):
         while x.shape[0] > 1:
             b, t, c = x.size()
             x = x.reshape(b // 2, 2, t, c)
-            x = x.permute(0, 2, 1, 3).reshape(b // 2, t * 2, c)
+            x = x.reshape(b // 2, t * 2, c).contiguous()
             #x = x.view(b//2, 2*t, c)
-            x = utils.fft_trunc_tsquish(x)
+            x = x.transpose(1,2)
+            x = self.comp(x)
+            #x = utils.rfft_trunc_squish(x, target_dim= t, dim=1) # ?,t,c
+            x = x.transpose(1,2)
             x = self.block(x, causal = CausalMem)
 
         return x
@@ -495,7 +470,7 @@ class GPTConfig:
     internal_block_size: int = 30
     device='cuda'
     optimizer: str = 'adam'
-    mem_block_size: int = 8
+    mem_block_size: int = 32
     batch_size = 64
     step = 0
 
@@ -572,13 +547,17 @@ class GPT(nn.Module):
             self.register_buffer('gmask', utils.gaussian_kernel(torch.ones(self.config.n_embd)))
         if(fftmem ):
             if(mem_mix_squish):
-                self.register_buffer('memory', torch.zeros(1,config.internal_block_size,config.n_embd//2))
+                self.register_buffer('memory', torch.zeros(1, config.internal_block_size, config.n_embd//2))
             else:
-                self.register_buffer('memory', torch.zeros(1,config.mem_block_size,config.n_embd))
+                self.register_buffer('memory', torch.randn(1, config.mem_block_size, config.n_embd))
             if(config.dropout > 0.0):
                 config.dropout = config.dropout / 4
             self.dreamer = Dreamer(config)
             self.memory_selector = MemBlock(config)
+            
+            self.mem_comp = LearnableFourierResampler(config.mem_block_size, config.mem_block_size//2, 32)
+
+
         self.surprise = 1
         if(convemb):
             self.convemb = wackmodel.Patcher(config)
@@ -630,13 +609,24 @@ class GPT(nn.Module):
         if topoloss:
             self.ucl = UncertaintyWeightedLoss(3)  
         #if mix_squish:
-        self.fcomp = LearnableFourierResampler(config.n_embd,config.n_embd//2,config.n_embd//4)
+        self.c_comp = LearnableFourierResampler(config.n_embd,config.n_embd//2,config.n_embd//4)
+        
         self.decomp = torch.nn.Sequential(
                             torch.nn.Linear(config.n_embd//2,config.n_embd),
                             torch.nn.GELU(),
                             torch.nn.Linear(config.n_embd,config.n_embd*2 ),
                             torch.nn.GELU(),
                             torch.nn.Linear(config.n_embd*2,config.n_embd ),
+
+                        )
+        if(losspred):
+            self.lpb = MemBlock(config) 
+            self.botl = torch.nn.Sequential(
+                            torch.nn.Linear(config.n_embd,config.n_embd//2),
+                            torch.nn.GELU(),
+                            torch.nn.Linear(config.n_embd//2,config.n_embd//8 ),
+                            torch.nn.GELU(),
+                            torch.nn.Linear(config.n_embd//8, 1),
 
                         )
         #self.wnl = wnormlearnloss(config.n_embd*4)
@@ -671,30 +661,20 @@ class GPT(nn.Module):
         #patch_max=torch.as_tensor(self.patch_max, device=device, dtype=torch.long)
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         
-        if convemb:
-            x, patchtargets, pploss= self.convemb(idx)
-            pb, pt, pe = x.size()
-            
-            pos = torch.arange(0, pt, dtype=torch.long, device=device)
-            pos_emb = self.transformer.wpe(pos)
-            x = x + pos_emb
-        else:
-            pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-            tok_emb = self.transformer.wte(idx)
-            pos_emb = self.transformer.wpe(pos) # position embeddings of shape (b, t, n_embd)
-            if qope:
-                pos_emb = pos_emb.view(1, t, self.config.n_embd//4, 4)
-                tok_emb = tok_emb.view(b, t, self.config.n_embd//4, 4)
-                g1 = torch.sigmoid(pos_emb[...,0].view(1, t, self.config.n_embd//4, 1))
-                g2 = torch.sigmoid(tok_emb[...,0].view(b, t, self.config.n_embd//4, 1))
-                pos_emb = utils.exponential_map(pos_emb[...,1:]*g1*g2)
-
-                #pos_emb = utils.maprotgate(pos_emb.view(1, t, self.config.n_embd//4, 4))
-                x = utils.quaternion_multiply(tok_emb, pos_emb) 
-                x = x.view(b,t,self.config.n_embd)
-                #x = self.qoper(tok_emb,pos_emb.expand(b,t,self.config.n_embd),False,False)
-            else:
-                x = tok_emb + pos_emb
+        
+        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (b, t, n_embd)
+        x = tok_emb + pos_emb
+        if qope:
+            pos_emb = pos_emb.view(1, t, self.config.n_embd//4, 4)
+            tok_emb = tok_emb.view(b, t, self.config.n_embd//4, 4)
+            g1 = torch.sigmoid(pos_emb[...,0].view(1, t, self.config.n_embd//4, 1))
+            g2 = torch.sigmoid(tok_emb[...,0].view(b, t, self.config.n_embd//4, 1))
+            pos_emb = utils.exponential_map(pos_emb[...,1:]*g1*g2)
+            x = utils.quaternion_multiply(tok_emb, pos_emb) 
+            x = x.view(b,t,self.config.n_embd)
+        
         x = self.transformer.drop(x)
 
         if mtp:
@@ -711,11 +691,11 @@ class GPT(nn.Module):
 
         #if(Qrotention):
         if qnorm:
-            x = quatnorm(x) #doesn't work in shakespeare char by default
+            x = utils.quatnorm(x) #doesn't work in shakespeare char by default
         #tok_emb += self.gradsink * 1e-5
         
         if mix_squish:
-            fh = self.fcomp(x,dim=-1)
+            fh = self.c_comp(x,dim=-1)
         for i, block in enumerate(self.transformer.h):
             #if (i==1):
             #    fs = torch.fft.rfft(x, self.config.n_embd-2)
@@ -723,11 +703,17 @@ class GPT(nn.Module):
             if (i>1):
                 if mix_squish:
                     # and i < self.config.n_layer-1):
-                    sh = self.fcomp(x,dim=-1)
+                    sh = self.c_comp(x,dim=-1)
                     x = torch.stack([sh,fh],dim =-1).flatten(start_dim=-2,end_dim=-1)
             if blockin:
                 block_inputs.append(x) 
             
+            if nmix:
+                # and i < self.config.n_layer-1):
+                sh = self.c_comp(x,dim=-1)
+                fh = torch.randn_like(sh)
+                x = torch.cat([sh,fh],dim=-1)
+
             #xcomp = self.fcomp(x)
             #xguess = self.decomp(xcomp)
             #dcloss = F.mse_loss(x,xguess,reduction="none")#.mean(dim=2)
@@ -752,24 +738,15 @@ class GPT(nn.Module):
             reduction= 'none'
             if(not self.training):
                 reduction = 'mean'
-            #    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='mean')
-            #else:
-            #    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none').view(b,t)
-           
-            loss = linear_cross_entropy(x.to(torch.bfloat16), self.lm_head.weight.to(torch.bfloat16), targets, impl='torch_compile', reduction=reduction)
-            #loss = loss+dnloss
             
-            #loss = F.cross_entropy(logits, targets, ignore_index=-1, reduction=reduction) 
-            #loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=reduction).view(b,t)
+            loss = linear_cross_entropy(x.to(torch.bfloat16), self.lm_head.weight.to(torch.bfloat16), targets, impl='torch_compile', reduction=reduction)
+            
             #TODO: wavelet loss
-            if(convemb):
-                loss = self.convemb.loss(logits, patchtargets, pploss)
 
             if self.training:
-                
-                #loss = loss + utils.compute_criticality_loss(self)
 
-
+                if losspred:
+                    loss = (loss + F.mse_loss(self.botl(self.lpb(x)).squeeze(-1), loss.detach()))/2.0
 
                 if auxmod:
                     if topoloss:
@@ -778,7 +755,7 @@ class GPT(nn.Module):
                         loss = loss+acl     
                     
                 if midchaos:
-                    loss = loss + torch.nn.functional.mse_loss(utils.mmnorm(block_inputs[2], dim=[-1,-2]), utils.zca_newton_schulz(block_inputs[2].view(-1, self.config.n_embd)).view(b, t, self.config.n_embd))*1e-2
+                    loss = loss + torch.nn.functional.mse_loss(utils.range_norm(block_inputs[2], dim=[-1,-2]), utils.zca_newton_schulz(block_inputs[2].view(-1, self.config.n_embd)).view(b, t, self.config.n_embd))*1e-2
 
                 if symloss:
                     for i in block_inputs:
@@ -788,7 +765,7 @@ class GPT(nn.Module):
                         #loss = loss + lcloss#utils.calculate_linear_chaos_loss(i, balance_lambda=0.1,target_chaos=0.5)
                         #loss = loss + 0.001 * torch.nn.functional.mse_loss(torch.abs(torch.fft.fft(i)),torch.softmax(torch.abs(torch.fft.fft(i)), -1))
                 if spl:
-                    loss = loss + self.self_prediction_loss(block_inputs,x) #* self.predict_weight #* 0.001
+                    loss = loss + self.self_prediction_loss(x) #* self.predict_weight #* 0.001
                 
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
@@ -910,7 +887,7 @@ class GPT(nn.Module):
         return logits, loss
     
     def mem_mix_fwd(self, targets, x):
-        b, t, e = x.size()
+        b, t, c = x.size()
         block_inputs = []
 
         if(self.training):
@@ -918,7 +895,7 @@ class GPT(nn.Module):
             fh = self.memory.expand(b,t,self.config.n_embd//2)
             for i, block in enumerate(self.transformer.h):
                 if(self.config.mix_mask[i]):
-                    sh = utils.fft_trunc_csquish(xswish)
+                    sh = utils.rfft_trunc_squish(xswish, target_dim= c//2,dim=-1)
                     xswish = torch.stack([fh,sh],dim =-1).flatten(start_dim=-2,end_dim=-1)
                 xswish = block(xswish)
             first_mem = self.mix_mem_form(xswish,fh)
@@ -932,7 +909,7 @@ class GPT(nn.Module):
             x = block(x) 
 
             if(self.config.mix_mask[i]):
-                sh = utils.fft_trunc_csquish(x)
+                sh = utils.rfft_trunc_squish(xswish, target_dim= c//2,dim=-1)
                 x = torch.stack([sh,fh],dim =-1).flatten(start_dim=-2,end_dim=-1)
             
         updated_mem = None
@@ -948,8 +925,8 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1) 
             
             if(self.training):
-                loss = loss + self.self_prediction_loss(x,block_inputs) 
-                loss = loss + self.blockspl(self.memory_selector, self.memory)
+                loss = loss + self.self_prediction_loss(x) 
+                loss = loss + self.memory_selector.spl(self.memory, x)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
@@ -957,46 +934,48 @@ class GPT(nn.Module):
         return logits, loss
     
     def mem_fwd(self, targets, x):
-        b, t, e = x.size()
-        
-        block_inputs = []
+        b, t, c = x.size()
+        malpha= 0.1#todo
 
+        mit = self.memory.expand(b,self.config.mem_block_size,self.config.n_embd)
+        
         if(self.training):
             xswish = torch.cat([x[b//2:,:,],x[:b//2,:,:]],dim=0)
-            for block in self.transformer.h:
-                xswish = block(xswish, self.memory.expand(b,self.config.mem_block_size,self.config.n_embd))
-            mh1 = self.mem_form(xswish[b//2:,:,:], self.memory).expand(b//2,self.config.mem_block_size,self.config.n_embd)
-            mh2 = self.mem_form(xswish[:b//2,:,:], self.memory).expand(b//2,self.config.mem_block_size,self.config.n_embd)
-            first_mem = torch.cat([mh1,mh2],dim =0) #disallow cheating as much as possible
-        else:
-            first_mem = self.memory.expand(b,self.config.mem_block_size,self.config.n_embd)
-        
-        if(mix_squish):
-            fh = utils.fft_trunc_csquish(x)
-
-        for i, block in enumerate(self.transformer.h):
             
-            block_inputs.append(x) 
-            x = block(x,first_mem)
-            if(mix_squish):
-                if(self.config.mix_mask[i]):
-                    sh = utils.fft_trunc_csquish(x)
-                    x = torch.stack([sh,fh],dim =-1).flatten(start_dim=-2,end_dim=-1)
+            xswish = torch.cat((mit,xswish),dim=1)
+            for block in self.transformer.h:
+                xswish = block(xswish)
+            mit = xswish[:,:self.config.mem_block_size,:]
+            xswish = xswish[:,self.config.mem_block_size:,:]
+            mh1 = utils.range_norm(self.memory +self.mem_form(xswish[b//2:,:,:], mit)*malpha+self.memory, dim=[-1,-2]).expand(b//2, self.config.mem_block_size, self.config.n_embd)
+            mh2 = utils.range_norm(self.memory +self.mem_form(xswish[:b//2,:,:], mit)*malpha+self.memory, dim=[-1,-2]).expand(b//2, self.config.mem_block_size, self.config.n_embd)
+            mit = torch.cat([mh1,mh2],dim =0) #disallow cheating as much as possible
+        
+        x = torch.cat((mit,x),dim=1)
+        for i, block in enumerate(self.transformer.h):
+            x = block(x)
+        mit = x[:,:self.config.mem_block_size,:]
+        x   = x[:,self.config.mem_block_size:,:]
             
         updated_mem = None
         if self.training and not self.memory_frozen :
-            updated_mem = self.mem_form(x, first_mem)
+            updated_mem = self.mem_form(x, mit)
             with torch.no_grad():
-                self.memory.copy_(updated_mem)
+                #pass
+                #self.memory.add_(updated_mem)
+                self.memory = utils.range_norm(self.memory+updated_mem*malpha, dim=[-1,-2])
 
         x = self.transformer.ln_f(x)
         if targets is not None:
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1) 
+            #loss = linear_cross_entropy(x.to(torch.bfloat16), self.lm_head.weight.to(torch.bfloat16), targets, impl='torch_compile')
             
             if(self.training):
-                loss = loss + self.self_prediction_loss(block_inputs, x, self.memory) 
-                loss = loss + self.blockspl(self.memory_selector, first_mem[::b//2,:,:], self.memory.expand(2,-1,-1), x)
+                #pass
+                loss = loss + self.self_prediction_loss(x) #*0.001
+                um = utils.range_norm(self.memory+updated_mem*malpha, dim=[-1,-2]).expand(b,self.config.mem_block_size,c)
+                loss = loss + self.memory_selector.spl(um) #*0.001
                 
                 
         else:
@@ -1038,11 +1017,10 @@ class GPT(nn.Module):
             return firstLogit, loss
     
     
-    def self_prediction_loss(self, block_inputs, x, memory = None, k =None):
-        b, t, e = x.size()
+    def self_prediction_loss(self,  x ):
         loss = 0
         for i, block in enumerate(self.transformer.h):
-            loss = loss + block.spl( block_inputs[i], x, memory, k) 
+            loss = loss + block.spl(x) 
         return loss
     
     
@@ -1055,13 +1033,22 @@ class GPT(nn.Module):
 
     def mem_form(self, x, memory):
         #currently assumes mem size and block size are the same
-        b, t, e = x.size()
-        squishmem       = utils.fft_trunc_tsquish(memory).expand(b, self.config.mem_block_size//2, self.config.n_embd) #(b, m//2,c)
+        b, t, c = x.size()
+        mb, mt, mc = memory.size()
+        #squishmem       = utils.rfft_trunc_squish(memory, target_dim= mt//2,dim=1).expand(b, self.config.mem_block_size//2, self.config.n_embd) #(b, m//2,c)
+        
+        #squishmem = self.mem_comp(memory.transpose(1,2).contiguous()).transpose(1,2)
+        #squishmem = squishmem.expand(b, self.config.mem_block_size//2, self.config.n_embd)
+        
         selectedMemory  = self.memory_selector(x, causal = False)[:,:self.config.mem_block_size,:] #(b, m, c)
-        selectedMemory  = utils.fft_trunc_tsquish(selectedMemory) #(b, m//2,c)
-        mh1             = torch.cat([selectedMemory,squishmem],dim =1)       #(b, m,c)
+        
+        #selectedMemory  = utils.rfft_trunc_squish(selectedMemory, target_dim= mt//2,dim=1) #(b, m//2,c)
+        
+        #selectedMemory  = self.mem_comp(selectedMemory.transpose(1,2)).transpose(1,2)
+        #mh1             = torch.cat([selectedMemory,squishmem],dim =1)       #(b, m,c)
+        
+        mh1             = selectedMemory
         mh1             = self.dreamer(mh1)
-
         return mh1#[:, :self.config.mem_block_size, :]
 
     
