@@ -47,7 +47,7 @@ diffembd        = False
 qope            = False
 side_squish     = False
 #slow
-spl             = False or fftmem
+spl             = False #or fftmem
 qrot            = False
 think           = False
 repeat_block    = False
@@ -549,7 +549,7 @@ class GPT(nn.Module):
             if(mem_mix_squish):
                 self.register_buffer('memory', torch.zeros(1, config.internal_block_size, config.n_embd//2))
             else:
-                self.register_buffer('memory', torch.randn(1, config.mem_block_size, config.n_embd))
+                self.register_buffer('memory', torch.zeros(1, config.mem_block_size, config.n_embd))
             if(config.dropout > 0.0):
                 config.dropout = config.dropout / 4
             self.dreamer = Dreamer(config)
@@ -935,7 +935,7 @@ class GPT(nn.Module):
     
     def mem_fwd(self, targets, x):
         b, t, c = x.size()
-        malpha= 0.1#todo
+        malpha= 1.0#todo
 
         mit = self.memory.expand(b,self.config.mem_block_size,self.config.n_embd)
         
@@ -947,8 +947,14 @@ class GPT(nn.Module):
                 xswish = block(xswish)
             mit = xswish[:,:self.config.mem_block_size,:]
             xswish = xswish[:,self.config.mem_block_size:,:]
-            mh1 = utils.range_norm(self.memory +self.mem_form(xswish[b//2:,:,:], mit)*malpha+self.memory, dim=[-1,-2]).expand(b//2, self.config.mem_block_size, self.config.n_embd)
-            mh2 = utils.range_norm(self.memory +self.mem_form(xswish[:b//2,:,:], mit)*malpha+self.memory, dim=[-1,-2]).expand(b//2, self.config.mem_block_size, self.config.n_embd)
+            xh1 = xswish[b//2:,:,:]
+            xh2 = xswish[:b//2,:,:]
+            #mh1 = utils.range_norm(self.memory + self.mem_form(xh1)*malpha, dim=[-1,-2])
+            #mh2 = utils.range_norm(self.memory + self.mem_form(xh2)*malpha, dim=[-1,-2])
+            mh1 = (self.memory + self.mem_form(xh1)*malpha)
+            mh2 = (self.memory + self.mem_form(xh2)*malpha)
+            mh1 = mh1.expand(b//2, self.config.mem_block_size, self.config.n_embd)
+            mh2 = mh2.expand(b//2, self.config.mem_block_size, self.config.n_embd)
             mit = torch.cat([mh1,mh2],dim =0) #disallow cheating as much as possible
         
         x = torch.cat((mit,x),dim=1)
@@ -959,11 +965,12 @@ class GPT(nn.Module):
             
         updated_mem = None
         if self.training and not self.memory_frozen :
-            updated_mem = self.mem_form(x, mit)
+            updated_mem = self.mem_form(x)
             with torch.no_grad():
                 #pass
                 #self.memory.add_(updated_mem)
-                self.memory = utils.range_norm(self.memory+updated_mem*malpha, dim=[-1,-2])
+                #self.memory = utils.range_norm(self.memory+updated_mem*malpha, dim=[-1,-2])
+                self.memory = (self.memory+updated_mem*malpha)
 
         x = self.transformer.ln_f(x)
         if targets is not None:
@@ -972,10 +979,10 @@ class GPT(nn.Module):
             #loss = linear_cross_entropy(x.to(torch.bfloat16), self.lm_head.weight.to(torch.bfloat16), targets, impl='torch_compile')
             
             if(self.training):
-                #pass
-                loss = loss + self.self_prediction_loss(x) #*0.001
-                um = utils.range_norm(self.memory+updated_mem*malpha, dim=[-1,-2]).expand(b,self.config.mem_block_size,c)
-                loss = loss + self.memory_selector.spl(um) #*0.001
+                if spl:
+                    loss = loss + self.self_prediction_loss(x) #*0.001
+                    um = utils.range_norm(self.memory+updated_mem*malpha, dim=[-1,-2]).expand(b,self.config.mem_block_size,c)
+                    loss = loss + self.memory_selector.spl(um) #*0.001
                 
                 
         else:
@@ -1031,10 +1038,9 @@ class GPT(nn.Module):
         updated_mem     = self.dreamer(updated_mem)
         return utils.fft_trunc_csquish(updated_mem)#(b,t,c//2)
 
-    def mem_form(self, x, memory):
+    def mem_form(self, x):
         #currently assumes mem size and block size are the same
         b, t, c = x.size()
-        mb, mt, mc = memory.size()
         #squishmem       = utils.rfft_trunc_squish(memory, target_dim= mt//2,dim=1).expand(b, self.config.mem_block_size//2, self.config.n_embd) #(b, m//2,c)
         
         #squishmem = self.mem_comp(memory.transpose(1,2).contiguous()).transpose(1,2)
