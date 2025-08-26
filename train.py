@@ -266,13 +266,13 @@ decay_wa            = False
 gfft                = False #or best
 gnorm               = False #or best
 gzca_enabled        = False #or best
-swnorm_enabled      = False or best
+swnorm_enabled      = True or best
 
 muon                = False
 #for fftmem owt: 1e-5 #beta2 dependent
 #for fftmem skspr: 5e-5 #beta2 dependent
 #no clue why this way of passing is needed here but not for the bools. love python
-config["swna"]      = 1e-4 if dataset == "openwebtext" else 1e-4
+config["swna"]      = 1e-5 if dataset == "openwebtext" else 1e-3
 config["swwa"]      = 1.0e-5 if dataset == "openwebtext" else 1e-4
 zcastep             = 2 #2, 5
 szcapow             = 2 #2, 10
@@ -470,12 +470,19 @@ scaler = None
 if(force_gc):
     gc.collect()
     torch.cuda.empty_cache()
-
+itresetage = 5000
+itreset = 20
+itunfreeze = 10
 #@torch.compile(backend='inductor', mode='max-autotune')
 def model_step(iter_num, tl, best_val_loss, config):
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     
+    #itrage = (iter_num // itresetage) % 2 
+    #if itrage == 0:
+    #    lr = get_lr(iter_num%itreset) if decay_lr else learning_rate
+    #if itrage == 1:
+    #    lr = get_lr(iter_num%itresetage) if decay_lr else learning_rate
     
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
@@ -560,8 +567,21 @@ def model_step(iter_num, tl, best_val_loss, config):
             mod.poststep()
 
     #optimizer.zero_grad(set_to_none=True)
+    #if(iter_num % 2 == 1):
+    #    model.model_freezeToggle()
+    #else:
+    #    model.memory_freezeToggle()
+    #if(iter_num > 1):
+    #    if(iter_num % itresetage == 0):
+    #        model.model_freezeToggle()
+    #if(iter_num > 1 and (iter_num // itresetage) % 2 ):
+    #    if(iter_num % itreset == 1):
+    #        #model.reinit_nonmem()
+    #        model.model_freezeToggle()
+    #    if(iter_num % itreset == itunfreeze):
+    #        model.model_freezeToggle()
+
     with torch.no_grad():
-        
         if decay_wa:
             lrgpu = torch.tensor(lr, device='cuda') 
         if lrfinder:

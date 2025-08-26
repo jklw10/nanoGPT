@@ -11,7 +11,6 @@ import math
 import inspect
 from dataclasses import dataclass
 
-from numpy import float32
 from pytorch_wavelets import DWT1DForward
 import torch
 import torch.nn as nn
@@ -470,7 +469,7 @@ class GPTConfig:
     internal_block_size: int = 30
     device='cuda'
     optimizer: str = 'adam'
-    mem_block_size: int = 32
+    mem_block_size: int = 64
     batch_size = 64
     step = 0
 
@@ -516,13 +515,14 @@ class GPT(nn.Module):
         assert config.block_size is not None
         config.internal_vocab_size = config.vocab_size * config.internal_vocab_size_multi
         
+        self.model_frozen = False 
         self.memory_frozen = False 
         self.config = config
         self.ksize = 8
         self.patch_max = 10
         self.bembwidth = config.n_embd//2
         config.internal_block_size = config.block_size
-        
+        config.mem_block_size = config.block_size #unfortunately uncoupling these proves difficult.
         blocks = nn.ModuleList([MemBlock(config) for _ in range(config.n_layer)])
         self.denoiser = MemBlock(config) 
         
@@ -549,7 +549,7 @@ class GPT(nn.Module):
             if(mem_mix_squish):
                 self.register_buffer('memory', torch.zeros(1, config.internal_block_size, config.n_embd//2))
             else:
-                self.register_buffer('memory', torch.zeros(1, config.mem_block_size, config.n_embd))
+                self.register_buffer('memory', torch.randn(1, config.mem_block_size, config.n_embd)*1e-5)
             if(config.dropout > 0.0):
                 config.dropout = config.dropout / 4
             self.dreamer = Dreamer(config)
@@ -1062,30 +1062,62 @@ class GPT(nn.Module):
         # init all weights
         self.apply(self._init_nonmem_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
-        #for pn, p in self.named_parameters():
-        #    if pn.endswith('c_proj.weight'):
-        #        torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * self.config.n_layer))
+        memory_module_names = ('memory.', 'dreamer.', 'memory_selector.', 'mem_comp.')
+        
+        for pn, p in self.named_parameters():
+            # Skip any parameter that is part of a memory module
+            if pn.startswith(memory_module_names):
+                continue
+            # Apply special init to non-memory c_proj weights
+            if pn.endswith('c_proj.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * self.config.n_layer))
 
     def _init_nonmem_weights(self, module):
-        if module is self.memory or module is self.dreamer or module is self.memory_selector:
+        if module is self.memory or module is self.dreamer or module is self.memory_selector or module is self.mem_comp:
             return
+        #if isinstance(module, Linear):
+        #    torch.nn.init.normal_(module.weight, mean=module.weight.mean(), std=(module.weight.std() + 1e-10))
+        #    if module.bias is not None:
+        #        torch.nn.init.zeros_(module.bias)
+        #elif isinstance(module, nn.Embedding):
+        #    torch.nn.init.normal_(module.weight, mean=module.weight.mean(), std=(module.weight.std() + 1e-10))
+        #elif isinstance(module, nn.Conv1d):
+        #    torch.nn.init.normal_(module.weight, mean=module.weight.mean(), std=(module.weight.std() + 1e-10))
+        #how memory is initialized normally
         if isinstance(module, Linear):
-            torch.nn.init.normal_(module.weight, mean=module.weight.mean()/2, std=(module.weight.max()-module.weight.min() + 1e-10))
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=module.weight.mean()/2, std=(module.weight.max()-module.weight.min() + 1e-10))
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
         elif isinstance(module, nn.Conv1d):
-            torch.nn.init.normal_(module.weight, mean=module.weight.mean()/2, std=(module.weight.max()-module.weight.min() + 1e-10))
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    
+    def model_freezeToggle(self):
+        self.model_frozen = not self.model_frozen
+        
+        self.apply(self.toggle_weights)      
+
+    def toggle_weights(self, module):
+        if not(module is self.memory or module is self.dreamer or module is self.memory_selector or module is self.mem_comp):
+            return
+        for param in module.parameters():
+            param.requires_grad = not self.model_frozen
+        #module.requires_grad_ = not self.model_frozen
+
+
 
     def memory_freezeToggle(self):
         self.memory_frozen = not self.memory_frozen
-        if hasattr(self, 'memory_selector') and self.memory_selector is not None:
-            for param in self.memory_selector.parameters():
-                param.requires_grad = not self.memory_frozen
-        if hasattr(self, 'dreamer') and self.dreamer is not None:
-            for param in self.dreamer.parameters():
-                param.requires_grad = not self.memory_frozen
+        #if hasattr(self, 'memory_selector') and self.memory_selector is not None:
+        #    for param in self.memory_selector.parameters():
+        #        param.requires_grad = not self.memory_frozen
+        #if hasattr(self, 'dreamer') and self.dreamer is not None:
+        #    for param in self.dreamer.parameters():
+        #        param.requires_grad = not self.memory_frozen
+        #if hasattr(self, 'mem_comp') and self.mem_comp is not None:
+        #    for param in self.mem_comp.parameters():
+        #        param.requires_grad = not self.memory_frozen
                 
     def get_patch_lengths(self, logits, end_token_idx, seq_len):
         """Returns tensor of patch lengths (batch_size,) based on first end token occurrence"""
