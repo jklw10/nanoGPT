@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import optim
-import tritonpscan
+import quantizer
 import utils
 import wackmodel
 from cut_cross_entropy import linear_cross_entropy
@@ -444,16 +444,16 @@ class Dreamer(nn.Module):
     def forward(self, x):
         while x.shape[0] > 1:
             b, t, c = x.size()
-            x = x.reshape(b // 2, 2, t, c)
-            x = x.reshape(b // 2, t * 2, c).contiguous()
+            x = x.reshape(b // 2, 2, t, c) #b//2, 2, t, c
+            x = x.reshape(b // 2, t * 2, c).contiguous() #b//2, 2 * t, c
             #x = x.view(b//2, 2*t, c)
             x = x.transpose(1,2)
             x = self.comp(x)
             #x = utils.rfft_trunc_squish(x, target_dim= t, dim=1) # ?,t,c
-            x = x.transpose(1,2)
+            x = x.transpose(1,2) # ?,t,c
             x = self.block(x, causal = CausalMem)
 
-        return x
+        return x # 1,t,c
 
 @dataclass
 class GPTConfig:
