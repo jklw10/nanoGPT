@@ -16,11 +16,10 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import optim
-import quantizer
 import utils
 import wackmodel
 from cut_cross_entropy import linear_cross_entropy
-
+import quantizer
 #todo
 #prediction machine
 #Linear = optim.OptimizedLinear
@@ -31,7 +30,8 @@ diffSplits      = 1
 ssmax           = True
 mtp             = False
 #ungraded
-fftmem          = True
+fftmem          = False
+qmem            = False
 mmnorm          = False
 normless        = False
 #good in owt
@@ -63,6 +63,8 @@ acl1            = False # unimplemented
 
 nmix            = False
 losspred        = False
+
+k_atten         = True
 
 auxmod          = acl1 or acebtl #or topoloss
 
@@ -308,31 +310,87 @@ class MemAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
 
         return y
-    
-        #if mem is None:
-        #    q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        #    q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-        #    k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-        #    v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-#
-        #    y = torch.nn.functional.scaled_dot_product_attention(q*(math.log(T)*self.qm),k,  v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal= causal)
-#
-        #    y = y.transpose(1, 2).contiguous().view(B, T, self.n_head * self.head_dim) 
-        #    y = self.resid_dropout(self.c_proj(y))
-#
-        #    return y
-        #
-        #q, k, v = self.c_attn(torch.cat((mem,x),dim=1)).split(self.n_embd, dim=2)
-        #q = q.view(B, T+self.mem_len, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-        #k = k.view(B, T+self.mem_len, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-        #v = v.view(B, T+self.mem_len, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-#
-        #y = torch.nn.functional.scaled_dot_product_attention(q*(math.log(T+self.mem_len)*self.qm), k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal= causal)
-        #y = y.transpose(1, 2).contiguous().view(B, T+self.mem_len, self.n_head * self.head_dim) 
-        #y = self.resid_dropout(self.c_proj(y))
-#
-        #return y#[:,self.mem_len:,:].contiguous(), y[:,:self.mem_len,:].contiguous()
 
+class KPredictor(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        head_dim = config.n_embd // config.n_head
+        self.net = nn.Sequential(
+            nn.Linear(head_dim, head_dim * 2),
+            nn.ReLU(),
+            nn.Linear(head_dim * 2, 1),
+            nn.Tanh()
+        )
+        self.qdim = config.block_size
+        
+        self.k_center_logit = nn.Parameter(torch.zeros(1))
+        self.k_scale_logit = nn.Parameter(torch.zeros(1))
+
+    def forward(self, q):
+        deviation = self.net(q) 
+
+        center = 1.0 + (self.qdim - 1) * torch.sigmoid(self.k_center_logit)
+        scale = (self.qdim / 2) * torch.sigmoid(self.k_scale_logit)
+        k_predicted_float = (center + deviation * scale).clamp(1.0, float(self.qdim))
+        
+        return k_predicted_float
+    
+class Kattention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        
+        self.k_predictor = KPredictor(config)
+
+    def forward(self, x, causal = False):
+        B, T, C = x.size() 
+        # 1. Calculate query, key, values for all heads in batch and move head forward
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # 2. Calculate attention scores (logits)
+        # att shape: (B, nh, T, T)
+        att_logits = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+
+        # 3. Apply causal mask
+        mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, T, T)
+        att_logits = att_logits.masked_fill(mask == 0, float('-inf'))
+
+        # 4. --- THE DYNAMIC K-SELECTION ---
+        # Predict the optimal k for each query vector
+        k_predicted = self.k_predictor(q).clamp(1,T//8) # Shape: (B, nh, T, 1)
+
+        # Apply the dynFKHot function to get a sparse mask
+        # input logits: (B, nh, T, T), input k: (B, nh, T, 1)
+        khot_mask = quantizer.dynFKHot.apply(att_logits, k_predicted)
+
+        # 5. --- MEAN POOLING AND WEIGHTING ---
+        # Normalize the mask by k to perform mean-pooling.
+        # This is the differentiable path for k.
+        #sparse_weights = khot_mask / (k_predicted + 1e-8)
+        
+        # We can optionally apply softmax to the selected values
+        # This makes it a true probability distribution over the sparse set.
+        sparse_att_logits = att_logits.masked_fill(khot_mask == 0, float('-inf'))
+        sparse_probs = F.softmax(sparse_att_logits, dim=-1)
+
+        # 6. Apply the sparse attention weights to the values
+        # Each head does this independently.
+        y = sparse_probs @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        # 7. Re-assemble all head outputs side by side
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+
+        # 8. Output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
 
 class LearnableSpiral4D(nn.Module):
     def __init__(self, init_freq=1.0, init_amp=1.0):
@@ -407,6 +465,8 @@ class MemBlock(nn.Module):
         self.ln_1 = LayerNorm(config)
         if(Qrotention):
             self.attn = QrotAttention(config)
+        elif k_atten:
+            self.attn = Kattention(config)
         else:
             self.attn = MemAttention(config)
         self.ln_2 = LayerNorm(config)
@@ -548,6 +608,25 @@ class GPT(nn.Module):
         if(fftmem ):
             if(mem_mix_squish):
                 self.register_buffer('memory', torch.zeros(1, config.internal_block_size, config.n_embd//2))
+            elif qmem:
+                self.qdim = 64
+                self.mem_quant = quantizer.NKQAE(config.n_embd, config.n_embd*2, self.qdim)
+                self.register_buffer('memory', torch.zeros(1, config.mem_block_size, dtype=torch.long))
+                self.mem_pos_selector = nn.Sequential(
+                    Linear(config.n_embd*2, config.n_embd*4, bias=False),
+                    nn.GELU(),
+                    Linear(config.n_embd*4, config.n_embd*2, bias=False),
+                    nn.GELU(),
+                    Linear(config.n_embd*2, config.mem_block_size, bias=False),
+                )
+                self.mem_pos_selector_selector = nn.Sequential(
+                    Linear(config.mem_block_size, config.mem_block_size*4, bias=False),
+                    nn.GELU(),
+                    Linear(config.mem_block_size*4, config.mem_block_size*2, bias=False),
+                    nn.GELU(),
+                    Linear(config.mem_block_size*2, config.mem_block_size, bias=False),
+                )
+
             else:
                 self.register_buffer('memory', torch.randn(1, config.mem_block_size, config.n_embd)*1e-5)
             if(config.dropout > 0.0):
@@ -556,7 +635,7 @@ class GPT(nn.Module):
             self.memory_selector = MemBlock(config)
             
             self.mem_comp = LearnableFourierResampler(config.mem_block_size, config.mem_block_size//2, 32)
-
+            
 
         self.surprise = 1
         if(convemb):
@@ -683,6 +762,8 @@ class GPT(nn.Module):
         if fftmem:
             if mem_mix_squish:
                 return self.mem_mix_fwd(targets, x)
+            elif qmem:
+                return self.mem_quant_fwd(targets, x)
             else:
                 return self.mem_fwd(targets, x)
 
@@ -775,6 +856,8 @@ class GPT(nn.Module):
         return logits, loss
 
     def acebtl(self, x, tok_emb):
+        #TODO: use autoencoder for loss target selector.
+
         if(self.auxmlpin != self.config.n_embd):
             xsquish = utils.rfft_trunc_squish(x,target_dim=self.auxmlpin)
         else:
@@ -931,6 +1014,120 @@ class GPT(nn.Module):
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
+        return logits, loss
+    
+    def mem_quant_fwd(self, targets, x):
+        b, t, c = x.size()
+
+        #mit = self.memory.expand(b,self.config.mem_block_size,self.config.n_embd)
+        kh = utils.bitfield_to_k_hot(self.memory, self.qdim).float().detach()
+        memory = self.mem_quant.dequant(kh)#.expand(b,self.config.mem_block_size,self.config.n_embd)
+        mit = memory.expand(b,self.config.mem_block_size,self.config.n_embd)
+        if(self.training):
+            xswish = torch.cat([x[b//2:,:,],x[:b//2,:,:]],dim=0)
+            
+            xswish = torch.cat((mit,xswish),dim=1)
+            for block in self.transformer.h:
+                xswish = block(xswish)
+            mit = xswish[:,:self.config.mem_block_size,:]
+            xswish = xswish[:,self.config.mem_block_size:,:]
+            #xswish = xswish[:,self.config.mem_block_size:,:]
+            xh1 = xswish[b//2:,:,:]
+            xh2 = xswish[:b//2,:,:]
+            mith1 = self.mem_form(mit[b//2:,:,:])
+            mith2 = self.mem_form(mit[:b//2,:,:])
+            mh1 = self.mem_form(xh1)
+            mh2 = self.mem_form(xh2)
+            #mh1 = utils.range_norm(self.memory + self.mem_form(xh1)*malpha, dim=[-1,-2])
+            #mh2 = utils.range_norm(self.memory + self.mem_form(xh2)*malpha, dim=[-1,-2])
+            mp1 = (self.mem_pos_selector(torch.cat((mith1,mh1),dim=-1)))
+            mp2 = (self.mem_pos_selector(torch.cat((mith2,mh2),dim=-1)))
+            
+            tally1 = torch.sum(mp1, dim=1) # Shape is now (1, 64)
+            tally2 = torch.sum(mp2, dim=1) # Shape is now (1, 64)
+
+            # 3. Use the final tally to select the top K memory slots to update.
+            # You can change k=1 to something else to allow multi-slot updates.
+            mkhot1 = quantizer.TopKHot.apply(tally1, 1) # Shape: (1, 64)
+            mkhot2 = quantizer.TopKHot.apply(tally2, 1)
+            
+            #mem = self.mem_quant.quant(memory)
+            #muh1 = self.mem_quant(mem + mith1 * mkhot1.T)
+            #muh2 = self.mem_quant(mem + mith2 * mkhot2.T)
+            
+            mum1 = mkhot1.unsqueeze(-1) # Shape: (batch/2, mem_block_size, 1)
+            muh1 = mh1 * mum1
+            muh1 = memory + muh1
+            muh1 = self.mem_quant(muh1)[0]
+
+            mum2 = mkhot2.unsqueeze(-1) # Shape: (batch/2, mem_block_size, 1)
+            
+            muh2 = mh2 * mum2
+            muh2 = memory + muh2
+            muh2 = self.mem_quant(muh2)[0]
+            
+            muh1 = muh1.expand(b//2, self.config.mem_block_size, self.config.n_embd)
+            muh2 = muh2.expand(b//2, self.config.mem_block_size, self.config.n_embd)
+            mit = torch.cat([muh1,muh2],dim =0) #disallow cheating as much as possible
+        
+        x = torch.cat((mit,x),dim=1)
+        for i, block in enumerate(self.transformer.h):
+            x = block(x)
+        mit = x[:,:self.config.mem_block_size,:]
+        x   = x[:,self.config.mem_block_size:,:]
+            
+        updated_mem = None
+        if self.training and not self.memory_frozen :
+            updated_mem = self.mem_form(x) # Shape: (1, mem_block_size, n_embd)
+
+            with torch.no_grad():
+                consolidated_mit = self.mem_form(mit)# self.dreamer(mit) # Shape: (1, mem_block_size, n_embd)
+
+                pos_logits = self.mem_pos_selector(torch.cat((updated_mem, consolidated_mit), dim=-1)) # Shape: (1, mem_block_size)
+                
+                tally1 = torch.sum(pos_logits, dim=1) # Shape is now (1, 64)
+
+                _, index_to_update = torch.topk(tally1, k=1, dim=-1) # Shape: (1, 1)
+                mkhot1 = quantizer.TopKHot.apply(tally1, 1) # Shape: (1, 64)
+                
+                mum1 = mkhot1.unsqueeze(-1) # Shape: (batch/2, mem_block_size, 1)
+                muh1 = mh1 * mum1
+                muh1 = memory + muh1
+                
+                #muh1 = self.mem_quant(muh1)[0]
+                
+                final_khot = self.mem_quant.quant(muh1)
+                
+                idx = index_to_update.squeeze()
+                final_bitfield = utils.k_hot_to_bitfield(final_khot[0, idx, :]).squeeze()
+                #torch._dynamo.graph_break() 
+                self.memory[0,idx] = final_bitfield
+                #dequantized_mem_at_index = memory[0, index_to_update.squeeze()]
+                #final_content = dequantized_mem_at_index + updated_mem.squeeze(0)
+
+                #final_khot = self.mem_quant.quant(final_content) # Shape: (1, qdim)
+
+                #final_bitfield = utils.k_hot_to_bitfield(final_khot) 
+
+                #self.memory[index_to_update.squeeze()] = final_bitfield[0]
+
+        x = self.transformer.ln_f(x)
+        if targets is not None:
+            logits = self.lm_head(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1) 
+            #loss = linear_cross_entropy(x.to(torch.bfloat16), self.lm_head.weight.to(torch.bfloat16), targets, impl='torch_compile')
+            
+            if(self.training):
+                if spl:
+                    loss = loss + self.self_prediction_loss(x) #*0.001
+                    #todo: soon:tm:
+                    #um = utils.range_norm(self.memory+updated_mem, dim=[-1,-2]).expand(b,self.config.mem_block_size,c)
+                    #loss = loss + self.memory_selector.spl(um) #*0.001
+                
+                
+        else:
+            logits = self.lm_head(x[:, [-1], :])
+            loss = None 
         return logits, loss
     
     def mem_fwd(self, targets, x):

@@ -266,7 +266,7 @@ decay_wa            = False
 gfft                = False #or best
 gnorm               = False #or best
 gzca_enabled        = False #or best
-swnorm_enabled      = True or best
+swnorm_enabled      = False or best
 
 muon                = False
 #for fftmem owt: 1e-5 #beta2 dependent

@@ -216,6 +216,7 @@ class CustomQuantizer(nn.Module):
         return CustomGradientQuantizerFunction.apply(x, self.linear.weight)
 
 
+
 # --- The NEW Hybrid Gradient Quantizer ---
 class HybridQuantizerFunction(torch.autograd.Function):
     @staticmethod
@@ -254,123 +255,6 @@ class HybridQuantizerFunction(torch.autograd.Function):
         # Must return a grad for each input (x, linear_weight, beta). Grad for beta is None.
         return grad_x, grad_linear_weight, None
 
-#class SoftTargetQuantizerFunction(torch.autograd.Function):
-#    @staticmethod
-#    def forward(ctx, x, linear_weight, k_decider):
-#        kd = F.linear(x, k_decider)
-#        _, k = torch.topk(kd, k=1, dim=-1)
-#
-#        _, indices = torch.topk(x, k=k, dim=-1)
-#        # In this model, the forward pass is a hard k-hot lookup
-#        k_hot = torch.zeros_like(x).scatter_(-1, indices, 1.0)
-#        
-#        ctx.save_for_backward(x, linear_weight, k_decider, k_hot, kd)
-#        ctx.k = k
-#
-#        # The output is still the sum of the k chosen vectors
-#        output = F.linear(k_hot, linear_weight)
-#        return output
-#
-#    @staticmethod
-#    def backward(ctx, g):
-#        x, linear_weight, k_decider, k_hot_from_fwd, kd = ctx.saved_tensors
-#        k_values = ctx.k
-#
-#        grad_linear_weight = g.T @ k_hot_from_fwd
-#
-#        gl = g @ linear_weight
-#        
-#        with torch.no_grad():
-#            batch_size = x.shape[0]
-#            max_k = kd.shape[-1]
-#            kfrom = (k_values - 1).clamp(min=1,max=max_k-2)
-#            k_probes = torch.cat([
-#                kfrom,
-#                kfrom+1,
-#                kfrom + 2
-#            ], dim=1) # Shape: (batch, 3)
-#            variances = torch.zeros_like(k_probes, dtype=torch.float)
-#
-#            for i in range(3):
-#                current_k_probe = k_probes[:, i]
-#                top_vals, _ = torch.topk(-gl, k=max_k, dim=-1) # Get all sorted vals once
-#
-#                # Create a mask for the top-k values for each item
-#                mask = torch.arange(max_k, device=x.device)[None, :] < current_k_probe[:, None]
-#
-#                # Apply softmax only to the valid top-k values
-#                masked_vals = torch.where(mask, top_vals, torch.tensor(-float('inf'), device=x.device))
-#                soft_weights = F.softmax(masked_vals, dim=-1)
-#
-#                variances[:, i] = soft_weights.var(dim=-1)
-#    
-#            
-#            # For each item, find which probe (0, 1, or 2) had the minimum variance
-#            best_probe_indices = torch.argmin(variances, dim=-1)
-#            
-#            # The target k is the k value from the probe that won
-#            target_k = k_probes.gather(-1, best_probe_indices.unsqueeze(-1)).squeeze(-1)
-#            
-#            # Create a one-hot target for the k-decider logits
-#            target_k_indices = target_k - 1 # Map k back to index
-#            target_k_hot = F.one_hot(target_k_indices, num_classes=max_k).float()
-#
-#        # The gradient for the k-decider's output logits
-#        grad_kd = F.softmax(kd, dim=-1) - target_k_hot
-#        
-#        # Propagate this gradient back to the k_decider's weights via chain rule
-#        grad_k_decider_weight = grad_kd.T @ x
-#
-#        
-#       #grad_linear_weight = g.T @ k_hot_from_fwd 
-#
-#       #_, indices = torch.topk(x, k=k_values, dim=-1)
-#       ## In this model, the forward pass is a hard k-hot lookup
-#       #target_k_hot = torch.zeros_like(x).scatter_(-1, indices, 1.0)
-#       ## Calculate the gradient for x. This is the mathematical gradient of
-#       ##    CrossEntropy(x, target), which is (softmax(x) - target_one_hot).
-#       ##    This is the core of your idea, substituted in place of the real gradient.
-#       #xsm = F.softmax(x, dim=-1)
-#
-#       #current_k_probe = k_probes[:, i]
-#       #top_vals, _ = torch.topk(-grad_kd, k=max_k, dim=-1) # Get all sorted vals once
-#       ## Create a mask for the top-k values for each item
-#       #mask = torch.arange(max_k, device=x.device)[None, :] < current_k_probe[:, None]
-#       ## Apply softmax only to the valid top-k values
-#       #masked_vals = torch.where(mask, top_vals, torch.tensor(-float('inf'), device=x.device))
-#       #soft_weights = F.softmax(masked_vals, dim=-1)
-#       #
-#       #
-#       #masked_weight = torch.where(mask, top_vals, xsm, device=x.device)
-#
-#       #grad_x = masked_weight - target_k_hot
-#       ##grad_x = F.softmax(x, dim=-1) - soft_target
-#        # --- Part 3: REFINED Gradient for the input x ---
-#        # This now correctly implements the dynamic Soft-Target logic.
-#        with torch.no_grad():
-#            # 3a: Get top values and indices from the CORRECT signal (-gl) using the DYNAMIC k_values
-#            # We use the same masking trick as in the forward pass.
-#            sorted_gl_indices = torch.argsort(-gl, dim=-1, descending=True)
-#            topk_gl_vals = (-gl).gather(-1, sorted_gl_indices)
-#            
-#            # Create mask based on k_values chosen in the forward pass
-#            k_range = torch.arange(x.shape[-1], device=x.device)[None, :]
-#            k_mask = (k_range < k_values).float()
-#            
-#            # Apply mask to the sorted values
-#            masked_topk_gl_vals = torch.where(k_mask > 0, topk_gl_vals, torch.tensor(-float('inf'), device=x.device))
-#
-#            # 3b: Softmax within the dynamic k-window to get soft_weights
-#            soft_weights = F.softmax(masked_topk_gl_vals, dim=-1)
-#
-#            # 3c: Scatter the weights back to the original order to create the soft_target
-#            soft_target = soft_weights.gather(-1, torch.argsort(sorted_gl_indices, dim=-1))
-#
-#        # 3d: The final, clean gradient calculation
-#        grad_x = F.softmax(x, dim=-1) - soft_target
-#
-#        return grad_x, grad_linear_weight, grad_k_decider_weight
-# (The DynamicKQuantizerFunction from the previous answer is correct and goes here)
 class DynamicKQuantizerFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, logits, main_linear_weight, k_decider_weight):
@@ -476,17 +360,238 @@ class NKQuantizer(nn.Module):
     def forward(self, x):
         return SoftTargetQuantizerFunction.apply(x, self.codebook.weight, self.k) 
 
-class HybridQuantizer(nn.Module):
-    def __init__(self, quant_dim, output_dim, beta=0.25):
+
+class TopKHot(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x,  k):
+        _, indices = torch.topk(x, k=k, dim=-1)
+        k_hot = torch.zeros_like(x).scatter_(-1, indices, 1.0)
+        ctx.save_for_backward(x, k)
+        return k_hot
+
+    @staticmethod
+    def backward(ctx, g):
+        x, k = ctx.saved_tensors
+
+        with torch.no_grad():
+            topk_vals, topk_indices = torch.topk(-g, k=k, dim=-1)
+
+            soft_weights = F.softmax(topk_vals, dim=-1)
+
+            soft_target = torch.zeros_like(x).scatter_(-1, topk_indices, soft_weights)
+
+        grad_x = F.softmax(x, dim=-1) - soft_target
+        
+        return grad_x,  None
+
+class TopKHot2(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, k):
+        #_, indices = torch.topk(x, k=k, dim=-1)
+        #k_hot = torch.zeros_like(x).scatter_(-1, indices, 1.0)
+        
+        batch_size, quant_dim = x.shape
+        
+        sorted_indices = torch.argsort(x, dim=-1, descending=True)
+        
+        k_range = torch.arange(quant_dim, device=x.device)[None, :].expand(batch_size, -1)
+        
+        k_hot_mask = (k_range < k).float()
+        
+        k_hot = k_hot_mask.gather(-1, torch.argsort(sorted_indices, dim=-1))
+
+        ctx.save_for_backward(x)
+        ctx.k = k
+        ctx.max_k = x.shape[-1]
+        return k_hot
+
+    @staticmethod
+    def backward(ctx, g):
+        x, = ctx.saved_tensors
+        k = ctx.k
+        max_k = ctx.max_k
+        
+        sorted_g, sorted_g_indices = torch.sort(-g, dim=-1, descending=True)
+        # --- PATH 1: Gradient for the input logits 'x' (Soft-Target Logic) ---
+        with torch.no_grad():
+            k_range = torch.arange(x.shape[-1], device=x.device)[None, :]
+            k_mask = (k_range < k).float()
+            
+            # Apply the dynamic mask to the sorted correction signal
+            masked_topk_gl_vals = torch.where(k_mask > 0, sorted_g, torch.tensor(-float('inf'), device=x.device))
+            soft_weights = F.softmax(masked_topk_gl_vals, dim=-1)
+            soft_target = soft_weights.gather(-1, torch.argsort(sorted_g_indices, dim=-1))
+        grad_x = F.softmax(x, dim=-1) - soft_target
+        
+        # --- PATH 2: Surrogate Gradient for 'k_continuous' (Your Vectorized Logic) ---
+        with torch.no_grad():
+            batch_size = g.shape[0]
+            
+            # Define the probe window in a vectorized way
+            kfrom = (k - 1).clamp(min=1, max=max_k - 2)
+            # Shape: (1, 3) -> will broadcast to (batch_size, 3)
+            k_probes = torch.cat([kfrom, kfrom + 1, kfrom + 2], dim=0).unsqueeze(0)
+
+            variances = torch.zeros((batch_size, 3), device=g.device)
+            means = torch.zeros((batch_size, 3), device=g.device)
+            # This loop is now over a fixed size of 3, not a Python list
+            for i in range(3):
+                current_k_probe = k_probes[:, i] # Shape: (batch_size)
+                mask = torch.arange(max_k, device=g.device)[None, :] < current_k_probe[:, None]
+                masked_vals = torch.where(mask, sorted_g, torch.tensor(-float('inf'), device=g.device))
+                soft_weights = F.softmax(masked_vals, dim=-1)
+                variances[:, i] = soft_weights.var(dim=-1)
+                means[:, i] = soft_weights.mean(dim=-1)
+
+            # Find which probe had the minimum variance for each item in the batch
+            best_probe_indices = torch.argmin(((0.5-means)**2)/(2*variances), dim=-1) # Shape: (batch_size)
+            
+            # Create the gradient signal based on the vote of the batch
+            # -1 if k-1 was best, 0 if k was best, +1 if k+1 was best
+            grad_signals = best_probe_indices.float() - 1.0
+            
+            grad_k_continuous = grad_signals#.mean(dim=-1)
+
+        # Return gradients for each input: (x, k_continuous)
+        return grad_x, grad_k_continuous
+
+class dynKHot(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, k_scores):
+
+        k_indices = torch.argmax(k_scores, dim=-1, keepdim=True) + 1
+        k_values = k_indices  
+
+        sorted_indices = torch.argsort(x, dim=-1, descending=True)
+        quant_dim = x.shape[-1]
+        k_range = torch.arange(quant_dim, device=x.device).expand(x.shape[0], -1)
+        k_hot_mask = (k_range < k_values).float()
+        k_hot = k_hot_mask.gather(-1, torch.argsort(sorted_indices, dim=-1))
+
+        ctx.save_for_backward(x, k_scores)
+        ctx.k_values = k_values 
+        return k_hot
+
+    @staticmethod
+    def backward(ctx, g):
+        x, k_scores = ctx.saved_tensors
+        k_values = ctx.k_values
+        batch_size, qdim = x.shape
+        
+        with torch.no_grad():
+            sorted_g, sorted_g_indices = torch.sort(-g, dim=-1, descending=True)
+            k_range = torch.arange(qdim, device=x.device).expand(batch_size, -1)
+            k_mask = (k_range < k_values).float()
+            
+            masked_vals = torch.where(k_mask > 0, sorted_g, torch.tensor(-float('inf'), device=x.device))
+            soft_weights = F.softmax(masked_vals, dim=-1)
+            soft_target_x = soft_weights.gather(-1, torch.argsort(sorted_g_indices, dim=-1))
+            
+        grad_x = F.softmax(x, dim=-1) - soft_target_x
+
+        with torch.no_grad():
+            g_avg = g.mean(dim=-1, keepdim=True)
+            g_std = g.std(dim=-1, keepdim=True)
+            epsilon = 0.1*g_std 
+            wanted_K = torch.sum(g < g_avg , dim=-1, keepdim=True)
+            #num_yes_votes = torch.sum(g < (g_avg - epsilon), dim=-1, keepdim=True)
+            #num_no_votes = torch.sum(g > (g_avg + epsilon), dim=-1, keepdim=True)
+
+            #nudge = (num_yes_votes-num_no_votes)#/(num_yes_votes+num_no_votes)
+
+            # 3. Calculate the new target k as a float
+            target_k_float = torch.round(wanted_K).long().clamp(1, qdim) - 1
+            
+            # 4. --- YOUR GAUSSIAN KERNEL TARGET ---
+            # Create the Gaussian "hump" centered at the float target.
+            #k_indices = torch.arange(qdim, device=x.device, dtype=torch.float32)
+            
+            # The standard deviation of the target kernel is a new hyperparameter.
+            # A small value (e.g., 0.5) creates a sharp, confident target.
+            #target_std = 0.5
+            
+            # Unsqueeze for broadcasting
+            #gaussian_target = torch.exp(-0.5 * ((k_indices - target_k_float) / target_std) ** 2)
+            
+            # Normalize to make it a valid probability distribution
+            #soft_target_k = gaussian_target / gaussian_target.sum(dim=-1, keepdim=True)
+            k_target = F.one_hot(target_k_float, qdim)
+
+        grad_k_scores = F.softmax(k_scores, dim=-1) - k_target
+        
+        return grad_x, grad_k_scores
+
+class dynFKHot(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, k_values):
+
+        quant_dim = x.shape[-1]
+        k_values = k_values.clamp(1, quant_dim)
+        sorted_indices = torch.argsort(x, dim=-1, descending=True)
+        k_range = torch.arange(quant_dim, device=x.device).expand(x.shape[0], -1)
+        k_hot_mask = (k_range < k_values).float()
+        k_hot = k_hot_mask.gather(-1, torch.argsort(sorted_indices, dim=-1))
+
+        ctx.save_for_backward(x, k_values)
+        return k_hot
+
+    @staticmethod
+    def backward(ctx, g):
+        x, k_values = ctx.saved_tensors
+        #k_values = ctx.k_values
+        batch_size, qdim = x.shape
+        
+        with torch.no_grad():
+            sorted_g, sorted_g_indices = torch.sort(-g, dim=-1, descending=True)
+            k_range = torch.arange(qdim, device=x.device).expand(batch_size, -1)
+            k_mask = (k_range < k_values).float()
+            
+            masked_vals = torch.where(k_mask > 0, sorted_g, torch.tensor(-float('inf'), device=x.device))
+            soft_weights = F.softmax(masked_vals, dim=-1)
+            soft_target_x = soft_weights.gather(-1, torch.argsort(sorted_g_indices, dim=-1))
+            
+        grad_x = F.softmax(x, dim=-1) - soft_target_x
+
+        with torch.no_grad():
+            g_avg = g.mean(dim=-1, keepdim=True)
+            wanted_K = torch.sum(g < g_avg , dim=-1, keepdim=True)
+            target_k_float = torch.round(wanted_K).long().clamp(1, qdim) - 1
+            
+        grad_k_values = k_values - target_k_float
+        
+        return grad_x, grad_k_values
+
+class NKQuantizer2(nn.Module):
+    def __init__(self, quant_dim, embed_dim, k):
         super().__init__()
-        self.linear = nn.Linear(quant_dim, output_dim, bias=False)
-        self.beta = beta
+        self.codebook = nn.Linear(quant_dim, embed_dim, bias=False)
+        self.k=k
+
     def forward(self, x):
-        return HybridQuantizerFunction.apply(x, self.linear.weight, self.beta)
+        k_hot = TopKHot.apply(x, self.k)
+        return self.codebook(k_hot)
+        
+class DynKQuantizer2(nn.Module):
+    def __init__(self, quant_dim, embed_dim, max_k):
+        super().__init__()
+        self.codebook = nn.Linear(quant_dim, embed_dim, bias=False)
+        self.dynkselector = nn.Sequential(
+            nn.Linear(quant_dim, quant_dim*2, bias=False),
+            nn.ReLU(),
+            nn.Linear(quant_dim*2, quant_dim, bias=False),
+            nn.ReLU(),
+            nn.Linear(quant_dim, quant_dim, bias=False),
+        )
+        self.mk = max_k
+        
+    def forward(self, x):
+        k = self.dynkselector(x)
+        k_hot = dynKHot.apply(x, k) 
+        return self.codebook(k_hot)
 
 # --- The Autoencoder and Experiment Setup ---
 class Autoencoder(nn.Module):
-    def __init__(self, encoder, quantizer, decoder):
+    def __init__(self,encoder, quantizer, decoder ):
         super().__init__()
         self.encoder = encoder
         self.quantizer = quantizer
@@ -504,39 +609,198 @@ class Autoencoder(nn.Module):
             
         reconstruction = self.decoder(quantized)
         return reconstruction, logits, vq_loss 
+    
+    
+class NKQAE(nn.Module):
+    def __init__(self, input_dim, n_embd, n_hdim, qdim, K = None):
+        super().__init__()
+        self.qdim = qdim
+        self.k = qdim//2 if K is None else K
+        self.encoder = nn.Sequential(nn.Linear(input_dim, n_hdim), nn.ReLU(), nn.Linear(n_hdim, self.qdim ))
+        self.codebook = nn.Linear(self.qdim, n_embd, bias=False)
+        self.decoder = nn.Sequential(nn.Linear(n_embd, n_hdim), nn.ReLU(), nn.Linear(n_hdim, input_dim))
 
+    def forward(self, x):
+        logits = self.encoder(x)
+        khot = TopKHot.apply(logits, self.qdim//2)
+        quantized = self.codebook(khot)
+        reconstruction = self.decoder(quantized)
+        return reconstruction, logits, 0.0
+
+    def quant(self, x):
+        logits = self.encoder(x)
+        return TopKHot.apply(logits, self.qdim//2)
+    
+    def dequant(self, k_hot):
+        q = self.codebook(k_hot)
+        return self.decoder(q)
+
+
+class DynFKhot(nn.Module):
+    def __init__(self, input_dim, n_hdim, qdim):
+        super().__init__()
+        self.qdim = qdim
+        self.k_predictor = nn.Sequential(
+            nn.Linear(input_dim+qdim, n_hdim), 
+            nn.ReLU(), 
+            nn.Linear(n_hdim, n_hdim), 
+            nn.ReLU(), 
+            nn.Linear(n_hdim, 1),
+            nn.Sigmoid(),
+        )
+        self.k_scale = nn.Parameter(torch.ones(1))
+        self.encoder = nn.Sequential(nn.Linear(input_dim, n_hdim), nn.ReLU(), nn.Linear(n_hdim, self.qdim ))
+        
+    def forward(self, x):
+        logits = self.encoder(x)
+        k = self.k_predictor(torch.cat((x,logits.detach()),dim=-1)) * self.qdim 
+        k = (k * F.sigmoid(self.k_scale) * 2 ).clamp(1, self.qdim) 
+        khot = dynFKHot.apply(logits, k)
+        return khot, k
+    
+
+class DynKQAE2(nn.Module):
+    def __init__(self, input_dim, n_embd, n_hdim, qdim):
+        super().__init__()
+        self.qdim = qdim
+        self.encoder = nn.Sequential(nn.Linear(input_dim, n_hdim), nn.ReLU(), nn.Linear(n_hdim, self.qdim ))
+        self.codebook = nn.Linear(self.qdim, n_embd, bias=False)
+        self.decoder = nn.Sequential(nn.Linear(n_embd, n_hdim), nn.ReLU(), nn.Linear(n_hdim, input_dim))
+        self.k_predictor = nn.Sequential(
+            nn.Linear(input_dim+qdim, n_hdim), 
+            nn.ReLU(), 
+            nn.Linear(n_hdim, n_hdim), 
+            nn.ReLU(), 
+            nn.Linear(n_hdim, 1),
+            #nn.Tanh(),
+            #nn.LayerNorm(qdim),
+            nn.Sigmoid(),
+        )
+        
+        self.k_scale = nn.Parameter(torch.ones(1))
+
+    def forward(self, x):
+        khot, k = self.quant(x)
+
+        reconstruction = self.dequant(khot, k)
+        
+        return reconstruction, khot, 0.0, k
+
+    def quant(self, x):
+        logits = self.encoder(x)
+        k = self.k_predictor(torch.cat((x,logits.detach()),dim=-1)) * self.qdim #+self.k_bias#-self.k_penalty
+        k = (k * F.sigmoid(self.k_scale)* 2 ).clamp(1, self.qdim) 
+        khot = dynFKHot.apply(logits, k)
+        return khot, k
+    
+    def dequant(self, k_hot, k):
+        k_hot = k_hot / (k.detach())
+        q = self.codebook(k_hot)
+        return self.decoder(q)
+    
+    def optimizer(self, LR):
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+
+        ae_params = []
+        k_selector_params = []
+
+        for name, param in param_dict.items():
+            if name.startswith('k_predictor') or name.startswith('k_bias'):
+                k_selector_params.append(param)
+            else:
+                ae_params.append(param)
+        num_ae = sum(p.numel() for p in ae_params)
+        num_k_sel = sum(p.numel() for p in k_selector_params)
+        print(f"ae parameter tensors: {len(ae_params)}, with {num_ae:,} parameters")
+        print(f"k selector parameter tensors: {len(k_selector_params)}, with {num_k_sel:,} parameters")
+
+        optim_groups = [
+            {'params': ae_params, 'lr': LR},
+            {
+                'params': k_selector_params,
+                'lr': LR ,#* 0.01,
+                #'weight_decay': 0.0,  # CRITICAL: No decay for the bias
+                #'betas': (0.0, 0.999),
+            }
+        ]
+        return torch.optim.AdamW(optim_groups, lr=LEARNING_RATE) 
+    
+class DynKQAE(nn.Module):
+    def __init__(self, input_dim, n_embd, n_hdim, qdim, voters, k_per):
+        super().__init__()
+        self.qdim = qdim
+        self.voters = voters
+        self.k_per = k_per
+        self.encoders = nn.ModuleList([ 
+                nn.Sequential(
+                    nn.Linear(input_dim, n_hdim), 
+                    nn.ReLU(), 
+                    nn.Linear(n_hdim, self.qdim ),
+                ) for _ in range(voters)
+            ])
+        self.codebook = nn.Linear(self.qdim, n_embd, bias=False)
+        self.decoder = nn.Sequential(nn.Linear(n_embd, n_hdim), nn.ReLU(), nn.Linear(n_hdim, input_dim))
+
+    def forward(self, x):
+        khot, kr= self.quant(x)
+        reconstruction = self.dequant(khot)
+        return reconstruction, khot, 0.0#F.mse_loss(khot,kr)
+
+    def quant(self, x):
+        all_logits = [encoder(x) for encoder in self.encoders]
+        
+        stacked_logits = torch.stack(all_logits, dim=1)
+        
+        all_votes = TopKHot.apply(stacked_logits, self.k_per)
+        
+        khot_raw = torch.sum(all_votes, dim=1)
+        #khot_xor = 0.5 * (1 - torch.cos(torch.pi * khot_raw))
+        khot = khot_raw.clamp(0,1)
+        return khot, khot_raw
+    
+    def dequant(self, k_hot):
+        q = self.codebook(k_hot)
+        return self.decoder(q)
+    
 def calculate_perplexity(logits):
     # Calculates the perplexity of the codebook usage for a batch
     probs = F.softmax(logits, dim=-1).mean(dim=0)
     entropy = -torch.sum(probs * torch.log(probs + 1e-10))
     perplexity = torch.exp(entropy)
-    return perplexity.item()
+    return perplexity.mean().detach().item()
 
 @torch.no_grad()
 def run_validation(model, val_loader, device, num_batches=10):
     model.eval()
     total_loss = 0
     total_perplexity = 0
+    total_k_perplexity = 0
+    total_k = 0
     batches_processed = 0
     for i, (images, _) in enumerate(val_loader):
         if i >= num_batches:
             break
         images = images.view(-1, INPUT_DIM).to(device)
-        recon, logits, _ = model(images)
-        total_loss += F.mse_loss(recon, images).item()
+        recon, logits, _, k = model(images)
+        total_loss += F.mse_loss(recon, images).mean().detach().item()
         if(logits is not None):
             total_perplexity += calculate_perplexity(logits)
+        total_k_perplexity += k.var()
+        #k_indices = torch.argmax(k, dim=-1) + 1
+        total_k += k.mean().detach().item()
         batches_processed += 1
-    
-    avg_loss = total_loss / batches_processed if batches_processed > 0 else 0
-    avg_perplexity = total_perplexity / batches_processed if batches_processed > 0 else 0
+    bp = batches_processed if batches_processed > 0 else 0
+    avg_k = total_k / bp
+    avg_loss = total_loss / bp
+    avg_perplexity = total_perplexity / bp
+    avg_perplexity = total_k_perplexity / bp
     model.train()
-    return avg_loss, avg_perplexity
+    return avg_loss, avg_perplexity, avg_k, total_k_perplexity
 
 if __name__ == '__main__':
     # Hyperparameters
     INPUT_DIM, HIDDEN_DIM, QUANT_DIM, EMBED_DIM = 28*28, 256, 64, 32
-    BATCH_SIZE, LEARNING_RATE, STEPS = 256, 1e-3, 1000
+    BATCH_SIZE, LEARNING_RATE, STEPS = 256, 1e-3, 10001
     
     VALIDATION_INTERVAL = 1000
     VALIDATION_STEPS = 100
@@ -563,12 +827,19 @@ if __name__ == '__main__':
         #"Hybrid": Autoencoder(copy.deepcopy(encoder_base), HybridQuantizer(QUANT_DIM, EMBED_DIM, beta=BETA), copy.deepcopy(decoder_base)),
         #"ADAK": Autoencoder(copy.deepcopy(encoder_base), AdaKQuantizer(QUANT_DIM, EMBED_DIM, QUANT_DIM), copy.deepcopy(decoder_base)),
         #"ADAK 15": Autoencoder(copy.deepcopy(encoder_base), AdaKQuantizer(QUANT_DIM, EMBED_DIM, 15), copy.deepcopy(decoder_base)),
-        "VQ-VAE 32": Autoencoder(copy.deepcopy(encoder_for_vqvae), MultiHotVQVAEQuantizer(QUANT_DIM, EMBED_DIM,  QUANT_DIM//2, 0.25), copy.deepcopy(decoder_base)),
-        "VQ-VAE":    Autoencoder(copy.deepcopy(encoder_for_vqvae), MultiHotVQVAEQuantizer(QUANT_DIM, EMBED_DIM, 1, 0.25), copy.deepcopy(decoder_base)),
-        "Gumbell":   Autoencoder(copy.deepcopy(encoder_base),      GumbelQuantizer(QUANT_DIM, EMBED_DIM, 1), copy.deepcopy(decoder_base)),
-        "CER":       Autoencoder(copy.deepcopy(encoder_base),      CustomQuantizer(QUANT_DIM, EMBED_DIM), copy.deepcopy(decoder_base)),
-        "STE":       Autoencoder(copy.deepcopy(encoder_base),      STEQuantizer(QUANT_DIM, EMBED_DIM), copy.deepcopy(decoder_base)),
-        "CER 32":    Autoencoder(copy.deepcopy(encoder_base),      NKQuantizer(QUANT_DIM, EMBED_DIM, QUANT_DIM//2), copy.deepcopy(decoder_base)),
+        #"VQ-VAE 32": Autoencoder(copy.deepcopy(encoder_for_vqvae), MultiHotVQVAEQuantizer(QUANT_DIM, EMBED_DIM,  QUANT_DIM//2, 0.25), copy.deepcopy(decoder_base)),
+        #"VQ-VAE":    Autoencoder(copy.deepcopy(encoder_for_vqvae), MultiHotVQVAEQuantizer(QUANT_DIM, EMBED_DIM, 1, 0.25), copy.deepcopy(decoder_base)),
+        #"Gumbell":   Autoencoder(copy.deepcopy(encoder_base),      GumbelQuantizer(QUANT_DIM, EMBED_DIM, 1), copy.deepcopy(decoder_base)),
+        #"CER":       Autoencoder(copy.deepcopy(encoder_base),      CustomQuantizer(QUANT_DIM, EMBED_DIM), copy.deepcopy(decoder_base)),
+        #"STE":       Autoencoder(copy.deepcopy(encoder_base),      STEQuantizer(QUANT_DIM, EMBED_DIM), copy.deepcopy(decoder_base)),
+        #"CERk 32":   Autoencoder(copy.deepcopy(encoder_base),      NKQuantizer(QUANT_DIM, EMBED_DIM, QUANT_DIM//2), copy.deepcopy(decoder_base)),
+        #"CER":       Autoencoder(copy.deepcopy(encoder_base),      CustomQuantizer(QUANT_DIM, EMBED_DIM), copy.deepcopy(decoder_base)),
+        #"adak":   Autoencoder(copy.deepcopy(encoder_base),      AdaKQuantizer(QUANT_DIM, EMBED_DIM,QUANT_DIM), copy.deepcopy(decoder_base)),
+        #"dynk3":   Autoencoder(copy.deepcopy(encoder_base),      DynKQuantizer2(QUANT_DIM, EMBED_DIM, QUANT_DIM), copy.deepcopy(decoder_base)),
+        #"cdynk":   Autoencoder(copy.deepcopy(encoder_base),      CER_DynamicK_Quantizer(QUANT_DIM, EMBED_DIM, QUANT_DIM), copy.deepcopy(decoder_base)),
+        "dynk3": DynKQAE2(INPUT_DIM, EMBED_DIM, HIDDEN_DIM, QUANT_DIM),
+        #"CERk 32":      NKQAE(INPUT_DIM, EMBED_DIM, HIDDEN_DIM, QUANT_DIM,  32),
+        
         #"CER 16": Autoencoder(copy.deepcopy(encoder_base), NKQuantizer(QUANT_DIM, EMBED_DIM, 16), copy.deepcopy(decoder_base)),
         #"STE 16": Autoencoder(copy.deepcopy(encoder_base), MultiHotSTEQuantizer(QUANT_DIM, EMBED_DIM, 16), copy.deepcopy(decoder_base)),
         #"STE qd0.5": Autoencoder(copy.deepcopy(encoder_base), MultiHotSTEQuantizer(QUANT_DIM, EMBED_DIM, QUANT_DIM//2), copy.deepcopy(decoder_base)),
@@ -578,8 +849,9 @@ if __name__ == '__main__':
     torch.set_float32_matmul_precision('medium')
     models = {name: torch.compile(model.to(device)) for name, model in models.items()}
     print("Compilation complete.")
-
-    optimizers = {name: torch.optim.Adam(model.parameters(), lr=LEARNING_RATE) for name, model in models.items()}
+    
+    optimizers = {name: model.optimizer(LEARNING_RATE) for name, model in models.items()}
+    #optimizers = {name: torch.optim.Adam(model.k_predictor.parameters(), lr=LEARNING_RATE*0.001) for name, model in models.items()}
     # --- NEW: Expanded Metrics Tracking ---
     metrics = {name: {"train_loss": [], "val_loss": [], "train_perp": [], "val_perp": [], "steps": []} for name in models.keys()}
 
@@ -595,25 +867,26 @@ if __name__ == '__main__':
         # Training Step
         for name, model in models.items():
             optimizers[name].zero_grad(set_to_none=True)
-            recon, logits, aux = model(images)
+            recon, logits, aux, k = model(images)
             loss_raw = F.mse_loss(recon, images) 
-            loss = loss_raw + aux if aux is not None else 0.0
+            loss = loss_raw + aux
             loss.backward()
             optimizers[name].step()
             
             if step % 100 == 0:
-                metrics[name]["train_loss"].append(loss_raw.detach().item())
+                metrics[name]["train_loss"].append(loss_raw.detach().cpu().item())
+                #metrics[name]["k_value"].append(k.detach().item())
                 perp = calculate_perplexity(logits.detach()) if logits is not None else 0.0
                 metrics[name]["train_perp"].append(perp)
 
         if step > 0 and step % VALIDATION_INTERVAL == 0:
             print(f"--- Step {step:5d} ---")
             for name, model in models.items():
-                val_loss, val_perp = run_validation(model, val_loader, device, VALIDATION_STEPS)
+                val_loss, val_perp, kavg, kpavg = run_validation(model, val_loader, device, VALIDATION_STEPS)
                 metrics[name]["val_loss"].append(val_loss)
                 metrics[name]["val_perp"].append(val_perp)
                 metrics[name]["steps"].append(step)
-                print(f"{name:>10} | Train Loss: {metrics[name]['train_loss'][-1]:.6f} | Val Loss: {val_loss:.6f} | Val Perp: {val_perp:.2f}")
+                print(f"{name:>10} | Train Loss: {metrics[name]['train_loss'][-1]:.6f} | Val Loss: {val_loss:.6f} | Val Perp: {val_perp:.2f}| Val k: {kavg:.2f}| Val k var: {kpavg:.2f}")
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 12), sharex=True)
     
@@ -624,13 +897,11 @@ if __name__ == '__main__':
         # Assuming train_loss is recorded every 10 steps as in the previous setup.
         num_train_logs = len(metrics[name]["train_loss"])
         train_steps_x_axis = range(0, num_train_logs * 10, 10) # Creates an x-axis of the correct length and scale
-        
+
         # Plot training loss
         if num_train_logs > 0:
             ax1.plot(train_steps_x_axis, metrics[name]["train_loss"], label=f'{name} Train Loss', alpha=0.5)
         
-        # --- Fix 2: Guard validation plots to prevent errors on short runs ---
-        # Only attempt to plot validation data if it actually exists.
         if len(metrics[name]["steps"]) > 0:
             ax1.plot(metrics[name]["steps"], metrics[name]["val_loss"], label=f'{name} Val Loss', linestyle='--', marker='o', markersize=4)
             ax2.plot(metrics[name]["steps"], metrics[name]["val_perp"], label=f'{name} Val Perplexity', linestyle='--', marker='o', markersize=4)

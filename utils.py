@@ -516,7 +516,28 @@ def qumgate(q: torch.Tensor) -> torch.Tensor:
     
     return output
 
+@torch.compile(backend='inductor', mode='max-autotune')
+def one_hot_to_bitfield(one_hot_tensor):
+  indices = torch.argmax(one_hot_tensor, dim=-1)
+  return 1 << indices
+@torch.compile(backend='inductor', mode='max-autotune')
+def bitfield_to_one_hot(bitfield_tensor, num_classes):
+  indices = torch.log2(bitfield_tensor.float()).long()
+  return F.one_hot(indices, num_classes=num_classes)
 
+@torch.compile(backend='inductor', mode='max-autotune')
+def k_hot_to_bitfield(k_hot_tensor):
+  num_classes = k_hot_tensor.shape[-1]
+  device = k_hot_tensor.device
+  powers_of_2 = 2 ** torch.arange(num_classes, device=device, dtype=torch.long)
+  bitfields = torch.sum(k_hot_tensor.long() * powers_of_2, dim=-1)
+  return bitfields
+@torch.compile(backend='inductor', mode='max-autotune')
+def bitfield_to_k_hot(bitfield_tensor, num_classes):
+  device = bitfield_tensor.device
+  powers_of_2 = 2 ** torch.arange(num_classes, device=device, dtype=torch.long)
+  k_hot = bitfield_tensor.unsqueeze(-1).bitwise_and(powers_of_2).ne(0).long()
+  return k_hot
 @torch.compile(backend='inductor', mode='max-autotune')
 def quaternion_multiply(q, p):
     # q and p are tensors of shape [..., 4]
