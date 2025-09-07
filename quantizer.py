@@ -1,4 +1,5 @@
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,6 +7,8 @@ import torchvision
 import matplotlib.pyplot as plt
 import copy
 from torch.utils.data import DataLoader, random_split
+
+import utils
 
 class MultiHotVQVAEQuantizer2(nn.Module):
     def __init__(self, quant_dim, embed_dim, k=15, commitment_cost=0.25):
@@ -361,6 +364,43 @@ class NKQuantizer(nn.Module):
         return SoftTargetQuantizerFunction.apply(x, self.codebook.weight, self.k) 
 
 
+class GatherByGateFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, gate_logits, candidate_pool, k):
+        _, top_indices = torch.topk(gate_logits, k=k, dim=-1)
+
+        output = torch.gather(candidate_pool, -1, top_indices)
+
+        ctx.save_for_backward(gate_logits, candidate_pool, top_indices)
+        return output
+
+    @staticmethod
+    def backward(ctx, g):
+        gate_logits, candidate_pool, top_indices = ctx.saved_tensors
+
+        grad_candidate_pool = torch.zeros_like(candidate_pool)
+        grad_candidate_pool.scatter_add_(-1, top_indices, g)
+
+        with torch.no_grad():
+            y = torch.gather(candidate_pool, -1, top_indices)
+            
+            ideal_targets = y - g
+
+            distances = torch.cdist(ideal_targets.unsqueeze(-2), candidate_pool.unsqueeze(-2))
+
+            _, ideal_indices = torch.min(distances, dim=-1)
+            
+            soft_target = torch.zeros_like(gate_logits)
+            #replace by softmax of -g scattered. instead of clamp
+            soft_target.scatter_add_(-1, ideal_indices, torch.ones_like(ideal_indices, dtype=gate_logits.dtype))
+
+            soft_target.clamp_(0, 1)
+
+        grad_gate_logits = F.softmax(gate_logits, dim=-1) - soft_target
+        
+        return grad_gate_logits, grad_candidate_pool, None
+    
+
 class TopKHot(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x,  k):
@@ -589,6 +629,10 @@ class DynKQuantizer2(nn.Module):
         k_hot = dynKHot.apply(x, k) 
         return self.codebook(k_hot)
 
+def xor(x,y):
+    return x * (1 - y) + (1 - x) * y
+
+
 # --- The Autoencoder and Experiment Setup ---
 class Autoencoder(nn.Module):
     def __init__(self,encoder, quantizer, decoder ):
@@ -776,7 +820,7 @@ def run_validation(model, val_loader, device, num_batches=10):
     total_perplexity = 0
     total_k_perplexity = 0
     total_k = 0
-    batches_processed = 0
+    batches_processed = 1
     for i, (images, _) in enumerate(val_loader):
         if i >= num_batches:
             break
@@ -785,24 +829,43 @@ def run_validation(model, val_loader, device, num_batches=10):
         total_loss += F.mse_loss(recon, images).mean().detach().item()
         if(logits is not None):
             total_perplexity += calculate_perplexity(logits)
-        total_k_perplexity += k.var()
+        total_k_perplexity += k.var().detach().item()
         #k_indices = torch.argmax(k, dim=-1) + 1
         total_k += k.mean().detach().item()
         batches_processed += 1
-    bp = batches_processed if batches_processed > 0 else 0
+    bp = batches_processed 
     avg_k = total_k / bp
     avg_loss = total_loss / bp
     avg_perplexity = total_perplexity / bp
-    avg_perplexity = total_k_perplexity / bp
+    avg_k_perplexity = total_k_perplexity / bp
     model.train()
-    return avg_loss, avg_perplexity, avg_k, total_k_perplexity
+    return avg_loss, avg_perplexity, avg_k, avg_k_perplexity
+
+
+wn = torch.nn.utils.parametrizations.weight_norm
+class wnormlearnloss(nn.Module):
+    def __init__(self, dims):
+        super().__init__()
+        # Create one learnable log_sigma_sq parameter for each loss
+        self.head = nn.Sequential(
+                wn(nn.Linear(dims, dims*2),dim=None),
+                nn.GELU(),
+                wn(nn.Linear(dims*2, dims*2),dim=None),
+                nn.GELU(),
+                wn(nn.Linear(dims*2, 1))
+            )
+
+    def forward(self, x):
+        loss = self.head(x)
+        return utils.minmaxnorm(loss).mean()
 
 if __name__ == '__main__':
     # Hyperparameters
     INPUT_DIM, HIDDEN_DIM, QUANT_DIM, EMBED_DIM = 28*28, 256, 64, 32
     BATCH_SIZE, LEARNING_RATE, STEPS = 256, 1e-3, 10001
     
-    VALIDATION_INTERVAL = 1000
+    VAL_LOG_INTERVAL = 1000
+    TRAIN_LOG_INTERVAL = 100
     VALIDATION_STEPS = 100
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -848,12 +911,23 @@ if __name__ == '__main__':
     print("Compiling models...")
     torch.set_float32_matmul_precision('medium')
     models = {name: torch.compile(model.to(device)) for name, model in models.items()}
+    auxl = torch.compile(wnormlearnloss(INPUT_DIM).to(device))
     print("Compilation complete.")
     
     optimizers = {name: model.optimizer(LEARNING_RATE) for name, model in models.items()}
     #optimizers = {name: torch.optim.Adam(model.k_predictor.parameters(), lr=LEARNING_RATE*0.001) for name, model in models.items()}
     # --- NEW: Expanded Metrics Tracking ---
-    metrics = {name: {"train_loss": [], "val_loss": [], "train_perp": [], "val_perp": [], "steps": []} for name in models.keys()}
+    metrics = {
+        name: {
+            "train_loss": [], 
+            "train_perp": [], 
+            "train_k_var": [], 
+            "train_k_mean": [], 
+            "val_loss": [], 
+            "val_perp": [], 
+            "val_k_var": [], 
+            "val_k_mean": [], 
+            } for name in models.keys()}
 
     print("Starting training with validation...")
     for step in range(STEPS):
@@ -867,44 +941,83 @@ if __name__ == '__main__':
         # Training Step
         for name, model in models.items():
             optimizers[name].zero_grad(set_to_none=True)
-            recon, logits, aux, k = model(images)
+            if isinstance(model, DynKQAE2):
+                recon, logits, aux, k = model(images)
+            else:
+                recon, logits, aux = model(images)
+                k = model.qdim//2
+
             loss_raw = F.mse_loss(recon, images) 
             loss = loss_raw + aux
+            loss = loss + auxl(recon)#*0.1
+            #r2, rq, _, k2 = model(recon.detach())
+            #loss = loss + F.mse_loss(F.softmax(recon.detach(),dim=-1), F.softmax(r2,dim=-1)) # The target distribution (from the first pass)
+
+            #target_dist = F.softmax(logits.detach() / k, dim=-1)
+            #input_dist_log = F.log_softmax(rq / k2, dim=-1)
+            #loss = loss + F.kl_div(input_dist_log, target_dist, reduction="batchmean")
+            #loss = loss + F.kl_div(F.softmax(logits.detach()/k.detach(),dim=-1), F.softmax(rq/k2,dim=-1), reduction="batchmean") 
             loss.backward()
+            #lw = F.softmax(recon)-F.softmax(images)
+            #loss.backward()
             optimizers[name].step()
             
             if step % 100 == 0:
                 metrics[name]["train_loss"].append(loss_raw.detach().cpu().item())
+                metrics[name]["train_k_var"].append(k.var().detach().cpu().item())
+                metrics[name]["train_k_mean"].append(k.mean().detach().cpu().item())
                 #metrics[name]["k_value"].append(k.detach().item())
                 perp = calculate_perplexity(logits.detach()) if logits is not None else 0.0
                 metrics[name]["train_perp"].append(perp)
 
-        if step > 0 and step % VALIDATION_INTERVAL == 0:
+        if step > 0 and step % VAL_LOG_INTERVAL == 0:
             print(f"--- Step {step:5d} ---")
             for name, model in models.items():
                 val_loss, val_perp, kavg, kpavg = run_validation(model, val_loader, device, VALIDATION_STEPS)
                 metrics[name]["val_loss"].append(val_loss)
                 metrics[name]["val_perp"].append(val_perp)
-                metrics[name]["steps"].append(step)
+                metrics[name]["val_k_var"].append(kpavg)
+                metrics[name]["val_k_mean"].append(kavg)
                 print(f"{name:>10} | Train Loss: {metrics[name]['train_loss'][-1]:.6f} | Val Loss: {val_loss:.6f} | Val Perp: {val_perp:.2f}| Val k: {kavg:.2f}| Val k var: {kpavg:.2f}")
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 12), sharex=True)
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
     
     for name in models.keys():
-        # --- Fix 1: Generate the correct x-axis for the training data ---
-        # The train_loss is recorded more frequently than the validation loss.
-        # We must create a corresponding x-axis for it.
-        # Assuming train_loss is recorded every 10 steps as in the previous setup.
+        # --- Generate Correct X-Axes Based on Logged Data Length ---
+        # This is more robust than assuming the training runs to full STEPS
         num_train_logs = len(metrics[name]["train_loss"])
-        train_steps_x_axis = range(0, num_train_logs * 10, 10) # Creates an x-axis of the correct length and scale
+        train_x_axis = np.arange(num_train_logs) * TRAIN_LOG_INTERVAL
+
+        num_val_logs = len(metrics[name]["val_loss"])
+        # The first validation happens at VAL_LOG_INTERVAL, not 0
+        val_x_axis = (np.arange(num_val_logs) + 1) * VAL_LOG_INTERVAL
+
+        #train_steps_x_axis = range(0, STEPS, TRAIN_LOG_INTERVAL) 
+        #val_steps_x_axis = range(0, STEPS, VAL_LOG_INTERVAL) 
 
         # Plot training loss
         if num_train_logs > 0:
-            ax1.plot(train_steps_x_axis, metrics[name]["train_loss"], label=f'{name} Train Loss', alpha=0.5)
+            ax1.plot(train_x_axis, metrics[name]["train_loss"], label=f'{name} Train Loss',       alpha=0.5)
+            ax2.plot(train_x_axis, metrics[name]["train_perp"], label=f'{name} Train Perplexity', alpha=0.5)
+
+            train_k_mean = np.array(metrics[name]["train_k_mean"])
+            train_k_var = np.array(metrics[name]["train_k_var"])
+            train_k_std = np.sqrt(train_k_var) 
+
+            ax3.plot(train_x_axis, train_k_mean, label=f'{name} Train K', alpha=0.5)
+            ax3.fill_between(train_x_axis, train_k_mean - train_k_std, train_k_mean + train_k_std, alpha=0.2)
+    
         
-        if len(metrics[name]["steps"]) > 0:
-            ax1.plot(metrics[name]["steps"], metrics[name]["val_loss"], label=f'{name} Val Loss', linestyle='--', marker='o', markersize=4)
-            ax2.plot(metrics[name]["steps"], metrics[name]["val_perp"], label=f'{name} Val Perplexity', linestyle='--', marker='o', markersize=4)
+        if num_val_logs > 0:
+            ax1.plot(val_x_axis, metrics[name]["val_loss"], label=f'{name} Val Loss', linestyle='--', marker='o', markersize=4)
+            ax2.plot(val_x_axis, metrics[name]["val_perp"], label=f'{name} Val Perplexity', linestyle='--', marker='o', markersize=4)
+
+            val_k_mean = np.array(metrics[name]["val_k_mean"])
+            val_k_var = np.array(metrics[name]["val_k_var"])
+            val_k_std = np.sqrt(val_k_var)
+            ax3.plot(val_x_axis, val_k_mean, label=f'{name} Train K', alpha=0.5)
+            ax3.fill_between(val_x_axis, val_k_mean - val_k_std, val_k_mean + val_k_std, alpha=0.2)
+    
     ax1.set_title('Training vs. Validation Loss')
     ax1.set_ylabel('Mean Squared Error (MSE) Loss')
     ax1.grid(True, which="both", ls="--")
@@ -919,6 +1032,18 @@ if __name__ == '__main__':
     ax2.grid(True, which="both", ls="--")
     ax2.legend()
     ax2.set_xlim(0, STEPS)
+
+    # --- Formatting for the K Variance Plot (ax3) ---
+    ax3.set_title('Variance of K (Codebook Usage)')
+    ax3.set_ylabel('Variance')
+    ax3.set_xlabel('Training Step')
+    ax3.grid(True, which="both", ls="--")
+    ax3.legend()
+    ax3.set_ylim(bottom=0)
+
+    # Apply shared settings
+    for ax in [ax1, ax2, ax3]:
+        ax.set_xlim(0, STEPS)
 
     plt.tight_layout()
     plt.show()

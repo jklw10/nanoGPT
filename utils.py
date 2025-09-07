@@ -112,10 +112,10 @@ def soft_range_clip_norm(x: torch.tensor, dim = -1, perc = 0.01, scale = None):
     return ((x_softclip - w_avg) / w_range) * scale
 
 @torch.compile(backend='inductor', mode='max-autotune')
-def minmaxnorm(x, dim = -1):
+def minmaxnorm(x, dim = -1, epsilon= 1e-10):
     xmin = x.amin(dim=dim, keepdim=True)
     xmax = x.amax(dim=dim, keepdim=True) 
-    return (x - xmin) / ( xmax - xmin)
+    return (x - xmin) / ( xmax - xmin + epsilon)
 
 
 @torch.compile(backend='inductor', mode='max-autotune')

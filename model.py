@@ -7,6 +7,7 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
+import copy
 import math
 import inspect
 from dataclasses import dataclass
@@ -349,46 +350,26 @@ class Kattention(nn.Module):
 
     def forward(self, x, causal = False):
         B, T, C = x.size() 
-        # 1. Calculate query, key, values for all heads in batch and move head forward
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        # 2. Calculate attention scores (logits)
-        # att shape: (B, nh, T, T)
         att_logits = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
 
-        # 3. Apply causal mask
         mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, T, T)
         att_logits = att_logits.masked_fill(mask == 0, float('-inf'))
 
-        # 4. --- THE DYNAMIC K-SELECTION ---
-        # Predict the optimal k for each query vector
-        k_predicted = self.k_predictor(q).clamp(1,T//8) # Shape: (B, nh, T, 1)
+        k_predicted = torch.ones(1,device=x.device)*8.0 #self.k_predictor(q).clamp(1,T) 
 
-        # Apply the dynFKHot function to get a sparse mask
-        # input logits: (B, nh, T, T), input k: (B, nh, T, 1)
-        khot_mask = quantizer.dynFKHot.apply(att_logits, k_predicted)
+        khot_mask = quantizer.TopKHot.apply(att_logits, 8)
 
-        # 5. --- MEAN POOLING AND WEIGHTING ---
-        # Normalize the mask by k to perform mean-pooling.
-        # This is the differentiable path for k.
-        #sparse_weights = khot_mask / (k_predicted + 1e-8)
-        
-        # We can optionally apply softmax to the selected values
-        # This makes it a true probability distribution over the sparse set.
         sparse_att_logits = att_logits.masked_fill(khot_mask == 0, float('-inf'))
         sparse_probs = F.softmax(sparse_att_logits, dim=-1)
 
-        # 6. Apply the sparse attention weights to the values
-        # Each head does this independently.
-        y = sparse_probs @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-
-        # 7. Re-assemble all head outputs side by side
+        y = sparse_probs @ v 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
-        # 8. Output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
 
@@ -436,12 +417,13 @@ class MLP(nn.Module):
         self.n_embd = config.n_embd
 
     def forward(self, x):
-        x = self.c_fc(x)
         #x2 = self.c_fc2(x)
+        x = self.c_fc(x)
         if(qrot):
             x = self.qrot(x)
         else:
             x = self.gelu(x)
+        #x = x * quantizer.TopKHot.apply(x2, self.n_embd*2)
         x = self.c_proj(x)
         #x2 = self.c_proj2(x)
         x = self.dropout(x)
@@ -458,7 +440,68 @@ class MLP(nn.Module):
             #x_rotated = x_rotated*self.gaprelu(x_norm-2)#*torch.sigmoid(xm+ym)#
         return x_rotated.view(b, t, 2 * self.n_embd)
 
+class DynamicSparseMoE(nn.Module):
+    """A Sparse MoE layer using a dynamic, learnable Top-K."""
+    def __init__(self, config, num_experts):
+        super().__init__()
+        self.num_experts = num_experts
+        self.k_selector = nn.Sequential(
+            nn.Linear(config.n_embd + num_experts, config.n_embd // 4),
+            nn.ReLU(),
+            nn.Linear(config.n_embd // 4, 1)
+        )
+        self.gate = nn.Linear(config.n_embd, num_experts)
+        self.experts = nn.ModuleList([MLP(config) for _ in range(num_experts)])
 
+    def forward(self, x):
+        gating_logits = self.gate(x) 
+        batch_size, seq_len, _ = x.shape
+        flat_x = x.view(-1, x.size(-1))
+        flat_logits = gating_logits.view(-1, gating_logits.size(-1))
+        
+        top_k = 1.0+torch.sigmoid(self.k_selector(torch.cat((flat_x, flat_logits), dim=-1))) * (self.num_experts-1)
+        
+        gating_weights = quantizer.dynFKHot.apply(flat_logits, top_k) / torch.round(top_k).detach()
+        gating_weights = gating_weights.view(batch_size, seq_len, self.num_experts)
+
+        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=2)
+        
+        return torch.sum(gating_weights.unsqueeze(-1) * expert_outputs, dim=2) 
+
+
+class dynskip(nn.Module):
+    def __init__(self, config, n_layer):
+        super().__init__()
+        self.n_embd = config.n_embd
+        self.n_layer = n_layer
+        self.trunk = nn.ModuleList([
+            nn.Sequential(
+            nn.Linear(config.n_embd , config.n_embd),
+            nn.ReLU(),
+        ) for _ in range(n_layer)])
+        self.router = nn.Linear(config.n_embd*2, config.n_embd * n_layer)
+
+    def forward(self, x):
+        #input batch, time, embed (b,t,c)
+        intermediate_outputs = []
+        current_input = x
+        for layer in self.trunk:
+            current_input = layer(current_input)
+            intermediate_outputs.append(current_input)
+        #know the ins and outs to decide :)
+        logits = self.router(torch.cat((x,current_input),dim=-1))
+        
+        logits = logits#.view(x.shape[0], x.shape[1], self.n_embd, self.n_layer)
+        selection_mask = quantizer.TopKHot(logits, self.n_embd)
+        #embed's worth of selections, sure, some places return 0 or outputs added, such is life.
+
+        stacked_outputs = torch.stack(intermediate_outputs, dim=-1)
+        
+        masked_outputs = stacked_outputs * selection_mask
+        return torch.sum(masked_outputs, dim=-1)
+        
+
+moe = False
 class MemBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -470,7 +513,10 @@ class MemBlock(nn.Module):
         else:
             self.attn = MemAttention(config)
         self.ln_2 = LayerNorm(config)
-        self.mlp = MLP(config)
+        if moe:
+            self.mlp = DynamicSparseMoE(config, 4)
+        else:
+            self.mlp = MLP(config)
         self.register_buffer("block_input",torch.zeros([config.block_size, config.n_embd]))
         if fftmem:
             self.register_buffer("mem_input",torch.zeros([config.block_size, config.n_embd]))
@@ -548,7 +594,7 @@ class wnormlearnloss(nn.Module):
 
     def forward(self, x):
         loss = self.head(x)
-        return F.softplus(loss).mean()
+        return utils.minmaxnorm(loss).mean()
 
 class UncertaintyWeightedLoss(nn.Module):
     def __init__(self, num_losses: int):
