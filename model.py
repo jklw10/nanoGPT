@@ -7,16 +7,13 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
-import copy
 import math
 import inspect
 from dataclasses import dataclass
 
-from pytorch_wavelets import DWT1DForward
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-import optim
 import utils
 import wackmodel
 from cut_cross_entropy import linear_cross_entropy
@@ -65,11 +62,15 @@ acl1            = False # unimplemented
 nmix            = False
 losspred        = False
 
-k_atten         = True
+dynskip         = False
+k_atten         = False
+moe             = False
+sprs            = False
+wnll            = True
 
 auxmod          = acl1 or acebtl #or topoloss
 
-blockin         = spl or symloss or midchaos or topoloss or specl
+blockin         = spl or symloss or midchaos or topoloss or specl or dynskip
 
 
 class LayerNorm(nn.Module):
@@ -268,7 +269,7 @@ class QrotAttention(nn.Module):
         return Y
     
 
-class MemAttention(nn.Module):
+class Attention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
@@ -312,66 +313,81 @@ class MemAttention(nn.Module):
 
         return y
 
-class KPredictor(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        head_dim = config.n_embd // config.n_head
-        self.net = nn.Sequential(
-            nn.Linear(head_dim, head_dim * 2),
-            nn.ReLU(),
-            nn.Linear(head_dim * 2, 1),
-            nn.Tanh()
-        )
-        self.qdim = config.block_size
-        
-        self.k_center_logit = nn.Parameter(torch.zeros(1))
-        self.k_scale_logit = nn.Parameter(torch.zeros(1))
-
-    def forward(self, q):
-        deviation = self.net(q) 
-
-        center = 1.0 + (self.qdim - 1) * torch.sigmoid(self.k_center_logit)
-        scale = (self.qdim / 2) * torch.sigmoid(self.k_scale_logit)
-        k_predicted_float = (center + deviation * scale).clamp(1.0, float(self.qdim))
-        
-        return k_predicted_float
-    
-class Kattention(nn.Module):
-    def __init__(self, config):
+class TopKSparseAttention(nn.Module):
+    def __init__(self, config, k_sparse=1):
         super().__init__()
         assert config.n_embd % config.n_head == 0
+        
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        self.resid_dropout = nn.Dropout(config.dropout)
+        
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_head
         
-        self.k_predictor = KPredictor(config)
+        # Simple, query-independent scorer
+        self.key_scorer = nn.Linear(self.head_dim, 1)
+        
+        self.k_sparse = k_sparse
 
-    def forward(self, x, causal = False):
-        B, T, C = x.size() 
+    def forward(self, x, causal = True):
+        B, T, C = x.size()
+
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
-        att_logits = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # 1. Get query-independent scores for all keys.
+        key_scores = self.key_scorer(k).squeeze(-1) # Shape: (B, nh, T)
 
-        mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, T, T)
-        att_logits = att_logits.masked_fill(mask == 0, float('-inf'))
+        # --- The New, Elegant Causal Selection ---
 
-        k_predicted = torch.ones(1,device=x.device)*8.0 #self.k_predictor(q).clamp(1,T) 
+        # 2. Create a causal mask for the scores.
+        # This will be used to filter the scores *before* topk.
+        causal_mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, T, T)
+        
+        # We need to expand the scores to a (T, T) matrix for each query
+        # to apply the mask.
+        scores_for_selection = key_scores.unsqueeze(2).expand(-1, -1, T, -1) # (B, nh, T, T)
+        
+        # 3. Apply the causal mask to the scores.
+        # We use masked_fill to ensure that future keys have no chance of being selected.
+        causally_masked_scores = scores_for_selection.masked_fill(causal_mask == 0, float('-inf'))
+        
+        # 4. Now, perform Top-K on these causally valid scores.
+        # For each query (dim=2), we select the top k keys from its past (dim=3).
+        # This is guaranteed to be causal and NaN-free.
+        # We also need to handle the case where t < k_sparse.
+        k_val = min(self.k_sparse, T)
+        _, top_indices = torch.topk(causally_masked_scores, k=k_val, dim=-1) # (B, nh, T, k_val)
 
-        khot_mask = quantizer.TopKHot.apply(att_logits, 8)
+        # --- The rest of the attention mechanism is now simpler and safer ---
 
-        sparse_att_logits = att_logits.masked_fill(khot_mask == 0, float('-inf'))
-        sparse_probs = F.softmax(sparse_att_logits, dim=-1)
+        # 5. Gather the Keys and Values based on the valid indices.
+        # This gather is the same complex gather as before.
+        expanded_indices = top_indices.unsqueeze(-1).expand(-1, -1, -1, -1, self.head_dim)
+        k_expanded = k.unsqueeze(2).expand(-1, -1, T, -1, -1)
+        v_expanded = v.unsqueeze(2).expand(-1, -1, T, -1, -1)
+        
+        sparse_k = torch.gather(k_expanded, 3, expanded_indices)
+        sparse_v = torch.gather(v_expanded, 3, expanded_indices)
+        
+        # 6. Perform the efficient dot-product.
+        # The logits matrix is guaranteed to have valid entries because our selection was valid.
+        q_for_attn = q.unsqueeze(3)
+        attn_logits = (q_for_attn @ sparse_k.transpose(-2, -1)).squeeze(3) * (1.0 / math.sqrt(self.head_dim))
+        
+        # 7. Final softmax and value application.
+        # No need for stability fixes here, as we have no all-'-inf' rows.
+        sparse_probs = F.softmax(attn_logits, dim=-1)
+        y = (sparse_probs.unsqueeze(3) @ sparse_v).squeeze(3)
 
-        y = sparse_probs @ v 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-
-        y = self.resid_dropout(self.c_proj(y))
+        y = self.c_proj(y)
+        
         return y
+
 
 class LearnableSpiral4D(nn.Module):
     def __init__(self, init_freq=1.0, init_amp=1.0):
@@ -444,32 +460,30 @@ class DynamicSparseMoE(nn.Module):
     """A Sparse MoE layer using a dynamic, learnable Top-K."""
     def __init__(self, config, num_experts):
         super().__init__()
+        self.config = config
         self.num_experts = num_experts
-        self.k_selector = nn.Sequential(
-            nn.Linear(config.n_embd + num_experts, config.n_embd // 4),
-            nn.ReLU(),
-            nn.Linear(config.n_embd // 4, 1)
-        )
         self.gate = nn.Linear(config.n_embd, num_experts)
+        config.n_embd = config.n_embd // num_experts
         self.experts = nn.ModuleList([MLP(config) for _ in range(num_experts)])
+        config.n_embd = config.n_embd * num_experts
+
 
     def forward(self, x):
         gating_logits = self.gate(x) 
-        batch_size, seq_len, _ = x.shape
-        flat_x = x.view(-1, x.size(-1))
+        b, t, c = x.shape
         flat_logits = gating_logits.view(-1, gating_logits.size(-1))
         
-        top_k = 1.0+torch.sigmoid(self.k_selector(torch.cat((flat_x, flat_logits), dim=-1))) * (self.num_experts-1)
+        gating_weights = quantizer.ThresHot.apply(flat_logits)
+       # gating_weights /= gating_weights.sum(dim=-1, keepdim=True).detach()
+        gating_weights = gating_weights.view(b, t, self.num_experts)
+        xchunked = x.view(b, t, self.config.n_embd // self.num_experts, self.num_experts)
+        expert_outputs = torch.stack([expert(xchunked[...,i]) for i, expert in enumerate(self.experts)], dim=2)
         
-        gating_weights = quantizer.dynFKHot.apply(flat_logits, top_k) / torch.round(top_k).detach()
-        gating_weights = gating_weights.view(batch_size, seq_len, self.num_experts)
-
-        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=2)
-        
-        return torch.sum(gating_weights.unsqueeze(-1) * expert_outputs, dim=2) 
+        return (gating_weights.unsqueeze(-1) * expert_outputs).view(b,t,c)
+        #return torch.sum(gating_weights.unsqueeze(-1) * expert_outputs, dim=2) 
 
 
-class dynskip(nn.Module):
+class Dynskip(nn.Module):
     def __init__(self, config, n_layer):
         super().__init__()
         self.n_embd = config.n_embd
@@ -482,39 +496,40 @@ class dynskip(nn.Module):
         self.router = nn.Linear(config.n_embd*2, config.n_embd * n_layer)
 
     def forward(self, x):
-        #input batch, time, embed (b,t,c)
+        
         intermediate_outputs = []
         current_input = x
         for layer in self.trunk:
             current_input = layer(current_input)
             intermediate_outputs.append(current_input)
-        #know the ins and outs to decide :)
+        
         logits = self.router(torch.cat((x,current_input),dim=-1))
         
         logits = logits#.view(x.shape[0], x.shape[1], self.n_embd, self.n_layer)
-        selection_mask = quantizer.TopKHot(logits, self.n_embd)
-        #embed's worth of selections, sure, some places return 0 or outputs added, such is life.
+        #selection_mask = quantizer.TopKHot(logits, self.n_embd)
 
         stacked_outputs = torch.stack(intermediate_outputs, dim=-1)
         
-        masked_outputs = stacked_outputs * selection_mask
-        return torch.sum(masked_outputs, dim=-1)
+        return quantizer.GatherByGate(logits, stacked_outputs,2).sum(dim=-1)
+
+        #masked_outputs = stacked_outputs * selection_mask
+        #return torch.sum(masked_outputs, dim=-1)
         
 
-moe = False
-class MemBlock(nn.Module):
+class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config)
         if(Qrotention):
             self.attn = QrotAttention(config)
-        elif k_atten:
-            self.attn = Kattention(config)
+        elif sprs:
+            self.attn = TopKSparseAttention(config)
+        
         else:
-            self.attn = MemAttention(config)
+            self.attn = Attention(config)
         self.ln_2 = LayerNorm(config)
         if moe:
-            self.mlp = DynamicSparseMoE(config, 4)
+            self.mlp = DynamicSparseMoE(config, 10)
         else:
             self.mlp = MLP(config)
         self.register_buffer("block_input",torch.zeros([config.block_size, config.n_embd]))
@@ -544,7 +559,7 @@ class Dreamer(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.block = MemBlock(config)
+        self.block = Block(config)
         self.comp = LearnableFourierResampler(config.mem_block_size * 2, config.mem_block_size, 64)
         
     def forward(self, x):
@@ -580,38 +595,22 @@ class GPTConfig:
     step = 0
 
 wn = torch.nn.utils.parametrizations.weight_norm
+
 class wnormlearnloss(nn.Module):
-    def __init__(self, dims):
+    def __init__(self, config):
         super().__init__()
-        # Create one learnable log_sigma_sq parameter for each loss
+              
         self.head = nn.Sequential(
-                wn(Linear(dims, dims*2),dim=None),
+                wn(nn.Linear(config.n_embd, config.n_embd*2),dim=None),
                 nn.GELU(),
-                wn(Linear(dims*2, dims*2),dim=None),
-                nn.GELU(),
-                wn(Linear(dims*2, 1))
+                #wn(nn.Linear(config.n_embd*2, config.n_embd*2),dim=None),
+                #nn.GELU(),
+                wn(nn.Linear(config.n_embd*2, 1))
             )
 
     def forward(self, x):
-        loss = self.head(x)
-        return utils.minmaxnorm(loss).mean()
-
-class UncertaintyWeightedLoss(nn.Module):
-    def __init__(self, num_losses: int):
-        super().__init__()
-        # Create one learnable log_sigma_sq parameter for each loss
-        self.log_sigmas_sq = nn.Parameter(torch.zeros(num_losses), requires_grad=True)
-
-    def forward(self, *losses):
-        total_loss = 0
-        for i, loss in enumerate(losses):
-            precision = torch.exp(-self.log_sigmas_sq[i])
-            regularization = self.log_sigmas_sq[i]
-            
-            total_loss += precision * loss + regularization
-            
-        return total_loss
-
+        loss =  utils.minmaxnorm(self.head(x)).mean()
+        return loss
     
 class GPT(nn.Module):
 
@@ -629,9 +628,8 @@ class GPT(nn.Module):
         self.bembwidth = config.n_embd//2
         config.internal_block_size = config.block_size
         config.mem_block_size = config.block_size #unfortunately uncoupling these proves difficult.
-        blocks = nn.ModuleList([MemBlock(config) for _ in range(config.n_layer)])
-        self.denoiser = MemBlock(config) 
-        
+        blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        #blocks = nn.ModuleList([graphmodel.GraphFormerBlock(config) for _ in range(config.n_layer)])
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             
@@ -640,6 +638,11 @@ class GPT(nn.Module):
             h = blocks,
             ln_f = LayerNorm(config),
         ))
+
+        #self.denoiser = MemBlock(config) 
+        if dynskip:
+            self.router = nn.Linear(config.n_embd*2, config.n_layer)
+        
         if(think):
             self.thinkthreshold = nn.Parameter(torch.ones(1))
             self.thinkstop = nn.Sequential(
@@ -656,7 +659,9 @@ class GPT(nn.Module):
                 self.register_buffer('memory', torch.zeros(1, config.internal_block_size, config.n_embd//2))
             elif qmem:
                 self.qdim = 64
-                self.mem_quant = quantizer.NKQAE(config.n_embd, config.n_embd*2, self.qdim)
+                #self.mem_quant = quantizer.NKQAE(config.n_embd, config.n_embd*2, self.qdim)
+                
+                self.mem_quant = quantizer.Autoencoder(config.n_embd, config.n_embd, config.n_embd, self.qdim, quantizer.ThresHot)
                 self.register_buffer('memory', torch.zeros(1, config.mem_block_size, dtype=torch.long))
                 self.mem_pos_selector = nn.Sequential(
                     Linear(config.n_embd*2, config.n_embd*4, bias=False),
@@ -665,20 +670,14 @@ class GPT(nn.Module):
                     nn.GELU(),
                     Linear(config.n_embd*2, config.mem_block_size, bias=False),
                 )
-                self.mem_pos_selector_selector = nn.Sequential(
-                    Linear(config.mem_block_size, config.mem_block_size*4, bias=False),
-                    nn.GELU(),
-                    Linear(config.mem_block_size*4, config.mem_block_size*2, bias=False),
-                    nn.GELU(),
-                    Linear(config.mem_block_size*2, config.mem_block_size, bias=False),
-                )
+                
 
             else:
                 self.register_buffer('memory', torch.randn(1, config.mem_block_size, config.n_embd)*1e-5)
             if(config.dropout > 0.0):
                 config.dropout = config.dropout / 4
             self.dreamer = Dreamer(config)
-            self.memory_selector = MemBlock(config)
+            self.memory_selector = Block(config)
             
             self.mem_comp = LearnableFourierResampler(config.mem_block_size, config.mem_block_size//2, 32)
             
@@ -731,9 +730,7 @@ class GPT(nn.Module):
                             torch.nn.Linear(self.auxmlpout*2,self.auxmlpout ),
 
                         )
-        if topoloss:
-            self.ucl = UncertaintyWeightedLoss(3)  
-        #if mix_squish:
+        
         self.c_comp = LearnableFourierResampler(config.n_embd,config.n_embd//2,config.n_embd//4)
         
         self.decomp = torch.nn.Sequential(
@@ -745,7 +742,7 @@ class GPT(nn.Module):
 
                         )
         if(losspred):
-            self.lpb = MemBlock(config) 
+            self.lpb = Block(config) 
             self.botl = torch.nn.Sequential(
                             torch.nn.Linear(config.n_embd,config.n_embd//2),
                             torch.nn.GELU(),
@@ -754,7 +751,7 @@ class GPT(nn.Module):
                             torch.nn.Linear(config.n_embd//8, 1),
 
                         )
-        #self.wnl = wnormlearnloss(config.n_embd*4)
+        self.wnl = wnormlearnloss(config)
         self.gradsink = nn.Parameter(torch.randn(config.n_embd))
         self.predict_weight = 0.01
         # init all weights
@@ -847,6 +844,17 @@ class GPT(nn.Module):
             #x = x + x * F.tanh(dcloss)
             x = block(x) 
 
+        if dynskip:
+            logits = self.router(torch.cat((block_inputs[0],x),dim=-1))
+
+            #logits = logits#.view(x.shape[0], x.shape[1], self.n_embd, self.n_layer)
+            #selection_mask = quantizer.TopKHot(logits, self.n_embd)
+
+            stacked_outputs = torch.stack(block_inputs, dim=-1)
+
+            x = quantizer.GatherByGate.apply(logits, stacked_outputs,1).sum(dim=-1)
+            
+
         if acebtl:
             x, acl = self.acebtl(x, tok_emb)
         
@@ -863,15 +871,22 @@ class GPT(nn.Module):
         if targets is not None:
             logits = None# self.lm_head(x)
             reduction= 'none'
+            loss = linear_cross_entropy(x.to(torch.bfloat16), self.lm_head.weight.to(torch.bfloat16), targets, impl='torch_compile', reduction=reduction)
             if(not self.training):
                 reduction = 'mean'
+                loss = linear_cross_entropy(x[:,8:,:].to(torch.bfloat16), 
+                                            self.lm_head.weight.to(torch.bfloat16), 
+                                            targets[:,8:], 
+                                            impl='torch_compile', 
+                                            reduction=reduction)
             
-            loss = linear_cross_entropy(x.to(torch.bfloat16), self.lm_head.weight.to(torch.bfloat16), targets, impl='torch_compile', reduction=reduction)
+            
             
             #TODO: wavelet loss
 
             if self.training:
-
+                if wnll:
+                    loss = loss + self.wnl(x)
                 if losspred:
                     loss = (loss + F.mse_loss(self.botl(self.lpb(x)).squeeze(-1), loss.detach()))/2.0
 
@@ -1064,7 +1079,7 @@ class GPT(nn.Module):
     
     def mem_quant_fwd(self, targets, x):
         b, t, c = x.size()
-
+        malpha = 0.0001
         #mit = self.memory.expand(b,self.config.mem_block_size,self.config.n_embd)
         kh = utils.bitfield_to_k_hot(self.memory, self.qdim).float().detach()
         memory = self.mem_quant.dequant(kh)#.expand(b,self.config.mem_block_size,self.config.n_embd)
@@ -1092,23 +1107,25 @@ class GPT(nn.Module):
             tally1 = torch.sum(mp1, dim=1) # Shape is now (1, 64)
             tally2 = torch.sum(mp2, dim=1) # Shape is now (1, 64)
 
-            # 3. Use the final tally to select the top K memory slots to update.
-            # You can change k=1 to something else to allow multi-slot updates.
-            mkhot1 = quantizer.TopKHot.apply(tally1, 1) # Shape: (1, 64)
-            mkhot2 = quantizer.TopKHot.apply(tally2, 1)
+            ## 3. Use the final tally to select the top K memory slots to update.
+            ## You can change k=1 to something else to allow multi-slot updates.
+            #mkhot1 = quantizer.TopKHot.apply(tally1, 1) # Shape: (1, 64)
+            #mkhot2 = quantizer.TopKHot.apply(tally2, 1)
+            mkhot1 = quantizer.ThresHot.apply(tally1)
+            mkhot2 = quantizer.ThresHot.apply(tally2)
             
             #mem = self.mem_quant.quant(memory)
             #muh1 = self.mem_quant(mem + mith1 * mkhot1.T)
             #muh2 = self.mem_quant(mem + mith2 * mkhot2.T)
             
             mum1 = mkhot1.unsqueeze(-1) # Shape: (batch/2, mem_block_size, 1)
-            muh1 = mh1 * mum1
+            muh1 = mh1 * mum1 *malpha
             muh1 = memory + muh1
             muh1 = self.mem_quant(muh1)[0]
 
             mum2 = mkhot2.unsqueeze(-1) # Shape: (batch/2, mem_block_size, 1)
             
-            muh2 = mh2 * mum2
+            muh2 = mh2 * mum2*malpha
             muh2 = memory + muh2
             muh2 = self.mem_quant(muh2)[0]
             
@@ -1133,21 +1150,23 @@ class GPT(nn.Module):
                 
                 tally1 = torch.sum(pos_logits, dim=1) # Shape is now (1, 64)
 
-                _, index_to_update = torch.topk(tally1, k=1, dim=-1) # Shape: (1, 1)
-                mkhot1 = quantizer.TopKHot.apply(tally1, 1) # Shape: (1, 64)
+                #_, index_to_update = torch.topk(tally1, k=1, dim=-1) # Shape: (1, 1)
+                mkhot1 = quantizer.ThresHot.apply(tally1) # Shape: (1, 64)
                 
                 mum1 = mkhot1.unsqueeze(-1) # Shape: (batch/2, mem_block_size, 1)
-                muh1 = mh1 * mum1
+                muh1 = mh1 * mum1*malpha
                 muh1 = memory + muh1
                 
                 #muh1 = self.mem_quant(muh1)[0]
                 
                 final_khot = self.mem_quant.quant(muh1)
                 
-                idx = index_to_update.squeeze()
-                final_bitfield = utils.k_hot_to_bitfield(final_khot[0, idx, :]).squeeze()
+                #idx = index_to_update.squeeze()
+                final_bitfield = utils.k_hot_to_bitfield(final_khot[0, :, :]).squeeze()
                 #torch._dynamo.graph_break() 
-                self.memory[0,idx] = final_bitfield
+                #self.set_mem(idx,final_bitfield)
+                #torch._dynamo.graph_break()
+                self.memory[0, :] = final_bitfield
                 #dequantized_mem_at_index = memory[0, index_to_update.squeeze()]
                 #final_content = dequantized_mem_at_index + updated_mem.squeeze(0)
 
@@ -1176,6 +1195,10 @@ class GPT(nn.Module):
             loss = None 
         return logits, loss
     
+    @torch._dynamo.graph_break
+    def set_mem(self,idx,mem):
+        self.memory[0, idx] = mem
+
     def mem_fwd(self, targets, x):
         b, t, c = x.size()
         malpha= 1.0#todo

@@ -272,7 +272,7 @@ muon                = False
 #for fftmem owt: 1e-5 #beta2 dependent
 #for fftmem skspr: 5e-5 #beta2 dependent
 #no clue why this way of passing is needed here but not for the bools. love python
-config["swna"]      = 1e-5 if dataset == "openwebtext" else 1e-3
+config["swna"]      = 1e-5 if dataset == "openwebtext" else 1.0
 config["swwa"]      = 1.0e-5 if dataset == "openwebtext" else 1e-4
 zcastep             = 2 #2, 5
 szcapow             = 2 #2, 10

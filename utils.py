@@ -616,9 +616,11 @@ def softwnorm(model, alpha = 1e-5):
                 if p.ndim >= 2:
                     a = alpha
                     dim = [-1,-2]
-                else:
+                elif p.ndim >= 1:
                     a = alpha * 1e-5
                     dim = [-1]
+                else:
+                    continue
 
                 pstep = snormstep(p, a, dim) 
                 #pstep = (p.data - (p.data / p.data.norm(p=2,dim=dim,keepdim=True)))*a
