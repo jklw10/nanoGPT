@@ -159,7 +159,7 @@ class AsymmetricCausalGate(torch.autograd.Function):
         # Return grads for: key_scores, k_full, v_full, q_full, k_pool_size
         return grad_key_scores, grad_k_full, grad_v_full, None, None
 
-class GatherByGate2(torch.autograd.Function):
+class GatherByGate(torch.autograd.Function):
     @staticmethod
     def forward(ctx, gate_logits, candidate_pool, k):
         b,ct,c = candidate_pool.shape

@@ -17,7 +17,7 @@ import quantizer
 dataset = "shakespeare_char"
 data_dir = os.path.join('data', dataset)
 batch_size = 64
-block_size = 512
+block_size = 256
 
 DIM_L1 = 64
 DIM_L2 = 256
@@ -26,14 +26,14 @@ DIM_L3 = 1024
 K_GATHER_L1 = 64
 K_GATHER_L2 = 16
 
-max_iters = 1000
-eval_interval = 100
+max_iters = 5000
+eval_interval = 1000
 learning_rate = 1e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 device_type = 'cuda'
-
+skiptok = 1
 warmup_iters = 200
-lr_decay_iters = 5000
+lr_decay_iters = 15000
 min_lr = 1e-5
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
@@ -67,10 +67,10 @@ if not os.path.exists(data_dir):
 meta_path = os.path.join(data_dir, 'meta.pkl')
 with open(meta_path, 'rb') as f: meta = pickle.load(f)
 vocab_size = meta['vocab_size']
-skiptok = 1
+
 def get_batch(split):
     data = np.memmap(os.path.join(data_dir, f'{split}.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
+    ix = torch.randint(len(data) - block_size-skiptok, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+skiptok:i+skiptok+block_size]).astype(np.int64)) for i in ix])
     if device_type == 'cuda': 
@@ -152,42 +152,53 @@ class Patcher(nn.Module):
         self.down_scatter = sBlock(inner_dim, 4, 0.0,False)
         self.down_proj = nn.Linear(inner_dim,outer_dim)
         self.down_scan = modules.Block(outer_dim,4,0.0,False)
+        
+        #self.up_gate = nn.Linear(self.sdim*outer_seq, outer_seq)
+        self.up_gate = nn.Sequential(
+            nn.Linear(outer_dim, outer_dim // 4),
+            nn.ReLU(),
+            nn.Linear(outer_dim // 4, 1)
+        )
 
-        self.s_gate = nn.Linear(self.sdim*inner_seq, outer_seq)
+        self.down_gate = nn.Linear(self.sdim*inner_seq, outer_seq)
         
         self.down_norm = modules.LayerNorm(inner_dim, False)
 
         self.up_norm = modules.LayerNorm(outer_dim, False)
         self.up_norm2 = modules.LayerNorm(outer_dim, False)
         self.up_drain = nn.Parameter(torch.ones(outer_dim))
-        
-    def forward(self, x, center):
-        b,t,c = x.shape
+    
+    def abstract_up(self, x):
         scan = self.up_scan(x)
-        losses = F.mse_loss(x[:,1:,:],scan[:,:-1,:],reduction="none")
-        gate = losses.sum(dim=-1)
-        gate = F.pad(gate, (0, 1), "constant", 0)#.detach()
-        gathered = quantizer.GatherByGate2.apply(F.softmax(gate, dim=-1), F.softmax(scan, dim=-1), self.inner_seq)
+        #trim = scan[...,:self.sdim]
+        #trim = trim.reshape(x.shape[0], x.shape[1]*self.sdim)
+        gate = self.up_gate(scan).squeeze(-1)
+        #losses = F.mse_loss(x[:,1:,:],scan[:,:-1,:],reduction="none")
+        #gate = losses.sum(dim=-1)
+        #gate = F.pad(gate, (1, 0), "constant", 0)#.detach()
+        gathered = quantizer.GatherByGate.apply(F.softmax(gate, dim=-1), F.softmax(x, dim=-1), self.inner_seq)
         
-        p_up = self.up_proj(gathered)
-        #p_up = self.up_proj(self.upnorm(gathered))
-        passed, loss2 = center(p_up)
-        #passed = center(p_up)
-  
-
-        sg = self.s_gate(passed[...,:self.sdim].reshape(b,self.inner_seq*self.sdim))
+        return self.up_proj(gathered), x, losses
+    def abstract_down(self, x, residual):
+        sg = self.down_gate(x[...,:self.sdim].reshape(x.shape[0], self.inner_seq*self.sdim))
         sg = F.softmax(sg, dim=-1)
-        scattered = quantizer.ScatterByGate.apply(sg, passed, self.outer_seq)
+        scattered = quantizer.ScatterByGate.apply(sg, x, self.outer_seq)
         
-        pos = torch.arange(0, t, dtype=torch.long, device=device) 
-        phot = F.one_hot(pos, t).to(x.dtype)
+        pos = torch.arange(0, self.outer_seq, dtype=torch.long, device=device) 
+        phot = F.one_hot(pos, self.outer_seq).to(x.dtype)
         
         scattered = scattered + self.output_pos_emb(phot.detach())
-        pds = self.down_scatter(passed, scattered)
-        p_down = self.down_proj(pds)
+        pds = self.down_scatter(x, scattered)
+        p_down = self.down_proj(pds)+residual
 
+        return self.down_scan(p_down)
+    
+    def forward(self, x, center):
+        p_up, residual, losses = self.abstract_up(x)
+        passed, loss2 = center(p_up)
+        p_down=self.abstract_down(passed, residual)
         loss1 = torch.zeros(1,dtype=x.dtype,device=x.device)#losses.mean()
-        return self.down_scan(p_down+scan), loss1 + loss2
+        return p_down, loss1 + loss2
         
 
 
@@ -211,7 +222,7 @@ class HNet(nn.Module):
         positions = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0)
         tok_emb = self.token_embedder(idx)
         pos_emb = self.pos_embedder(positions)
-        x0 = tok_emb + pos_emb # This is our first skip connection
+        x0 = tok_emb + pos_emb 
         x = x0
         def innerb(xin):
             return self.innerb(xin), torch.zeros(1,dtype=x.dtype,device=x.device)
@@ -220,6 +231,26 @@ class HNet(nn.Module):
         x, aux = self.sLayers[0](x,inner)
         #x = self.sLayers[0](x,inner)
 
+        # --- 2. Calculate the Self-Consistency Loss ---
+        total_consistency_loss = 0.0
+        
+        #input_shifted = F.pad(x0[:, skiptok:, :], (0,0,skiptok, 0), "constant", 0)
+        #output_shifted = F.pad(x[:, :-skiptok, :], (0,0,skiptok, 0), "constant", 0)
+        
+        input_shifted = x0[:, skiptok:, :]
+        output_shifted = x[:, :-skiptok, :]
+        #gate = F.pad(gate, (skiptok, 0), "constant", 0)
+        current_input_rep = input_shifted
+        current_output_rep = output_shifted
+
+        for layer in self.sLayers:
+            encoded_input, _, _ = layer.abstract_up(current_input_rep)
+            encoded_output, _, _ = layer.abstract_up(current_output_rep)
+            
+            total_consistency_loss += F.mse_loss(encoded_input, encoded_output)
+            
+            current_input_rep = encoded_input
+            current_output_rep = encoded_output
         
         loss = None
         if targets is not None:
@@ -228,7 +259,7 @@ class HNet(nn.Module):
             targets_aligned = targets[:, :T_out]
             loss = F.cross_entropy(logits.reshape(-1, C), targets_aligned.reshape(-1))
             if self.training:
-                loss = loss+aux
+                loss = loss+aux+total_consistency_loss
         else:
             logits = self.head(x[:, -skiptok:, :])
 
@@ -249,11 +280,14 @@ class HNet(nn.Module):
             # optionally crop the logits to only the top k options
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
+                logits[logits < v[:, :, [-1]]] = -float('Inf')
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
+            B, T, C = probs.shape
+            probs_2d = probs.view(B * T, C)
             # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
+            idx_next = torch.multinomial(probs_2d, num_samples=1)
+            idx_next = idx_next.view(B, T)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 
@@ -306,7 +340,7 @@ for iter in range(max_iters):
             print(f"{i+1}. {name:<60} | Norm: {norm:.4f}")
     #torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
-gen = False
+gen = True
 if gen:
     meta_path = os.path.join('data', 'shakespeare_char/meta.pkl')
 
@@ -327,7 +361,7 @@ if gen:
     X, Y = get_batch('train')
     with torch.no_grad():
         model.eval()
-        outp = model.generate(X[0].unsqueeze(0), 100, temperature=0.01, top_k=200)
+        outp = model.generate(X[0].unsqueeze(0), 100, temperature=1.0, top_k=5)
         model.train()
-    print(decode(outp[0].detach().cpu().numpy().tolist()))
+    print(decode(outp[0,-100:].detach().cpu().numpy().tolist()))
     print("Training finished.")
