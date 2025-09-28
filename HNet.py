@@ -14,7 +14,6 @@ import torch.nn.functional as F
 import modules
 import quantizer
 
-# --- Configuration (remains the same) ---
 dataset = "shakespeare_char"
 data_dir = os.path.join('data', dataset)
 batch_size = 64
@@ -29,45 +28,62 @@ K_GATHER_L2 = 16
 
 max_iters = 30000
 eval_interval = 1000
-learning_rate = 1e-4
+learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 device_type = 'cuda'
 skiptok = 1
 warmup_iters = 200
 lr_decay_iters = 15000
-min_lr = 1e-5
-# learning rate decay scheduler (cosine with warmup)
+min_lr = 1e-4
+
+idk_enabled = False
+cl          = False
+mem         = False
+gradlog     = False
+gen         = True
+
+#todo, wnorm, midreset, lr on memory, memswizzle.
+
 def get_lr(it):
     
-    # 1) linear warmup for warmup_iters steps
     if it < warmup_iters:
         return learning_rate * (it + 1) / (warmup_iters + 1)
     
     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-    # 2) if it > lr_decay_iters, return min learning rate
     if it > lr_decay_iters:
         return min_lr
-    # 3) in between, use cosine decay down to min learning rate
     assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) 
     return min_lr + coeff * (learning_rate - min_lr)
 
-# --- Data Loading (remains the same) ---
 if not os.path.exists(data_dir):
     os.makedirs(data_dir, exist_ok=True)
     url = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
-    with open(os.path.join(data_dir, 'input.txt'), 'w', encoding='utf-8') as f: f.write(requests.get(url).text)
-    with open(os.path.join(data_dir, 'input.txt'), 'r') as f: data = f.read()
-    chars = sorted(list(set(data))); vocab_size = len(chars)
-    stoi = { ch:i for i,ch in enumerate(chars) }; itos = { i:ch for i,ch in enumerate(chars) }
-    n = len(data); train_data = data[:int(n*0.9)]; val_data = data[int(n*0.9):]
-    train_ids = np.array([stoi[c] for c in train_data], dtype=np.uint16); val_ids = np.array([stoi[c] for c in val_data], dtype=np.uint16)
-    train_ids.tofile(os.path.join(data_dir, 'train.bin')); val_ids.tofile(os.path.join(data_dir, 'val.bin'))
+    with open(os.path.join(data_dir, 'input.txt'), 'w', encoding='utf-8') as f: 
+        f.write(requests.get(url).text)
+    with open(os.path.join(data_dir, 'input.txt'), 'r') as f: 
+        data = f.read()
+    chars = sorted(list(set(data)))
+    vocab_size = len(chars)
+    stoi = { ch:i for i,ch in enumerate(chars) }
+    itos = { i:ch for i,ch in enumerate(chars) }
+    n = len(data)
+    train_data = data[:int(n*0.9)] 
+    val_data = data[int(n*0.9):]
+    train_ids = np.array([stoi[c] for c in train_data], dtype=np.uint16)
+    val_ids = np.array([stoi[c] for c in val_data], dtype=np.uint16)
+    train_ids.tofile(os.path.join(data_dir, 'train.bin'))
+    val_ids.tofile(os.path.join(data_dir, 'val.bin'))
     meta = {'vocab_size': vocab_size, 'itos': itos, 'stoi': stoi}
-    with open(os.path.join(data_dir, 'meta.pkl'), 'wb') as f: pickle.dump(meta, f)
+    with open(os.path.join(data_dir, 'meta.pkl'), 'wb') as f:
+        pickle.dump(meta, f)
 meta_path = os.path.join(data_dir, 'meta.pkl')
-with open(meta_path, 'rb') as f: meta = pickle.load(f)
+with open(meta_path, 'rb') as f: 
+    meta = pickle.load(f)
 vocab_size = meta['vocab_size']
+if idk_enabled:
+    idk_token = vocab_size
+    vocab_size += 1
 
 def get_batch(split):
     data = np.memmap(os.path.join(data_dir, f'{split}.bin'), dtype=np.uint16, mode='r')
@@ -197,8 +213,47 @@ class Patcher(nn.Module):
         passed = center(p_up)
         p_down = self.abstract_down(passed, residual)
         return p_down
-        
+def idk_loss(logits, targets, idk_token_id, idk_weight=0.1):
+    # Standard cross-entropy part (remains the same)
+    ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
+    # Use log_softmax for numerical stability. This is the key change.
+    log_probs = F.log_softmax(logits, dim=-1)
+
+    # Gather the log probabilities for the correct tokens
+    correct_token_log_probs = torch.gather(log_probs, -1, targets.unsqueeze(-1)).squeeze(-1)
+    
+    # Probabilities are needed for 'incorrectness', but this is less prone to error
+    # since it's not inside a log on the backward pass.
+    correct_token_probs = torch.exp(correct_token_log_probs)
+    
+    # Get the log probabilities for the 'idk' token
+    idk_token_log_probs = log_probs[..., idk_token_id]
+
+    # Calculate incorrectness (same as before)
+    incorrectness = 1.0 - correct_token_probs
+
+    # The encouragement term is now just the negative log probability,
+    # which is already computed. No need for another log().
+    # This avoids the log(small_number) problem entirely.
+    idk_encouragement = -idk_token_log_probs * incorrectness
+
+    # (rest of the function is the same)
+    with torch.no_grad():
+        is_correct = (torch.argmax(logits, dim=-1) == targets)
+    idk_encouragement[is_correct] = 0.0
+
+    # Ensure the encouragement term is not NaN before adding it.
+    # This is a safety check.
+    if torch.isnan(idk_encouragement).any():
+        return ce_loss
+    
+    return ce_loss + idk_weight * idk_encouragement.mean()
+
+
+def check_nan(tensor, name):
+    if torch.isnan(tensor).any():
+        print(f"!!! NaN detected in tensor: {name} !!!")
 
 class HNet(nn.Module):
     def __init__(self, vocab_size):
@@ -213,6 +268,29 @@ class HNet(nn.Module):
         ])
         self.innerb = modules.Block(DIM_L3,4,0.0,False)
         self.innerb2 = modules.Block(DIM_L3,4,0.0,False)
+        memconf = {
+            'mem_block_size': 48,
+            'dropout': 0.0,
+            'n_embd': DIM_L3,
+            'n_head': 4,
+            'bias': False,
+        }
+        self.mem_block_size=memconf['mem_block_size']
+        self.register_buffer('memory', torch.randn(1, self.mem_block_size, DIM_L3)*1e-5)
+        self.memory_frozen = False
+        self.cmem= True
+        self.dreamer = modules.Dreamer(causal=self.cmem, **memconf)
+        self.memory_selector = modules.Block(**memconf)
+
+    def mem_form(self, x):
+        mem         = self.memory_selector(x, causal=self.cmem)[:,:self.mem_block_size,:] #(b, m, c)
+        #check_nan(mem, "selector")
+        return self.dreamer(mem)
+    
+    def mem_update(self, update, malpha=1.0):
+        if self.training and not self.memory_frozen:
+            with torch.no_grad():
+                self.memory = (self.memory+update*malpha)
 
     def forward(self, idx, targets=None):
         device = idx.device
@@ -228,45 +306,68 @@ class HNet(nn.Module):
             
             x, res = layer.abstract_up(x)
             residuals.append(res)
-        
-        x = self.innerb(x)
-        x = self.innerb2(x)
-
+        if mem:
+            cb,ct,cc = x.shape
+            x1 = x
+            x = torch.cat([self.memory.expand(cb,-1,-1), x],dim=1) #probably needs a batch swizzle to pervent cheating
+            x = self.innerb(x)
+            x = self.innerb2(x)
+            malpha = 1.0
+            mem2 = ((self.memory+self.mem_form(x)*malpha)).expand(cb,-1,-1)
+            
+            x = torch.cat([mem2, x1],dim=1) #try what memorization enhances the score
+            x = self.innerb(x)
+            x = self.innerb2(x)
+            self.mem_update(self.mem_form(x),malpha)
+            x = x[:,self.mem_block_size:,:].contiguous()
+        else:
+            x = self.innerb(x)
+            x = self.innerb2(x)
         for i in reversed(range(len(self.sLayers))):
             layer = self.sLayers[i]
             x = layer.abstract_down(x, residuals[i])
         
-        total_cl = 0.0
-        
-        current_input_rep = x0[:, skiptok:, :]
-        current_output_rep = x[:, :-skiptok, :]
+        if cl:
+            total_cl = 0.0
 
-        for i, layer in enumerate(self.sLayers):
-            encoded_input, _  = layer.abstract_up(current_input_rep)
-            encoded_output, _ = layer.abstract_up(current_output_rep)
-            
-            total_cl = total_cl + F.mse_loss(encoded_input, encoded_output)
-            
-            current_input_rep = encoded_input
-            current_output_rep = encoded_output
+            current_input_rep = x0[:, skiptok:, :]
+            current_output_rep = x[:, :-skiptok, :]
+
+            for i, layer in enumerate(self.sLayers):
+                encoded_input, _  = layer.abstract_up(current_input_rep)
+                encoded_output, _ = layer.abstract_up(current_output_rep)
+
+                total_cl = total_cl + F.mse_loss(encoded_input, encoded_output)
+
+                current_input_rep = encoded_input
+                current_output_rep = encoded_output
         
         loss = None
         if targets is not None:
             logits = self.head(x)
             B, T_out, C = logits.shape
             targets_aligned = targets[:, :T_out]
-            loss = F.cross_entropy(logits.reshape(-1, C), targets_aligned.reshape(-1))
+            
             if self.training:
-                loss = loss+total_cl#+aux
+                
+                if idk_enabled:
+                    loss = idk_loss(logits, targets, idk_token) 
+                else:
+                    loss = F.cross_entropy(logits.reshape(-1, C), targets_aligned.reshape(-1))
+                
+                if cl:
+                    loss = loss+total_cl#+aux
+            else:
+                loss = F.cross_entropy(logits.reshape(-1, C), targets_aligned.reshape(-1))
         else:
             logits = self.head(x[:, -skiptok:, :])
 
 
         return logits, loss       
-
+    
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        #SOON :tm: :D
+    
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= block_size else idx[:, -block_size:]
@@ -279,6 +380,8 @@ class HNet(nn.Module):
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, :, [-1]]] = -float('Inf')
+                if idk_enabled:
+                    logits[:,:,idk_token] = -float('Inf')
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
             B, T, C = probs.shape
@@ -292,6 +395,8 @@ class HNet(nn.Module):
         return idx
 
 # --- Training Loop ---
+#torch.autograd.set_detect_anomaly(True)
+
 model = HNet(vocab_size=vocab_size)
 model.to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
@@ -300,7 +405,8 @@ model.compile()
 print(f"Starting training on {device}")
 print(f"Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
 print("Using Cross-Attention DePatcher for flexible sequence reconstruction.")
-gradlog = False
+
+
 if gradlog:
     gradient_norms = {}
 
@@ -343,10 +449,9 @@ for iter in range(max_iters):
         sorted_grads = sorted(gradient_norms.items(), key=lambda item: item[1], reverse=True)
         for i, (name, norm) in enumerate(sorted_grads):
             print(f"{i+1}. {name:<60} | Norm: {norm:.4f}")
-    #torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    #torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     optimizer.step()
     
-gen = True
 if gen:
     meta_path = os.path.join('data', 'shakespeare_char/meta.pkl')
 
@@ -359,8 +464,10 @@ if gen:
         for i in ll:
             if i in itos:
                 decoded.append(itos[i])
+            elif i == idk_token:
+                decoded.append('[IDK]')
             else:
-                decoded.append('[UNK]')  # Or another placeholder for unknown tokens
+                decoded.append(f'[UNK{i}]')  # Or another placeholder for unknown tokens
         return ''.join(decoded)
 
     print("sanity check")

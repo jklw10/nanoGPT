@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import modules
 import utils
 import wackmodel
 from cut_cross_entropy import linear_cross_entropy
@@ -66,7 +67,7 @@ dynskip         = False
 k_atten         = False
 moe             = False
 sprs            = False
-wnll            = True
+wnll            = False
 
 auxmod          = acl1 or acebtl #or topoloss
 
@@ -143,81 +144,6 @@ class PrecomputedFourierResampler(nn.Module):
 
 nlfft = True
 
-class LearnableFourierResampler(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int, num_filters: int):
-        super().__init__()
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.num_filters = num_filters
-
-        # A single set of learnable frequencies defines the filter bank.
-        # We initialize them based on the input dimension for stability.
-        self.frequencies = nn.Parameter(torch.linspace(1, input_dim // 2, num_filters))
-        
-        # We need two separate time axes: one for analysis, one for synthesis.
-        t_in = torch.linspace(0, 1, input_dim, device=self.frequencies.device)
-        t_out = torch.linspace(0, 1, output_dim, device=self.frequencies.device)
-        self.register_buffer("t_in", t_in)
-        self.register_buffer("t_out", t_out)
-
-    def _get_bases(self):
-        """Helper to generate both analysis and synthesis bases."""
-        freqs = self.frequencies.unsqueeze(1)
-        
-        # Analysis bases (for the input signal)
-        arg_in = 2 * math.pi * freqs * self.t_in.unsqueeze(0)
-        sin_basis_in = torch.sin(arg_in)
-        cos_basis_in = torch.cos(arg_in)
-        
-        # Synthesis bases (for the output signal)
-        arg_out = 2 * math.pi * freqs * self.t_out.unsqueeze(0)
-        sin_basis_out = torch.sin(arg_out)
-        cos_basis_out = torch.cos(arg_out)
-        
-        return sin_basis_in, cos_basis_in, sin_basis_out, cos_basis_out
-
-    def forward(self, x: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        """
-        Args:
-            x (torch.Tensor): Input tensor of shape [..., input_dim, ...].
-            dim (int): The dimension to resample.
-        """
-        # --- Preparation ---
-        assert x.shape[dim] == self.input_dim, \
-            f"Input tensor dim {dim} has size {x.shape[dim]}, " \
-            f"but module was initialized with input_dim {self.input_dim}."
-            
-        x_permuted = x.transpose(dim, -1)
-        original_shape = x_permuted.shape
-        x_flattened = x_permuted.reshape(-1, self.input_dim)
-        
-        # --- 1. ANALYSIS ---
-        # Get all four basis sets.
-        sin_basis_in, cos_basis_in, sin_basis_out, cos_basis_out = self._get_bases()
-        
-        # Project input signal onto the ANALYSIS bases to get coefficients.
-        c_sin = torch.einsum('ns,fs->nf', x_flattened, sin_basis_in)
-        c_cos = torch.einsum('ns,fs->nf', x_flattened, cos_basis_in)
-        
-        # `c_sin` and `c_cos` are the compressed representation.
-        
-        # --- 2. SYNTHESIS ---
-        # Reconstruct a new signal by doing a weighted sum of the SYNTHESIS bases.
-        sin_recon = torch.einsum('nf,fs->ns', c_sin, sin_basis_out)
-        cos_recon = torch.einsum('nf,fs->ns', c_cos, cos_basis_out)
-        
-        # The new signal is the sum of the components.
-        x_reconstructed = sin_recon + cos_recon # Shape: [N, output_dim]
-        
-        # --- Reshape Output ---
-        # The last dimension now has size `output_dim`.
-        output_shape = original_shape[:-1] + (self.output_dim,)
-        output = x_reconstructed.view(output_shape)
-        
-        # Put the processed dimension back where it was.
-        output = output.transpose(dim, -1).contiguous()
-        
-        return output
     
 class Scanner(nn.Module):
     def __init__(self, config):
@@ -555,26 +481,6 @@ class Block(nn.Module):
         ) 
         return sploss
     
-class Dreamer(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.block = Block(config)
-        self.comp = LearnableFourierResampler(config.mem_block_size * 2, config.mem_block_size, 64)
-        
-    def forward(self, x):
-        while x.shape[0] > 1:
-            b, t, c = x.size()
-            x = x.reshape(b // 2, 2, t, c) #b//2, 2, t, c
-            x = x.reshape(b // 2, t * 2, c).contiguous() #b//2, 2 * t, c
-            #x = x.view(b//2, 2*t, c)
-            x = x.transpose(1,2)
-            x = self.comp(x)
-            #x = utils.rfft_trunc_squish(x, target_dim= t, dim=1) # ?,t,c
-            x = x.transpose(1,2) # ?,t,c
-            x = self.block(x, causal = CausalMem)
-
-        return x # 1,t,c
 
 @dataclass
 class GPTConfig:
@@ -676,10 +582,10 @@ class GPT(nn.Module):
                 self.register_buffer('memory', torch.randn(1, config.mem_block_size, config.n_embd)*1e-5)
             if(config.dropout > 0.0):
                 config.dropout = config.dropout / 4
-            self.dreamer = Dreamer(config)
+            self.dreamer = modules.Dreamer(**config)
             self.memory_selector = Block(config)
             
-            self.mem_comp = LearnableFourierResampler(config.mem_block_size, config.mem_block_size//2, 32)
+            self.mem_comp = modules.LearnableFourierResampler(config.mem_block_size, config.mem_block_size//2, 32)
             
 
         self.surprise = 1
@@ -731,7 +637,7 @@ class GPT(nn.Module):
 
                         )
         
-        self.c_comp = LearnableFourierResampler(config.n_embd,config.n_embd//2,config.n_embd//4)
+        self.c_comp = modules.LearnableFourierResampler(config.n_embd,config.n_embd//2,config.n_embd//4)
         
         self.decomp = torch.nn.Sequential(
                             torch.nn.Linear(config.n_embd//2,config.n_embd),
