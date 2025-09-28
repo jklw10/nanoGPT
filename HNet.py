@@ -1,5 +1,6 @@
 import math
 import os
+import time
 
 #os.environ['CUDA_LAUNCH_BLOCKING'] = "0" 
 from cut_cross_entropy import linear_cross_entropy
@@ -20,13 +21,13 @@ batch_size = 64
 block_size = 256
 
 DIM_L1 = 64
-DIM_L2 = 256
-DIM_L3 = 1024
+DIM_L2 = 128
+DIM_L3 = 256
 
 K_GATHER_L1 = 64
 K_GATHER_L2 = 16
 
-max_iters = 5000
+max_iters = 30000
 eval_interval = 1000
 learning_rate = 1e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -170,15 +171,13 @@ class Patcher(nn.Module):
     
     def abstract_up(self, x):
         scan = self.up_scan(x)
-        #trim = scan[...,:self.sdim]
-        #trim = trim.reshape(x.shape[0], x.shape[1]*self.sdim)
         gate = self.up_gate(scan).squeeze(-1)
         #losses = F.mse_loss(x[:,1:,:],scan[:,:-1,:],reduction="none")
         #gate = losses.sum(dim=-1)
         #gate = F.pad(gate, (1, 0), "constant", 0)#.detach()
-        gathered = quantizer.GatherByGate.apply(F.softmax(gate, dim=-1), F.softmax(x, dim=-1), self.inner_seq)
+        gathered = quantizer.GatherByGate.apply(F.softmax(gate, dim=-1), F.softmax(scan, dim=-1), self.inner_seq)
         
-        return self.up_proj(gathered), x, losses
+        return self.up_proj(gathered), x
     def abstract_down(self, x, residual):
         sg = self.down_gate(x[...,:self.sdim].reshape(x.shape[0], self.inner_seq*self.sdim))
         sg = F.softmax(sg, dim=-1)
@@ -194,11 +193,10 @@ class Patcher(nn.Module):
         return self.down_scan(p_down)
     
     def forward(self, x, center):
-        p_up, residual, losses = self.abstract_up(x)
-        passed, loss2 = center(p_up)
-        p_down=self.abstract_down(passed, residual)
-        loss1 = torch.zeros(1,dtype=x.dtype,device=x.device)#losses.mean()
-        return p_down, loss1 + loss2
+        p_up, residual = self.abstract_up(x)
+        passed = center(p_up)
+        p_down = self.abstract_down(passed, residual)
+        return p_down
         
 
 
@@ -214,6 +212,7 @@ class HNet(nn.Module):
             Patcher(DIM_L2,DIM_L3,K_GATHER_L1,K_GATHER_L2),
         ])
         self.innerb = modules.Block(DIM_L3,4,0.0,False)
+        self.innerb2 = modules.Block(DIM_L3,4,0.0,False)
 
     def forward(self, idx, targets=None):
         device = idx.device
@@ -224,30 +223,29 @@ class HNet(nn.Module):
         pos_emb = self.pos_embedder(positions)
         x0 = tok_emb + pos_emb 
         x = x0
-        def innerb(xin):
-            return self.innerb(xin), torch.zeros(1,dtype=x.dtype,device=x.device)
-        def inner(xin):
-            return self.sLayers[1](xin, innerb)
-        x, aux = self.sLayers[0](x,inner)
-        #x = self.sLayers[0](x,inner)
-
-        # --- 2. Calculate the Self-Consistency Loss ---
-        total_consistency_loss = 0.0
-        
-        #input_shifted = F.pad(x0[:, skiptok:, :], (0,0,skiptok, 0), "constant", 0)
-        #output_shifted = F.pad(x[:, :-skiptok, :], (0,0,skiptok, 0), "constant", 0)
-        
-        input_shifted = x0[:, skiptok:, :]
-        output_shifted = x[:, :-skiptok, :]
-        #gate = F.pad(gate, (skiptok, 0), "constant", 0)
-        current_input_rep = input_shifted
-        current_output_rep = output_shifted
-
-        for layer in self.sLayers:
-            encoded_input, _, _ = layer.abstract_up(current_input_rep)
-            encoded_output, _, _ = layer.abstract_up(current_output_rep)
+        residuals = []
+        for i, layer in enumerate(self.sLayers):
             
-            total_consistency_loss += F.mse_loss(encoded_input, encoded_output)
+            x, res = layer.abstract_up(x)
+            residuals.append(res)
+        
+        x = self.innerb(x)
+        x = self.innerb2(x)
+
+        for i in reversed(range(len(self.sLayers))):
+            layer = self.sLayers[i]
+            x = layer.abstract_down(x, residuals[i])
+        
+        total_cl = 0.0
+        
+        current_input_rep = x0[:, skiptok:, :]
+        current_output_rep = x[:, :-skiptok, :]
+
+        for i, layer in enumerate(self.sLayers):
+            encoded_input, _  = layer.abstract_up(current_input_rep)
+            encoded_output, _ = layer.abstract_up(current_output_rep)
+            
+            total_cl = total_cl + F.mse_loss(encoded_input, encoded_output)
             
             current_input_rep = encoded_input
             current_output_rep = encoded_output
@@ -259,7 +257,7 @@ class HNet(nn.Module):
             targets_aligned = targets[:, :T_out]
             loss = F.cross_entropy(logits.reshape(-1, C), targets_aligned.reshape(-1))
             if self.training:
-                loss = loss+aux+total_consistency_loss
+                loss = loss+total_cl#+aux
         else:
             logits = self.head(x[:, -skiptok:, :])
 
@@ -313,22 +311,29 @@ if gradlog:
     for name, p in model.named_parameters():
         if p.requires_grad:
             p.register_hook(get_grad_hook(name))
+
+            
+t0 = time.time()
+t2 = time.time()
 for iter in range(max_iters):
     lr = get_lr(iter)
     
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     if iter % eval_interval == 0 or iter == max_iters - 1:
+        t2 = time.time()
         model.eval()
         losses = {}
         for split in ['train', 'val']:
             X_val, Y_val = get_batch(split)
             with torch.no_grad():
                 _, loss = model(X_val, Y_val)
-            losses[split] = loss.item()
-        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            losses[split] = loss.detach().item()
+        optimizer.zero_grad(set_to_none=True)
+        t1 = time.time()
+        print(f"step {iter}: train loss: {losses['train']:.4f}, val loss: {losses['val']:.4f}, time: {(t2-t0)*1000:.0f} ms, Tval: {(t1-t2)*1000:.0f} ms ")
         model.train()
-
+        t0 = time.time()
     X, Y = get_batch('train')
     logits, loss = model(X, Y)
     optimizer.zero_grad(set_to_none=True)
@@ -340,6 +345,7 @@ for iter in range(max_iters):
             print(f"{i+1}. {name:<60} | Norm: {norm:.4f}")
     #torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
+    
 gen = True
 if gen:
     meta_path = os.path.join('data', 'shakespeare_char/meta.pkl')
