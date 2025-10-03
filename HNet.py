@@ -41,6 +41,7 @@ cl          = False
 mem         = False
 gradlog     = False
 gen         = True
+memcheat    = False
 
 #todo, wnorm, midreset, lr on memory, memswizzle.
 
@@ -165,7 +166,11 @@ class Patcher(nn.Module):
         self.up_scan = modules.Block(outer_dim,4,0.0,False)
         self.up_proj = nn.Linear(outer_dim,inner_dim)
         
+        self.resid_up = nn.Linear(outer_dim, inner_dim)
+        
         self.output_pos_emb = nn.Linear(outer_seq, inner_dim)
+        
+        self.down_diffuser = sBlock(outer_dim, 4, 0.0,False)
         self.down_scatter = sBlock(inner_dim, 4, 0.0,False)
         self.down_proj = nn.Linear(inner_dim,outer_dim)
         self.down_scan = modules.Block(outer_dim,4,0.0,False)
@@ -176,75 +181,87 @@ class Patcher(nn.Module):
             nn.ReLU(),
             nn.Linear(outer_dim // 4, 1)
         )
-
-        self.down_gate = nn.Linear(self.sdim*inner_seq, outer_seq)
         
+        self.step0 = nn.Parameter(torch.randn(inner_dim))
+        self.step1 = nn.Parameter(torch.randn(inner_dim))
+        self.step2 = nn.Parameter(torch.randn(inner_dim))
+        self.step3 = nn.Parameter(torch.randn(inner_dim))
+
+        #self.down_gate = nn.Linear(self.sdim*inner_seq, outer_seq)
+        self.down_gate = nn.Sequential(
+            nn.Linear(outer_dim, outer_dim // 4),
+            nn.ReLU(),
+            nn.Linear(outer_dim // 4, outer_seq)
+        )
+
+
         self.down_norm = modules.LayerNorm(inner_dim, False)
+        self.gate_norm = modules.LayerNorm(outer_seq, False)
+        self.down_scan = modules.Block(outer_dim, 4, 0.0,False)
 
         self.up_norm = modules.LayerNorm(outer_dim, False)
-        self.up_norm2 = modules.LayerNorm(outer_dim, False)
+        self.upgate_norm = modules.LayerNorm(outer_seq, False)
         self.up_drain = nn.Parameter(torch.ones(outer_dim))
     
     def abstract_up(self, x):
         scan = self.up_scan(x)
+        #scan = F.softmax(scan, dim=-1)
+        scan = self.up_norm(scan)
         gate = self.up_gate(scan).squeeze(-1)
+        #gate = F.softmax(gate, dim=-1)
+        gate = self.upgate_norm(gate)
+
         #losses = F.mse_loss(x[:,1:,:],scan[:,:-1,:],reduction="none")
         #gate = losses.sum(dim=-1)
         #gate = F.pad(gate, (1, 0), "constant", 0)#.detach()
-        gathered = quantizer.GatherByGate.apply(F.softmax(gate, dim=-1), F.softmax(scan, dim=-1), self.inner_seq)
+        
+        gathered = quantizer.GatherByGate.apply(gate, scan, self.inner_seq)
         
         return self.up_proj(gathered), x
     def abstract_down(self, x, residual):
-        sg = self.down_gate(x[...,:self.sdim].reshape(x.shape[0], self.inner_seq*self.sdim))
-        sg = F.softmax(sg, dim=-1)
-        scattered = quantizer.ScatterByGate.apply(sg, x, self.outer_seq)
+        #sg = self.down_gate(x[...,:self.sdim].reshape(x.shape[0], self.inner_seq*self.sdim))
+        pgd = p_down = self.down_proj(x)
+        pgd =self.down_scan(pgd)[:,-1,:]
+        sg = self.down_gate(pgd)
+        #sg = F.softmax(sg, dim=-1) 
+        sg = self.gate_norm(sg)
+        scattered = quantizer.ScatterByGate.apply(sg, x, self.outer_seq)# technically causal leak
         
         pos = torch.arange(0, self.outer_seq, dtype=torch.long, device=device) 
         phot = F.one_hot(pos, self.outer_seq).to(x.dtype)
-        
-        scattered = scattered + self.output_pos_emb(phot.detach())
-        pds = self.down_scatter(x, scattered)
+        pos_emb = self.output_pos_emb(phot.detach()).expand(x.shape[0],-1,-1)
+        scattered = scattered + pos_emb 
+        #scattered = scattered + self.resid_up(residual)
+        pds = self.down_scatter(x, scattered)#
+        #pds = self.down_scatter(x, pos_emb)# self.resid_up(residual))
         p_down = self.down_proj(pds)+residual
 
-        return self.down_scan(p_down)
+        return self.down_scan(p_down), 0.0
     
     def forward(self, x, center):
         p_up, residual = self.abstract_up(x)
-        passed = center(p_up)
-        p_down = self.abstract_down(passed, residual)
-        return p_down
+        passed, aux = center(p_up)
+        p_down, aux2 = self.abstract_down(passed, residual)
+        return p_down, aux+aux2
 def idk_loss(logits, targets, idk_token_id, idk_weight=0.1):
-    # Standard cross-entropy part (remains the same)
     ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
-    # Use log_softmax for numerical stability. This is the key change.
     log_probs = F.log_softmax(logits, dim=-1)
 
-    # Gather the log probabilities for the correct tokens
     correct_token_log_probs = torch.gather(log_probs, -1, targets.unsqueeze(-1)).squeeze(-1)
     
-    # Probabilities are needed for 'incorrectness', but this is less prone to error
-    # since it's not inside a log on the backward pass.
     correct_token_probs = torch.exp(correct_token_log_probs)
     
-    # Get the log probabilities for the 'idk' token
     idk_token_log_probs = log_probs[..., idk_token_id]
 
-    # Calculate incorrectness (same as before)
     incorrectness = 1.0 - correct_token_probs
 
-    # The encouragement term is now just the negative log probability,
-    # which is already computed. No need for another log().
-    # This avoids the log(small_number) problem entirely.
     idk_encouragement = -idk_token_log_probs * incorrectness
 
-    # (rest of the function is the same)
     with torch.no_grad():
         is_correct = (torch.argmax(logits, dim=-1) == targets)
     idk_encouragement[is_correct] = 0.0
 
-    # Ensure the encouragement term is not NaN before adding it.
-    # This is a safety check.
     if torch.isnan(idk_encouragement).any():
         return ce_loss
     
@@ -268,19 +285,20 @@ class HNet(nn.Module):
         ])
         self.innerb = modules.Block(DIM_L3,4,0.0,False)
         self.innerb2 = modules.Block(DIM_L3,4,0.0,False)
-        memconf = {
-            'mem_block_size': 48,
-            'dropout': 0.0,
-            'n_embd': DIM_L3,
-            'n_head': 4,
-            'bias': False,
-        }
-        self.mem_block_size=memconf['mem_block_size']
-        self.register_buffer('memory', torch.randn(1, self.mem_block_size, DIM_L3)*1e-5)
-        self.memory_frozen = False
-        self.cmem= True
-        self.dreamer = modules.Dreamer(causal=self.cmem, **memconf)
-        self.memory_selector = modules.Block(**memconf)
+        if mem:
+            memconf = {
+                'mem_block_size': 48,
+                'dropout': 0.0,
+                'n_embd': DIM_L3,
+                'n_head': 4,
+                'bias': False,
+            }
+            self.mem_block_size=memconf['mem_block_size']
+            self.register_buffer('memory', torch.randn(1, self.mem_block_size, DIM_L3)*1e-5)
+            self.memory_frozen = False
+            self.cmem= True
+            self.dreamer = modules.Dreamer(causal=self.cmem, **memconf)
+            self.memory_selector = modules.Block(**memconf)
 
     def mem_form(self, x):
         mem         = self.memory_selector(x, causal=self.cmem)[:,:self.mem_block_size,:] #(b, m, c)
@@ -313,8 +331,12 @@ class HNet(nn.Module):
             x = self.innerb(x)
             x = self.innerb2(x)
             malpha = 1.0
-            mem2 = ((self.memory+self.mem_form(x)*malpha)).expand(cb,-1,-1)
-            
+            if memcheat:
+                mem2 = ((self.memory+self.mem_form(x)*malpha)).expand(cb,-1,-1)
+            else:
+                mh1 = ((self.memory+self.mem_form(x[:cb//2,...])*malpha)).expand(cb//2,-1,-1)
+                mh2 = ((self.memory+self.mem_form(x[cb//2:,...])*malpha)).expand(cb//2,-1,-1)
+                mem2 = torch.cat([mh2,mh1],dim=0)
             x = torch.cat([mem2, x1],dim=1) #try what memorization enhances the score
             x = self.innerb(x)
             x = self.innerb2(x)
@@ -323,9 +345,11 @@ class HNet(nn.Module):
         else:
             x = self.innerb(x)
             x = self.innerb2(x)
+        aux=0
         for i in reversed(range(len(self.sLayers))):
             layer = self.sLayers[i]
-            x = layer.abstract_down(x, residuals[i])
+            x, auxl = layer.abstract_down(x, residuals[i])
+            aux = aux+auxl
         
         if cl:
             total_cl = 0.0
@@ -355,8 +379,9 @@ class HNet(nn.Module):
                 else:
                     loss = F.cross_entropy(logits.reshape(-1, C), targets_aligned.reshape(-1))
                 
+                loss = loss+aux
                 if cl:
-                    loss = loss+total_cl#+aux
+                    loss = loss+total_cl
             else:
                 loss = F.cross_entropy(logits.reshape(-1, C), targets_aligned.reshape(-1))
         else:
@@ -458,7 +483,8 @@ if gen:
     with open(meta_path, 'rb') as f:
         meta = pickle.load(f)
     stoi, itos = meta['stoi'], meta['itos']
-    def encode(s): [stoi[c] for c in s]
+    def encode(s): 
+        return [stoi[c] for c in s]
     def decode(ll):
         decoded = []
         for i in ll:

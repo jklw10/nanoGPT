@@ -135,7 +135,7 @@ def softclipnorm(x: torch.tensor, dim = -1, perc = 0.01):
     # Detach the scaling factors to not affect their own gradients
     return (x_softclip - x_min_robust) / x_range_robust
 
-def fast_sin_leakyrelu(x):
+def sin_leakyrelu(x):
      base = F.leaky_relu(x)
      sine_mod = F.relu(torch.sign(x)) * torch.sin(1.25 * x)
      return base + sine_mod
@@ -146,21 +146,26 @@ def oozing_floor(x):
      oozing_floor = F.relu(torch.sign(x)) * torch.floor(1.25 * x)
      return base + oozing_floor
 
-def fast_sin_gelu_leaky(x, leaky=0.01):
+def sin_gelu_leaky(x, leaky=0.01):
      base = F.gelu(x)
      sine_mod = torch.where(x >= 0, torch.sin(1.25 * x), x * leaky)
      return base + sine_mod
 
 
-def fast_sin_gelu(x):
+def sin_gelu(x):
      base = F.gelu(x)
      sine_mod = torch.relu(torch.sign(x)) * torch.sin(1.25 * x)
      return base + sine_mod
 
-def fast_sin_gelu_sinleak(x, leaky=0.01):
+def sin_gelu_sinleak(x, leaky=0.01):
      base = F.gelu(x)
      lh = F.leaky_relu(torch.sign(x),negative_slope=leaky)
      sine_mod = lh * torch.sin(1.25 * x)
+     return base + sine_mod
+
+def sin_relu(x):
+     base = F.relu(x)
+     sine_mod = F.relu(torch.sign(x)) * torch.sin(1.25 * x)
      return base + sine_mod
 
 def modified_sin_gelu_leaky(x, leaky=0.01):
@@ -1035,10 +1040,6 @@ def mmdiem( a :torch.Tensor,b :torch.Tensor):
     variance = torch.sqrt(a.var()*b.var()+1e-10)
     return torch.dot(anorm, bnorm) /  numel / variance # + (torch.abs(arange-brange)) + torch.abs(a.var() - b.var())
 
-def fast_sin_relu(x):
-     base = F.relu(x)
-     sine_mod = F.relu(torch.sign(x)) * torch.sin(1.25 * x)
-     return base + sine_mod
 
 
 def quaternionize(x):

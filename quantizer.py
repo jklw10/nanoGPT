@@ -40,7 +40,7 @@ class MultiHotVQVAEQuantizer(nn.Module):
 
         z_q_ste = z_e + (z_q - z_e).detach()
         return z_q_ste, total_vq_loss
-    
+
 class GumbelQuantizer(nn.Module):
     def __init__(self, quant_dim, embed_dim, temperature=1.0):
         super().__init__()
@@ -72,6 +72,7 @@ class tkSTE(torch.autograd.Function):
         grad_x = g 
         return grad_x, None
     
+
 class MultiHotSTEFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, linear_weight, k):
@@ -201,7 +202,8 @@ class GatherByGate(torch.autograd.Function):
             hard_target.scatter_(dim=1, index=best_candidate_indices, value=1.0)
             
             # Use a stable, cross-entropy-like gradient.
-            probs = F.softmax(gate_logits, dim=-1)
+            #probs = F.softmax(gate_logits, dim=-1)
+            probs = F.sigmoid(gate_logits)
             grad_gate_logits = probs - hard_target
         if ctx.needs_input_grad[1]:
             b,p,c = candidate_pool.shape
@@ -260,6 +262,7 @@ class TopKHot(torch.autograd.Function):
     def forward(ctx, x,  k):
         _, indices = torch.topk(x, k=k, dim=-1)
         k_hot = torch.zeros_like(x).scatter_(-1, indices, 1.0)
+        
         ctx.save_for_backward(x)
         ctx.k = k
         return k_hot
@@ -466,6 +469,31 @@ class TaylorThresHotActivation(nn.Module):
         
         return active_outputs
 
+
+class SelAct(nn.Module):
+  
+    def __init__(self, in_features):
+        super().__init__()
+        self.in_features = in_features
+        
+        self.activations = [
+            F.relu,
+            F.silu, 
+            utils.sin_leakyrelu
+        ]
+        self.n_acts = len(self.activations)
+        self.gate = nn.Parameter(torch.randn(in_features,self.n_acts) * 0.1)
+
+
+    def forward(self, x):
+
+        ghot = TopKHot.apply(self.gate,1)
+        
+        out = self.activations[0](x)*ghot[...,0]
+        out + self.activations[1](x)*ghot[...,1]
+        out += self.activations[2](x)*ghot[...,2]
+
+        return out
 
 class Autoencoder(nn.Module):
     def __init__(self, input, hidden, embed, qdim, quantizer , k = None):
@@ -681,8 +709,9 @@ if __name__ == '__main__':
         #"CER k 1":    Autoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopOneHot,  1),
         #"CER2 k 1":   debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHot,    1),
         #"BCER k 1":   Autoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHotBCE, 1),
-        "thot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHotBCE, TaylorThresHotActivation, 32),
-        "bspline":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHotBCE, BSplineActivation, 32),
+        #"thot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHotBCE, TaylorThresHotActivation, 32),
+        #"bspline":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHotBCE, BSplineActivation, 32),
+        "selact":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHotBCE, SelAct, 32),
         
         #"CER k 32":   debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHot,    32),
         #"STE k1":    Autoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, tkSTE, 1),
