@@ -173,6 +173,34 @@ def modified_sin_gelu_leaky(x, leaky=0.01):
      base = 0.5 * x * (1 + F.tanh(sqpi * (x + 0.044715 * x**3)))
      sine_mod = torch.where(x >= 0, torch.sin(1.25 * x), x * leaky)
      return base + sine_mod
+
+
+def idk_loss(ce_loss, logits, targets, idk_token_id, idk_weight=0.1):
+    log_probs = F.log_softmax(logits, dim=-1)
+
+    correct_token_log_probs = torch.gather(log_probs, -1, targets.unsqueeze(-1)).squeeze(-1)
+    
+    correct_token_probs = torch.exp(correct_token_log_probs)
+    
+    idk_token_log_probs = log_probs[..., idk_token_id]
+
+    incorrectness = 1.0 - correct_token_probs
+
+    idk_encouragement = -idk_token_log_probs * incorrectness
+
+    with torch.no_grad():
+        is_correct = (torch.argmax(logits, dim=-1) == targets)
+    idk_encouragement[is_correct] = 0.0
+
+    if torch.isnan(idk_encouragement).any():
+        return ce_loss
+    
+    return ce_loss + idk_weight * idk_encouragement.mean()
+
+def check_nan(tensor, name):
+    if torch.isnan(tensor).any():
+        print(f"!!! NaN detected in tensor: {name} !!!")
+
 def create_memory_causal_mask(memory_length, incoming_length):
     # Create a mask that allows attending to memory tokens and implements
     # causal attention for the incoming tokens
@@ -596,6 +624,19 @@ def zca_newton_schulz(G, epsilon=1e-5, steps=5, power_iters=10):
     
     return torch.matmul(G, W)
 
+
+def whiten_3d_global(x, **kwargs):
+    original_shape = x.shape
+    batch_size, seq_len, embed_dim = original_shape
+    
+    x_reshaped = x.reshape(batch_size * seq_len, embed_dim)
+    
+    x_whitened_reshaped = zca_newton_schulz(x_reshaped, **kwargs)
+    
+    x_whitened = x_whitened_reshaped.reshape(original_shape)
+    
+    return x_whitened
+
 @torch.compile(backend='inductor', mode='max-autotune')
 def wfunny(model, wemas):
     for i, p in enumerate(model.parameters()):
@@ -671,6 +712,36 @@ def justnorm(x, idim=-1):
     res = (x / x.norm(p=2, dim=idim, keepdim=True)).to(dtype=dtype) 
     return res
 
+class SpectralInspector:
+    def __init__(self, name: str, max_entries: int = 100):
+        self.name = name
+        self.max_entries = max_entries # Safety brake for memory
+        self.spectra = {'weight_param': [], 'weight_ortho': []}
+
+    def __call__(self, module, input, output):
+        # This logic is mostly the same, but we add a check to prevent memory leak
+        if len(self.spectra['weight_param']) >= self.max_entries:
+            return # Stop collecting if we've hit the limit
+
+        if hasattr(module, 'weight_param'):
+            s_param = torch.linalg.svdvals(module.weight_param.detach())
+            self.spectra['weight_param'].append(s_param.cpu().numpy())
+
+        if hasattr(module, 'last_weight_ortho'):
+            s_ortho = torch.linalg.svdvals(module.last_weight_ortho.detach())
+            self.spectra['weight_ortho'].append(s_ortho.cpu().numpy())
+    def get_latest_spectra(self):
+        """Returns the spectra from the most recent forward pass."""
+        if not self.spectra['weight_param']:
+            return None, None
+        return self.spectra['weight_param'][-1], self.spectra['weight_ortho'][-1]
+
+    def clear(self):
+        """Clears the stored spectra."""
+        self.spectra = {
+            'weight_param': [],
+            'weight_ortho': []
+        }
 @torch.compile(backend='inductor', mode='max-autotune')
 def orthogonalize_gradients(grad, params):
     w = params.view(-1)

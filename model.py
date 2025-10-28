@@ -11,6 +11,8 @@ import math
 import inspect
 from dataclasses import dataclass
 
+from numpy import float32
+from pandas import infer_freq
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -23,16 +25,21 @@ import quantizer
 #prediction machine
 #Linear = optim.OptimizedLinear
 Linear = nn.Linear
+Orthlin = modules.OrthogonalLinear
 #settings :)
 #known good
 diffSplits      = 1
-ssmax           = True
+ssmax           = False
 mtp             = False
+CCE             = True
 #ungraded
 fftmem          = False
 qmem            = False
 mmnorm          = False
 normless        = False
+orthqk          = False
+orthHead        = False
+rmHead          = False
 #good in owt
 qnorm           = False
 #good in shkspr
@@ -51,7 +58,7 @@ think           = False
 repeat_block    = False
 repeatCenter    = False
 
-Qrotention      = False
+Qrotention      = True
 symloss         = False
 midchaos        = False
 
@@ -68,6 +75,8 @@ k_atten         = False
 moe             = False
 sprs            = False
 wnll            = False
+
+csbr            = False
 
 auxmod          = acl1 or acebtl #or topoloss
 
@@ -101,8 +110,13 @@ class PrecomputedFourierResampler(nn.Module):
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.num_filters = num_filters
-
-        frequencies = torch.linspace(1, input_dim // 2, num_filters)
+        self.max_freq = input_dim // 2
+        self.min_freq = 1.0
+        if csbr:
+            frequencies = self.min_freq + (self.max_freq - self.min_freq) * torch.rand(self.num_filters)
+            frequencies = torch.sort(frequencies).values
+        else:
+            frequencies = torch.linspace(self.min_freq, self.max_freq, num_filters)
         self.register_buffer("frequencies", frequencies)
         t_in = torch.linspace(0, 1, input_dim)
         t_out = torch.linspace(0, 1, output_dim)
@@ -149,11 +163,19 @@ class Scanner(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.d = config.n_embd
-        self.sampler = PrecomputedFourierResampler(config.n_embd * 2, config.n_embd, 64)
-
-    def forward(self, x: torch.Tensor, y: torch.Tensor):
-        z = torch.cat((y, x), dim=-1)
-        z=self.sampler(z)
+        #self.sampler = modules.FastCayleyLinear(config.n_embd * 2, config.n_embd, 64, bias=False)
+        #self.sampler = modules.ExponentialCayleyLinear(config.n_embd * 2, config.n_embd, 64)
+        #self.sampler = modules.LipschitzLinear(config.n_embd * 2, config.n_embd)
+        #self.sampler = modules.ProcrustesLinear(config.n_embd * 2, config.n_embd, method="qr")
+        self.proj = modules.ProcrustesButterflyLinear(config.n_embd * 2, method="polar")
+        
+    def forward(self, x: torch.Tensor, y: torch.Tensor, p_weight=None):
+        #z = torch.cat((y, x), dim=-1)
+        #z = self.sampler(z)
+        z = self.proj(x,y,p_weight).to(x.dtype)
+        #z = self.proj1(y)+self.proj2(x)
+        
+        #z = (self.weight1 * x) + (self.weight2 * y)
         z = utils.range_norm(z)
         return z
 
@@ -161,7 +183,8 @@ class QrotAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.c_attn2 =  Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)
+        self.q_attn =  Orthlin(config.n_embd, config.n_embd, bias=config.bias)
+        self.v_attn =  Linear(config.n_embd, config.n_embd, bias=config.bias)
         
         self.c_proj = Linear(config.n_embd,  config.n_embd, bias=config.bias)
 
@@ -176,31 +199,43 @@ class QrotAttention(nn.Module):
         self.n_head = config.n_head 
         self.head_dim = config.n_embd//config.n_head * 2
         self.win = config.block_size // config.n_layer
+
      
 
-    def forward(self, x: torch.tensor): #same signature to allow easy swapping.
+    def forward(self, x: torch.tensor, causal = False): #same signature to allow easy swapping.
         B, T, C = x.size() 
-        q,   v = self.c_attn2(x).split(self.n_embd, dim=2)
+        q = self.q_attn(x) 
+        v = self.v_attn(x)
         QC = q.shape[2]
         
         q = q.view(B, T, QC)
         v = v.view(B, T, C)
-
-        q = utils.pscan(q, self.scanner, self.identity)
+        ow = self.scanner.proj.compute_orthogonal_weights()
+        def scan(left, right):
+            return self.scanner(left, right, p_weight=ow)
+        #print(self)
+        q = utils.pscan(q, scan, self.identity)
         
         Y = q*v 
         Y = Y.view(B, T, -1)
         Y = self.c_proj(Y)
         Y = self.resid_dropout(Y)
         return Y
-    
 
 class Attention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        if orthqk:
+            self.q_attn = (Orthlin(config.n_embd,  config.n_embd, bias=config.bias))
+            self.k_attn = (Orthlin(config.n_embd,  config.n_embd, bias=config.bias))
+        else:
+            self.q_attn = (Linear(config.n_embd,  config.n_embd, bias=config.bias))
+            self.k_attn = (Linear(config.n_embd,  config.n_embd, bias=config.bias))
+        self.v_attn = Linear(config.n_embd,  config.n_embd, bias=config.bias)
+        
+        
         # output projection
         self.c_proj = Linear(config.n_embd,  config.n_embd, bias=config.bias)
         
@@ -227,13 +262,19 @@ class Attention(nn.Module):
 
     def forward(self, x, causal=True):
         B, T, C = x.size() 
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        q = self.q_attn(x)
+        k = self.k_attn(x)
+        v = self.v_attn(x)
+        #print("actually running")
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
 
-        y = torch.nn.functional.scaled_dot_product_attention(q*(math.log(T)*self.qm),k,  v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal= causal)
-
+        if ssmax:
+            y = torch.nn.functional.scaled_dot_product_attention(q*(math.log(T)*self.qm),k,  v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal= causal)
+        else:
+            y = torch.nn.functional.scaled_dot_product_attention(q,k,  v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal= causal)
+        
         y = y.transpose(1, 2).contiguous().view(B, T, self.n_head * self.head_dim) 
         y = self.resid_dropout(self.c_proj(y))
 
@@ -372,7 +413,7 @@ class MLP(nn.Module):
         return x
 
     def qrot(self, x):
-        b,t,n=x.shape
+        b, t, n = x.shape
         x4d = x.view(b, t, self.n_embd, 4) # Reshape to (batch, seq_len, n_embd, 4)
         x_norm = torch.clamp_min(x4d.norm(dim=-1, keepdim=True), 1e-10) # Calculate norm along the last dimension (dim=3 or -1), keep dimensions
         x_normalized = x4d / x_norm             # Divide to normalize
@@ -464,7 +505,7 @@ class Block(nn.Module):
 
     def forward(self, x,  causal = True):
         self.block_input = x
-        x = x + self.attn(self.ln_1(x),causal)
+        x = x + self.attn(self.ln_1(x), causal)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -594,14 +635,15 @@ class GPT(nn.Module):
             self.lm_head = Linear(config.n_embd, config.vocab_size * self.patch_max, bias=False)
         else:
             #it'd seem like this isn't worth optimized linear's hassle with apple's CCE loss 
-            self.lm_head = Linear(config.n_embd, config.vocab_size, bias=False)
-            # with weight tying when using torch.compile() some warnings get generated:
-            # "UserWarning: functional_call was passed multiple values for tied weights.
-            # This behavior is deprecated and will be an error in future versions"
-            # not 100% sure what this is, so far seems to be harmless. TODO investigate
-            #apparently bad
-            self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
-        
+            if orthHead:
+                self.lm_head = Orthlin(config.n_embd, config.vocab_size, bias=False)
+            else:
+                self.lm_head = Linear(config.n_embd, config.vocab_size, bias=False)
+                self.transformer.wte.weight = self.lm_head.weight 
+                # https://paperswithcode.com/method/weight-tying
+            
+            if rmHead:
+                nn.init.orthogonal_(self.lm_head.weight)
 
 
         if(auxmod):
@@ -777,16 +819,20 @@ class GPT(nn.Module):
         if targets is not None:
             logits = None# self.lm_head(x)
             reduction= 'none'
-            loss = linear_cross_entropy(x.to(torch.bfloat16), self.lm_head.weight.to(torch.bfloat16), targets, impl='torch_compile', reduction=reduction)
             if(not self.training):
-                reduction = 'mean'
-                loss = linear_cross_entropy(x[:,8:,:].to(torch.bfloat16), 
-                                            self.lm_head.weight.to(torch.bfloat16), 
-                                            targets[:,8:], 
-                                            impl='torch_compile', 
-                                            reduction=reduction)
-            
-            
+                    reduction = 'mean'
+            if CCE:
+                loss = linear_cross_entropy(x.to(torch.bfloat16), 
+                                                self.lm_head.weight.to(torch.bfloat16), 
+                                                targets, 
+                                                impl='torch_compile', 
+                                                reduction=reduction)
+            else:
+                
+                logits = self.lm_head(x)
+                
+                loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1))
+                
             
             #TODO: wavelet loss
 

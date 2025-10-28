@@ -11,48 +11,6 @@ from torch.utils.data import DataLoader, random_split
 
 import utils
 
-class MultiHotVQVAEQuantizer(nn.Module):
-    def __init__(self, quant_dim, embed_dim, k=15, commitment_cost=0.25):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.quant_dim = quant_dim
-        self.k = k
-
-        self.commitment_cost = commitment_cost
-
-        self.embedding = nn.Embedding(self.quant_dim, self.embed_dim)
-        self.embedding.weight.data.uniform_(-1/self.quant_dim, 1/self.quant_dim)
-
-    def forward(self, z_e):
-        dist = torch.sum(z_e**2, dim=1, keepdim=True) - \
-               2 * torch.matmul(z_e, self.embedding.weight.t()) + \
-               torch.sum(self.embedding.weight**2, dim=1, keepdim=True).t()
-        
-        _, top_k_indices = torch.topk(-dist, k=self.k, dim=1)
-        
-        z_q_k = self.embedding(top_k_indices)
-        
-        z_q = torch.sum(z_q_k, dim=1)
-
-        vq_loss = F.mse_loss(z_q, z_e.detach())
-        commitment_loss = F.mse_loss(z_e, z_q.detach())
-        total_vq_loss = vq_loss + self.commitment_cost * commitment_loss
-
-        z_q_ste = z_e + (z_q - z_e).detach()
-        return z_q_ste, total_vq_loss
-
-class GumbelQuantizer(nn.Module):
-    def __init__(self, quant_dim, embed_dim, temperature=1.0):
-        super().__init__()
-        self.temperature = temperature
-        self.embedding = nn.Linear(quant_dim, embed_dim, bias=False)
-
-    def forward(self, logits):
-        y_soft = F.gumbel_softmax(logits, tau=self.temperature, hard=True)
-        
-        z_q = self.embedding(y_soft)
-        
-        return z_q
     
 class tkSTE(torch.autograd.Function):
     @staticmethod
@@ -180,7 +138,7 @@ class GatherByGate(torch.autograd.Function):
         grad_gate_logits = grad_candidate_pool = None
 
         with torch.no_grad():
-            ideal_targets = y - g
+            ideal_targets = y - g#scale gradient somehow. normalize both, hyper param, rangenorm
 
             Q = ideal_targets #B, K, C
             K = candidate_pool #B, P, C
@@ -307,7 +265,28 @@ class TopKHotBCE(torch.autograd.Function):
         grad_x = F.sigmoid(x) - soft_target
         
         return grad_x,  None
+    
+class HardTopKHotBCE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x,  k):
+        _, indices = torch.topk(x, k=k, dim=-1)
+        k_hot = torch.zeros_like(x).scatter_(-1, indices, 1.0)
+        ctx.save_for_backward(x)
+        ctx.k = k
+        return k_hot
 
+    @staticmethod
+    def backward(ctx, g):
+        x, = ctx.saved_tensors
+        k = ctx.k
+        with torch.no_grad():
+            _, topk_indices = torch.topk(-g, k=k, dim=-1)
+            hard_target = torch.zeros_like(x).scatter_(-1, topk_indices, 1.0)
+
+        grad_x = F.sigmoid(x) - hard_target
+        
+        return grad_x,  None
+    
 class ThresHot(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
@@ -333,6 +312,8 @@ class ThresHot(torch.autograd.Function):
         
         return grad_x
     #todo test as kolmogorov function selector
+
+
 
 class dynFKHot(torch.autograd.Function):
     @staticmethod
@@ -490,7 +471,7 @@ class SelAct(nn.Module):
         ghot = TopKHot.apply(self.gate,1)
         
         out = self.activations[0](x)*ghot[...,0]
-        out + self.activations[1](x)*ghot[...,1]
+        out += self.activations[1](x)*ghot[...,1]
         out += self.activations[2](x)*ghot[...,2]
 
         return out
@@ -528,17 +509,152 @@ class Autoencoder(nn.Module):
         return k_hot.sum(dim=-1, keepdim=True).clamp(1,self.qdim).detach()
 
 
+class MultiHotVQVAEQuantizer(nn.Module):
+    def __init__(self, quant_dim, embed_dim, k=15, commitment_cost=0.25):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.quant_dim = quant_dim
+        self.k = k
+
+        self.commitment_cost = commitment_cost
+
+        self.embedding = nn.Embedding(self.quant_dim, self.embed_dim)
+        self.embedding.weight.data.uniform_(-1/self.quant_dim, 1/self.quant_dim)
+
+    def forward(self, z_e):
+        dist = torch.sum(z_e**2, dim=1, keepdim=True) - \
+               2 * torch.matmul(z_e, self.embedding.weight.t()) + \
+               torch.sum(self.embedding.weight**2, dim=1, keepdim=True).t()
+        
+        _, top_k_indices = torch.topk(-dist, k=self.k, dim=1)
+        
+        z_q_k = self.embedding(top_k_indices)
+        k_hot = torch.zeros(z_e.shape[0], self.quant_dim, device=z_e.device)
+        k_hot.scatter_(1, top_k_indices, 1.0)
+        z_q = torch.sum(z_q_k, dim=1)#why is this so much better than mean()?
+        #z_q = F.normalize(z_q, p=2, dim=1) * self.embed_dim**0.5
+
+        vq_loss = F.mse_loss(z_q, z_e.detach())
+        commitment_loss = F.mse_loss(z_e, z_q.detach())
+        total_vq_loss = vq_loss + self.commitment_cost * commitment_loss
+
+        z_q_ste = z_e + (z_q - z_e).detach()
+        return z_q_ste, total_vq_loss, k_hot
+
+class mhvqvae(nn.Module):
+    def __init__(self, num_embeddings, embedding_dim, num_codes_to_select, commitment_cost=0.25):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.k = num_codes_to_select
+        self.commitment_cost = commitment_cost
+
+        # The codebook is an nn.Embedding layer
+        self.codebook = nn.Embedding(self.num_embeddings, self.embedding_dim)
+        self.codebook.weight.data.uniform_(-1.0 / self.num_embeddings, 1.0 / self.num_embeddings)
+
+    def forward(self, z_e):
+        assert z_e.shape[-1] == self.embedding_dim
+
+        distances = torch.sum(z_e.unsqueeze(1).pow(2), dim=2, keepdim=False) \
+                  - 2 * torch.matmul(z_e, self.codebook.weight.t()) \
+                  + torch.sum(self.codebook.weight.pow(2), dim=1)
+
+        _, indices = torch.topk(-distances, self.k, dim=1)  # (B, k)
+
+        k_hot = torch.zeros(z_e.shape[0], self.num_embeddings, device=z_e.device)
+        k_hot.scatter_(1, indices, 1)
+
+        quantized_k_vectors = self.codebook(indices)  # (B, k, D)
+        z_q = quantized_k_vectors.mean(dim=1)  # (B, D)
+
+        codebook_loss = F.mse_loss(z_q, z_e.detach())
+        commitment_loss = self.commitment_cost * F.mse_loss(z_e, z_q.detach())
+        vq_loss = codebook_loss + commitment_loss
+        z_q = z_e + (z_q - z_e).detach()
+
+        return z_q, vq_loss, k_hot
+
+class debugAutoencoderWithVQ(nn.Module):
+    def __init__(self, input_dim, hidden_dim, embed_dim, quantizer, Act):
+        super().__init__()
+        # Note: We don't need qdim anymore, the quantizer knows it.
+        self.embed_dim = embed_dim
+        
+        # The encoder now outputs a vector in the embedding space
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            Act(),
+            nn.Linear(hidden_dim, embed_dim) # Output size is embed_dim
+        )
+        
+        self.quantizer = quantizer # This will be an instance of MultiHotVQVAEQuantizer
+        
+        self.decoder = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            Act(),
+            nn.Linear(hidden_dim, input_dim)
+        )
+    
+    def forward(self, x):
+        # 1. Get continuous vector from encoder
+        z_e = self.encoder(x)
+        
+        # The VQ-VAE quantizer handles everything in the middle
+        z_q, vq_loss, k_hot = self.quantizer(z_e)
+        
+        # 3. Decode the quantized vector
+        reconstruction = self.decoder(z_q)
+        
+        # For your logging, get the 'k' value from the k_hot vector
+        k = None #k_hot.sum(dim=-1).mean().detach()
+
+        return reconstruction, k_hot, vq_loss, k
+    
+    def optimizer(self, LR):
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+
+        ae_params = []
+        k_selector_params = []
+
+        for name, param in param_dict.items():
+            if name.startswith('k_predictor') or name.startswith('k_bias'):
+                k_selector_params.append(param)
+            else:
+                ae_params.append(param)
+        num_ae = sum(p.numel() for p in ae_params)
+        num_k_sel = sum(p.numel() for p in k_selector_params)
+        print(f"ae parameter tensors: {len(ae_params)}, with {num_ae:,} parameters")
+        print(f"k selector parameter tensors: {len(k_selector_params)}, with {num_k_sel:,} parameters")
+
+        optim_groups = [
+            {'params': ae_params, 'lr': LR},
+            {
+                'params': k_selector_params,
+                'lr': LR ,#* 0.01,
+                #'weight_decay': 0.0,  # CRITICAL: No decay for the bias
+                #'betas': (0.0, 0.999),
+            }
+        ]
+        return torch.optim.AdamW(optim_groups, lr=LEARNING_RATE) 
+
 # --- The Autoencoder and Experiment Setup ---
 class debugAutoencoder(nn.Module):
     def __init__(self, input, hidden, embed, qdim, quantizer, Act , k = None):
         super().__init__()
         self.qdim = qdim
         
-
-        self.encoder = nn.Sequential(nn.Linear(input, hidden), Act(hidden), nn.Linear(hidden, qdim))
-        self.quantizer = Hotmod(quantizer, k)
+        params = inspect.signature(Act.__init__).parameters
+        if('in_features' in params):
+            ac = Act(hidden)
+            ac2 = Act(hidden)
+        else:
+            ac=Act()
+            ac2=Act()
+        self.encoder = nn.Sequential(nn.Linear(input, hidden), ac, nn.Linear(hidden, qdim))
+        self.quantizer = quantizer#Hotmod(quantizer, k)
         self.codebook = nn.Linear(self.qdim, embed, bias=False)
-        self.decoder = nn.Sequential(nn.Linear(embed, hidden), Act(hidden), nn.Linear(hidden, input))
+        self.decoder = nn.Sequential(nn.Linear(embed, hidden), ac2, nn.Linear(hidden, input))
         
     
     def forward(self, x):
@@ -551,10 +667,7 @@ class debugAutoencoder(nn.Module):
         logits = self.encoder(x)
         vq_loss = 0.0
 
-        if isinstance(self.quantizer, MultiHotVQVAEQuantizer):
-            k_hot, vq_loss = self.quantizer(logits)
-        else:
-            k_hot = self.quantizer(logits)
+        k_hot = self.quantizer(logits)
         
         return k_hot, vq_loss
     
@@ -596,6 +709,25 @@ class debugAutoencoder(nn.Module):
         ]
         return torch.optim.AdamW(optim_groups, lr=LEARNING_RATE) 
     
+class Gumbell(nn.Module):
+    def __init__(self,k):
+        self.tau=1.0
+        self.eps=1e-10
+        self.k=k
+        super().__init__()
+    def forward(self, logits):
+        gumbels = -torch.log(-torch.log(torch.rand_like(logits) + self.eps) + self.eps)
+        perturbed_logits = logits + gumbels
+
+        y_soft = torch.sigmoid(perturbed_logits / self.tau)
+
+        _, indices = torch.topk(perturbed_logits, self.k, dim=-1)
+        y_hard = torch.zeros_like(logits).scatter_(-1, indices, 1.0)
+
+        output = y_hard - y_soft.detach() + y_soft
+
+        return output
+    
 class Hotmod(nn.Module):
     def __init__(self, hotfunc, k):
         super().__init__()
@@ -603,11 +735,35 @@ class Hotmod(nn.Module):
         params = inspect.signature(self.hotfunc.forward).parameters
         self._needs_k = 'k' in params
         self.k = k
+
     def forward(self, x):
+        
         if self._needs_k:
             return self.hotfunc.apply(x, self.k)
         return self.hotfunc.apply(x)
-    
+
+
+class StochasticHotMod(nn.Module):
+    def __init__(self, hotfunc, k):
+        super().__init__()
+        self.hotfunc = hotfunc
+        params = inspect.signature(self.hotfunc.forward).parameters
+        self._needs_k = 'k' in params
+        self.k = k
+        self.temp = 1.0
+
+    def forward(self, x:torch.tensor):
+        if self.training:
+            uniform_samples = torch.rand_like(x)
+            gumbels = -torch.log(-torch.log(uniform_samples + 1e-9) + 1e-9)
+            gumbels = gumbels * torch.sqrt(x.norm(dim=-1,keepdim=True))
+            noisy_x = (x + gumbels) 
+            x_mod = noisy_x
+        else:
+            x_mod = x
+        if self._needs_k:
+            return self.hotfunc.apply(x_mod, self.k)
+        return self.hotfunc.apply(x_mod)   
 def calculate_perplexity(logits):
     # Calculates the perplexity of the codebook usage for a batch
     probs = F.softmax(logits, dim=-1).mean(dim=0)
@@ -665,6 +821,13 @@ class wnormlearnloss(nn.Module):
         loss = self.head(x)
         return utils.minmaxnorm(loss).mean()
 
+def whiteloss( x, y):
+    w = utils.zca_newton_schulz(torch.cat((x,y),dim=0))
+    #x,y = torch.chunk(w,2,dim=0)
+    x_w, y_w = w.split(x.size(0), dim=0)
+    return utils.minmaxnorm(F.mse_loss(x_w , y_w,reduction="none")).sum()
+
+
 if __name__ == '__main__':
     # Hyperparameters
     INPUT_DIM, HIDDEN_DIM, QUANT_DIM, EMBED_DIM = 28*28, 256, 64, 32
@@ -711,8 +874,37 @@ if __name__ == '__main__':
         #"BCER k 1":   Autoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHotBCE, 1),
         #"thot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHotBCE, TaylorThresHotActivation, 32),
         #"bspline":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHotBCE, BSplineActivation, 32),
-        "selact":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHotBCE, SelAct, 32),
         
+        #"topkCE":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM,  Hotmod(TopKHot,32), nn.SiLU ),
+        #"topkBCE":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM,  Hotmod(TopKHotBCE,32), nn.SiLU),
+        #"topkHBCE": debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, Hotmod(HardTopKHotBCE, 32), nn.SiLU),
+        "treshot": debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, Hotmod(ThresHot, 32), nn.SiLU),
+        #"stochhot": debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, StochasticHotMod(ThresHot, 32), nn.SiLU),
+        #"gumbell": debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, Gumbell(32), nn.SiLU),
+        #"mh-vqvae": debugAutoencoderWithVQ(
+        #    input_dim=INPUT_DIM,
+        #    hidden_dim=HIDDEN_DIM,
+        #    embed_dim=EMBED_DIM,
+        #    quantizer=mhvqvae(
+        #        num_embeddings=QUANT_DIM,
+        #        embedding_dim=EMBED_DIM,
+        #        num_codes_to_select=32,
+        #        commitment_cost=0.25
+        #    ),
+        #    Act=nn.SiLU
+        #),
+        #"ogimpl": debugAutoencoderWithVQ(
+        #    input_dim=INPUT_DIM,
+        #    hidden_dim=HIDDEN_DIM,
+        #    embed_dim=EMBED_DIM,
+        #    quantizer=MultiHotVQVAEQuantizer(
+        #        quant_dim=QUANT_DIM,
+        #        embed_dim=EMBED_DIM,
+        #        k=32,
+        #        commitment_cost=0.25
+        #    ),
+        #    Act=nn.SiLU
+        #)
         #"CER k 32":   debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHot,    32),
         #"STE k1":    Autoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, tkSTE, 1),
         #"STE k32":   Autoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, tkSTE, 32),
@@ -759,9 +951,11 @@ if __name__ == '__main__':
             #    recon, logits, aux = model(images)
             #    k = model.qdim//2
 
-            loss_raw = F.mse_loss(recon, images) 
-            loss = loss_raw + aux
-            loss = loss + auxl(recon)#*0.1
+            loss_raw = F.mse_loss(recon, images)
+            
+            loss = loss_raw+aux
+            #loss = loss_raw + whiteloss(recon, images)
+            #loss = loss + auxl(recon)#*0.1
             
             #r2, rq, _, k2 = model(recon.detach())
             #loss = loss + F.mse_loss(recon.detach(), r2) # The target distribution (from the first pass)

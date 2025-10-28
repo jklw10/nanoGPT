@@ -15,7 +15,6 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123
 $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
 """
-
 import gc
 import os
 import time
@@ -35,6 +34,8 @@ import utils
 
 from torch.utils.data import Dataset, DataLoader
 
+import seaborn as sns
+import matplotlib.pyplot as plt
 torch._dynamo.optimize()
 #torch._inductor.config.force_disable_caches = True
 torch._inductor.config.disable_cpp_codegen = True
@@ -272,7 +273,7 @@ muon                = False
 #for fftmem owt: 1e-5 #beta2 dependent
 #for fftmem skspr: 5e-5 #beta2 dependent
 #no clue why this way of passing is needed here but not for the bools. love python
-config["swna"]      = 1e-5 if dataset == "openwebtext" else 1.0
+config["swna"]      = 1e-5 if dataset == "openwebtext" else 1e-3
 config["swwa"]      = 1.0e-5 if dataset == "openwebtext" else 1e-4
 zcastep             = 2 #2, 5
 szcapow             = 2 #2, 10
@@ -373,7 +374,7 @@ def custom_gradient_adjustment(grad, param, wema = None, gema = None):
         adjusted_grad *= gdiff 
     
     if(grokfast):
-        gema += 0.9999 * (adjusted_grad - gema)
+        gema += 0.99 * (adjusted_grad - gema)
         adjusted_grad += gema * 2
         adjusted_grad /= 3
     if(ggauss and d2):
@@ -473,6 +474,45 @@ if(force_gc):
 itresetage = 5000
 itreset = 20
 itunfreeze = 10
+plt.ion()
+
+num_layers = 1
+
+cols = 2
+rows = (num_layers + cols - 1) // cols  # Ceiling division to get enough rows
+    
+fig, axes = plt.subplots(rows, cols, figsize=(14, 5 * rows), squeeze=False)
+def plot_spectra(params, training_step: int, fig, axes):
+    fig.suptitle(f'Singular Value Spectra at Step {training_step}', fontsize=18, y=0.98)
+    
+    fig.clf()
+    ax = fig.add_subplot(111) 
+    #ax = axes
+    s_param, s_ortho = params
+    if s_param is not None and s_ortho is not None:
+        sns.kdeplot(s_param, ax=ax, label='param1', 
+                    color='skyblue', fill=True, clip=(0, None))
+        sns.kdeplot(s_ortho, ax=ax, label='param2', 
+                    color='salmon', fill=True, clip=(0, None))
+        
+        ax.axvline(1.0, color='gray', linestyle='--', linewidth=2, label='Ideal Orthogonal')
+        ax.set_title("layer 0", fontsize=12)
+        ax.set_xlabel("Singular Value")
+        ax.set_ylabel("Density")
+        ax.legend()
+        ax.grid(True, which='both', linestyle=':', linewidth=0.5)
+        ax.set_xlim(left=0) 
+        
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.show()
+    plt.pause(0.1)
+params = model.transformer.h[0].attn.scanner.proj.proj1.weight_param
+porth = model.transformer.h[0].attn.scanner.proj.compute_orthogonal_weights()[0]
+s_ortho = (torch.linalg.svdvals(params).detach().cpu(),
+           torch.linalg.svdvals(porth).detach().cpu())
+            
+plot_spectra(s_ortho, iter_num, fig, axes)
+            
 #@torch.compile(backend='inductor', mode='max-autotune')
 def model_step(iter_num, tl, best_val_loss, config):
     # determine and set the learning rate for this iteration
@@ -483,6 +523,13 @@ def model_step(iter_num, tl, best_val_loss, config):
     #    lr = get_lr(iter_num%itreset) if decay_lr else learning_rate
     #if itrage == 1:
     #    lr = get_lr(iter_num%itresetage) if decay_lr else learning_rate
+    
+    params = model.transformer.h[0].attn.scanner.proj.proj1.weight_param
+    porth = model.transformer.h[0].attn.scanner.proj.compute_orthogonal_weights()[0]
+    s_ortho = (torch.linalg.svdvals(params).detach().cpu(),
+           torch.linalg.svdvals(porth).detach().cpu())
+            
+    plot_spectra(s_ortho, iter_num, fig, axes)
     
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
@@ -496,6 +543,11 @@ def model_step(iter_num, tl, best_val_loss, config):
             t1 = time.time()
             losses = estimate_loss()
             t2 = time.time()
+            params = model.transformer.h[0].attn.scanner.proj.compute_orthogonal_weights()
+            s_ortho = (torch.linalg.svdvals(params[0]).detach().cpu(),
+                        torch.linalg.svdvals(params[1]).detach().cpu())
+            
+            plot_spectra(s_ortho, iter_num, fig, axes)
             saved = False
             if wandb_log:
                 wandb.log({
