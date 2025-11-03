@@ -1,0 +1,5 @@
+python train.py config/train_shakespeare_char.py --grad_clip=0.0 --max_iters=100000 --n_embd=228 --n_layer=4 --lr_decay_iters=30000 --dataset='openwebtext' --dropout=0.0 --block_size=64 --batch_size=64 --beta2=0.999
+python train.py config/train_shakespeare_char.py --grad_clip=0.0 --max_iters=100000 --n_embd=228 --n_layer=4 --lr_decay_iters=30000 --dataset='shakespeare_char' --dropout=0.1 --block_size=64 --batch_size=64 --beta2=0.999
+python quantizer.py
+python HNet.py 2> logs/error_log.txt
+python corrector.py 2> logs/error_log.txt

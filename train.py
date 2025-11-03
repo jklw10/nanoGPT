@@ -269,6 +269,8 @@ gnorm               = False #or best
 gzca_enabled        = False #or best
 swnorm_enabled      = False or best
 
+plot                = False
+
 muon                = False
 #for fftmem owt: 1e-5 #beta2 dependent
 #for fftmem skspr: 5e-5 #beta2 dependent
@@ -474,44 +476,45 @@ if(force_gc):
 itresetage = 5000
 itreset = 20
 itunfreeze = 10
-plt.ion()
+if plot:
+    plt.ion()
 
-num_layers = 1
+    num_layers = 1
 
-cols = 2
-rows = (num_layers + cols - 1) // cols  # Ceiling division to get enough rows
-    
-fig, axes = plt.subplots(rows, cols, figsize=(14, 5 * rows), squeeze=False)
-def plot_spectra(params, training_step: int, fig, axes):
-    fig.suptitle(f'Singular Value Spectra at Step {training_step}', fontsize=18, y=0.98)
-    
-    fig.clf()
-    ax = fig.add_subplot(111) 
-    #ax = axes
-    s_param, s_ortho = params
-    if s_param is not None and s_ortho is not None:
-        sns.kdeplot(s_param, ax=ax, label='param1', 
-                    color='skyblue', fill=True, clip=(0, None))
-        sns.kdeplot(s_ortho, ax=ax, label='param2', 
-                    color='salmon', fill=True, clip=(0, None))
-        
-        ax.axvline(1.0, color='gray', linestyle='--', linewidth=2, label='Ideal Orthogonal')
-        ax.set_title("layer 0", fontsize=12)
-        ax.set_xlabel("Singular Value")
-        ax.set_ylabel("Density")
-        ax.legend()
-        ax.grid(True, which='both', linestyle=':', linewidth=0.5)
-        ax.set_xlim(left=0) 
-        
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.show()
-    plt.pause(0.1)
-params = model.transformer.h[0].attn.scanner.proj.proj1.weight_param
-porth = model.transformer.h[0].attn.scanner.proj.compute_orthogonal_weights()[0]
-s_ortho = (torch.linalg.svdvals(params).detach().cpu(),
-           torch.linalg.svdvals(porth).detach().cpu())
-            
-plot_spectra(s_ortho, iter_num, fig, axes)
+    cols = 2
+    rows = (num_layers + cols - 1) // cols  # Ceiling division to get enough rows
+
+    fig, axes = plt.subplots(rows, cols, figsize=(14, 5 * rows), squeeze=False)
+    def plot_spectra(params, training_step: int, fig, axes):
+        fig.suptitle(f'Singular Value Spectra at Step {training_step}', fontsize=18, y=0.98)
+
+        fig.clf()
+        ax = fig.add_subplot(111) 
+        #ax = axes
+        s_param, s_ortho = params
+        if s_param is not None and s_ortho is not None:
+            sns.kdeplot(s_param, ax=ax, label='base', 
+                        color='skyblue', fill=True, clip=(0, None))
+            sns.kdeplot(s_ortho, ax=ax, label='orth', 
+                        color='salmon', fill=True, clip=(0, None))
+
+            ax.axvline(1.0, color='gray', linestyle='--', linewidth=2, label='Ideal Orthogonal')
+            ax.set_title("layer 0", fontsize=12)
+            ax.set_xlabel("Singular Value")
+            ax.set_ylabel("Density")
+            ax.legend()
+            ax.grid(True, which='both', linestyle=':', linewidth=0.5)
+            ax.set_xlim(left=0) 
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.show()
+        plt.pause(0.1)
+    params = model.transformer.h[0].attn.scanner.proj.proj1.weight_param
+    porth = model.transformer.h[0].attn.scanner.proj.compute_orthogonal_weights()[0]
+    s_ortho = (torch.linalg.svdvals(params).detach().cpu(),
+               torch.linalg.svdvals(porth).detach().cpu())
+
+    plot_spectra(s_ortho, iter_num, fig, axes)
             
 #@torch.compile(backend='inductor', mode='max-autotune')
 def model_step(iter_num, tl, best_val_loss, config):
@@ -524,12 +527,14 @@ def model_step(iter_num, tl, best_val_loss, config):
     #if itrage == 1:
     #    lr = get_lr(iter_num%itresetage) if decay_lr else learning_rate
     
-    params = model.transformer.h[0].attn.scanner.proj.proj1.weight_param
-    porth = model.transformer.h[0].attn.scanner.proj.compute_orthogonal_weights()[0]
-    s_ortho = (torch.linalg.svdvals(params).detach().cpu(),
-           torch.linalg.svdvals(porth).detach().cpu())
-            
-    plot_spectra(s_ortho, iter_num, fig, axes)
+    if plot:
+        if iter_num % 100 == 0:
+            params = model.transformer.h[0].attn.scanner.proj.proj1.weight_param
+            porth = model.transformer.h[0].attn.scanner.proj.compute_orthogonal_weights()[0]
+            s_ortho = (torch.linalg.svdvals(params).detach().cpu(), 
+                       torch.linalg.svdvals(porth).detach().cpu())
+
+            plot_spectra(s_ortho, iter_num, fig, axes)
     
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
@@ -543,11 +548,14 @@ def model_step(iter_num, tl, best_val_loss, config):
             t1 = time.time()
             losses = estimate_loss()
             t2 = time.time()
-            params = model.transformer.h[0].attn.scanner.proj.compute_orthogonal_weights()
-            s_ortho = (torch.linalg.svdvals(params[0]).detach().cpu(),
-                        torch.linalg.svdvals(params[1]).detach().cpu())
             
-            plot_spectra(s_ortho, iter_num, fig, axes)
+            if plot:
+                params = model.transformer.h[0].attn.scanner.proj.proj1.weight_param
+                porth = model.transformer.h[0].attn.scanner.proj.compute_orthogonal_weights()[0]
+                s_ortho = (torch.linalg.svdvals(params).detach().cpu(),
+                            torch.linalg.svdvals(porth).detach().cpu())
+
+                plot_spectra(s_ortho, iter_num, fig, axes)
             saved = False
             if wandb_log:
                 wandb.log({

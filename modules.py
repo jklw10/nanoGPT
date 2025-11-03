@@ -10,6 +10,39 @@ import utils
 import quantizer
 
 
+
+class SSM(nn.Module):
+    def __init__(self, n_embd, dropout, bias):
+        super().__init__()
+
+        self.q_attn =  nn.Linear(n_embd, n_embd, bias=bias)
+        self.v_attn =  nn.Linear(n_embd, n_embd, bias=bias)
+        
+        self.c_proj = nn.Linear(n_embd,  n_embd, bias=bias)
+
+        self.identity = nn.Parameter(torch.rand(n_embd))
+        
+        self.attn_dropout = nn.Dropout(dropout) #todo
+        self.resid_dropout = nn.Dropout(dropout) #todo
+        self.n_embd = n_embd
+        self.dropout = dropout
+        self.scanner = ProcrustesButterflyLinear(n_embd * 2, method="polar")
+        
+    def forward(self, x: torch.tensor, causal = False): #same signature to allow easy swapping.
+        B, T, C = x.size() 
+        q = self.q_attn(x) 
+        v = self.v_attn(x)
+        ow = self.scanner.compute_orthogonal_weights()
+        def scan(left, right):
+            z = self.scanner(left,right,ow).to(x.dtype)
+            return utils.range_norm(z)
+        q = utils.pscan(q, scan, self.identity)
+        
+        Y = q*v 
+        Y = self.c_proj(Y)
+        Y = self.resid_dropout(Y)
+        return Y
+
 class CombineAttention(nn.Module):
     def __init__(self, n_embd,n_head,dropout,bias):
         super().__init__()
@@ -40,12 +73,6 @@ class CombineAttention(nn.Module):
         q = q.view(B, sT, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, sT, hs)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-
-        #if not causal:
-        #    att = torch.matmul(q, k.transpose(-2, -1)) 
-        #    y = F.softmax(att,dim=-1) @ v
-        #else:
-        #test unit linear, unitifying :D
 
         y = torch.nn.functional.scaled_dot_product_attention(
             q * (math.log(T)*self.qm),
@@ -152,6 +179,18 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
+class SSMBlock(nn.Module):
+    def __init__(self, n_embd, dropout, bias, **kwargs):
+        super().__init__()
+        self.ln_1 = LayerNorm(n_embd, bias)
+        self.attn = SSM(n_embd, dropout, bias)
+        self.ln_2 = LayerNorm(n_embd, bias)
+        self.mlp = MLP(n_embd, dropout, bias)
+
+    def forward(self, x,  causal = True):
+        x = x + self.attn(self.ln_1(x),causal)
+        x = x + self.mlp(self.ln_2(x))
+        return x
 
 csbr = True
 class LearnableFourierResampler(nn.Module):
@@ -517,45 +556,11 @@ class LipschitzLinear(nn.Module):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         mmT = torch.matmul(self.params.weight, self.params.weight.T)
         
-        # 2. Compute the row-wise sum of absolute values
-        # This is an upper bound on the squared Lipschitz constant for each row
         lipschitz_bounds_squared = torch.sum(torch.abs(mmT), dim=1)
 
-        # 3. Compute the rescaling factors (inverse square root)
-        # torch.rsqrt is a dedicated and often faster function for this
         rescaling_factors = torch.rsqrt(lipschitz_bounds_squared + 1e-10)
 
-        # 4. Apply the rescaling to each row of the original matrix
-        # The .unsqueeze(1) broadcasts the (N,) factors vector to the (N, M) matrix
         W = self.params.weight * rescaling_factors.unsqueeze(1)
-            
-        return F.linear(input, W, None)
-
-class ExponentialCayleyLinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, rank: int):
-        super().__init__()
-        
-        self.in_features = in_features
-        self.out_features = out_features
-        self.rank = rank
-
-        self.U = nn.Parameter(torch.empty(in_features, rank))
-        self.V = nn.Parameter(torch.empty(in_features, rank))
-        
-        nn.init.orthogonal_(self.U)
-        nn.init.orthogonal_(self.V)
-        torch.nn.utils.clip_grad_norm_(self.U, max_norm=1)
-        torch.nn.utils.clip_grad_norm_(self.V, max_norm=1)
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        A = self.U @ self.V.T - self.V @ self.U.T
-        
-        W_full = torch.matrix_exp(A)
-        
-        if self.out_features > self.in_features:
-            W = F.pad(W_full, (0, 0, 0, self.out_features - self.in_features))
-        else:
-            W = W_full[:self.out_features, :]
             
         return F.linear(input, W, None)
 
@@ -565,11 +570,8 @@ class CayleyLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
 
-        # The learnable parameter 'weight' is the generator of the rotation.
-        # It lives in a larger square space to handle non-square linear layers.
         self.square_dim = max(in_features, out_features)
         
-        # This parameter is the skew-symmetric generator 'A'
         self.weight = nn.Parameter(torch.empty(self.square_dim, self.square_dim))
         nn.init.uniform_(self.weight, -0.1, 0.1) # A simple initialization is fine
 
@@ -579,102 +581,19 @@ class CayleyLinear(nn.Module):
             nn.init.zeros_(self.bias)
 
     def _get_orthogonal_weight(self):
-        # Create the skew-symmetric matrix from the learnable parameter
         A = self.weight - self.weight.T
         
         I = torch.eye(self.square_dim, device=A.device, dtype=A.dtype)
         
-        # Compute the square orthogonal matrix using the Cayley transform
-        # W_square = (I + A)(I - A)^-1
         W_square = torch.linalg.solve(I - A, I + A)
         
-        # Slice the square matrix to get the final semi-orthogonal weight
-        # of the desired (out_features, in_features) shape.
         W = W_square[:self.out_features, :self.in_features]
             
         return W
 
     def forward(self, input):
-        # Dynamically compute the orthogonal weight on each forward pass
         W = self._get_orthogonal_weight()
         return F.linear(input, W, self.bias)
-
-@torch.compile(backend='inductor', mode='max-autotune')
-def newton_schulz_sqrt_inv(A, steps):
-    """
-    Computes A**(-1/2) using a compiled Newton-Schulz iteration.
-    A is assumed to be symmetric and positive semi-definite.
-    """
-    d = A.shape[0]
-    device, dtype = A.device, A.dtype
-    
-    # Power iteration to estimate spectral norm for stability
-    v = torch.randn(d, 1, device=device, dtype=dtype)
-    for _ in range(5): # Fewer iters are fine for norm estimation
-        u = A @ v
-        u = u / (u.norm() + 1e-8)
-        v = A.T @ u
-        v = v / (v.norm() + 1e-8)
-    s = (u.T @ A @ v).squeeze()
-    
-    # Scale A to ensure convergence
-    B = A / s
-    Y = torch.eye(d, device=device, dtype=dtype)
-    
-    # Newton-Schulz iterations
-    for _ in range(steps):
-        Y = 0.5 * torch.matmul(Y, 3.0 * torch.eye(d, device=device, dtype=dtype) - torch.matmul(Y, torch.matmul(B, Y)))
-    
-    # Rescale to get A**(-1/2)
-    return Y / (s ** 0.5)
-
-
-class NewtonSchulzOrthogonalLinear(nn.Module):
-    """
-    A parameter-efficient linear layer with a semi-orthogonal weight matrix,
-    using a fast, iterative Newton-Schulz method instead of SVD.
-    """
-    def __init__(self, in_features, out_features, bias=True, steps=5):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.steps = steps
-
-        # The learnable parameter is the same size as a standard linear layer.
-        self.weight = nn.Parameter(torch.empty(out_features, in_features))
-        nn.init.orthogonal_(self.weight)
-
-        self.bias = None
-        if bias:
-            self.bias = nn.Parameter(torch.empty(out_features))
-            nn.init.zeros_(self.bias)
-
-    def _get_orthogonal_weight(self):
-        epsilon = 1e-5
-        
-        if self.out_features >= self.in_features:
-            # Tall or square matrix: orthogonalize columns
-            M = self.weight.T @ self.weight
-            d = M.shape[0]
-            M.add_(torch.eye(d, device=M.device, dtype=M.dtype), alpha=epsilon)
-            
-            M_inv_sqrt = newton_schulz_sqrt_inv(M, self.steps)
-            W_ortho = self.weight @ M_inv_sqrt
-        else:
-            # Wide matrix: orthogonalize rows
-            M = self.weight @ self.weight.T
-            d = M.shape[0]
-            M.add_(torch.eye(d, device=M.device, dtype=M.dtype), alpha=epsilon)
-            
-            M_inv_sqrt = newton_schulz_sqrt_inv(M, self.steps)
-            W_ortho = M_inv_sqrt @ self.weight
-            
-        return W_ortho
-
-    def forward(self, input):
-        W = self._get_orthogonal_weight()
-        return F.linear(input, W, self.bias)
-
 
 class LowRankCayleyLinear(nn.Module):
     def __init__(self, in_features, out_features, rank: int, bias=False):
@@ -768,69 +687,6 @@ class LowrankWoodburyCayleyLinear(nn.Module):
         
         return y_sliced.reshape(*original_shape[:-1], self.out_features)
     
-class LowrankNSWoodburyCayleyLinear(nn.Module):
-    # __init__ remains the same, num_iter is already a parameter!
-    def __init__(self, in_features: int, out_features: int, rank: int, 
-                 num_iter: int = 4, bias: bool = True):
-        super().__init__()
-        
-        self.in_features = in_features
-        self.out_features = out_features
-        self.rank = rank
-        self.num_iter = num_iter # This now controls the approximation quality
-
-        self.U = nn.Parameter(torch.empty(in_features, rank))
-        self.V = nn.Parameter(torch.empty(in_features, rank))
-        
-        nn.init.orthogonal_(self.U)
-        nn.init.orthogonal_(self.V)
-
-        if bias:
-            self.bias = nn.Parameter(torch.empty(out_features))
-            nn.init.zeros_(self.bias)
-        else:
-            self.register_parameter('bias', None)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        original_shape = x.shape
-        x_flat = x.reshape(-1, self.in_features)
-        
-        L = torch.cat([self.U, -self.V], dim=1)
-        R = torch.cat([self.V, self.U], dim=1)
-
-        R_T_x = (x_flat @ R).T 
-
-        I_k = torch.eye(2 * self.rank, device=x.device, dtype=x.dtype)
-        R_T_L = R.T @ L
-        M = I_k - R_T_L
-        
-        # =========== THE REPLACEMENT STARTS HERE ===========
-
-        # 1. Initial guess for the inverse of M is the identity matrix
-        M_inv = I_k.to(torch.float32) # Use float32 for stability
-        M_f32 = M.to(torch.float32)
-
-        # 2. Perform Newton-Schulz iterations
-        for _ in range(self.num_iter):
-            M_inv = M_inv @ (2 * I_k - M_f32 @ M_inv)
-
-        # 3. Apply the approximate inverse
-        M_inv_R_T_x = (M_inv @ R_T_x.to(torch.float32)).to(x.dtype)
-        
-        # =========== THE REPLACEMENT ENDS HERE ===========
-        
-        x_inv = x_flat + (L @ M_inv_R_T_x).T
-        
-        R_T_x_inv = (x_inv @ R).T
-        y_flat = x_inv + (L @ R_T_x_inv).T
-
-        y_sliced = y_flat[..., :self.out_features]
-        
-        if self.bias is not None:
-            y_sliced += self.bias
-        
-        return y_sliced.reshape(*original_shape[:-1], self.out_features)
-
 def manual_inverse_newton_schulz(M, num_iter=10, power_iter=10):
     original_dtype = M.dtype
     
@@ -856,36 +712,23 @@ def manual_inverse_newton_schulz(M, num_iter=10, power_iter=10):
     return M_inv_approx
 class CayleyInverse(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, M, num_iter):
-        # Forward pass uses the fast Newton-Schulz approximation
-        #
+    def forward(ctx, M):
         M_f32 = M.to(torch.float32)
         M_inv_approx = torch.linalg.inv(M_f32)
         
-        #M_inv_approx = manual_inverse_newton_schulz(M, num_iter=2, power_iter=2)
-        #I_k = torch.eye(M.shape[0], device=M.device, dtype=M.dtype)
-        #M_inv_approx = I_k.to(torch.float32)
-        #for _ in range(num_iter):
-        #    M_inv_approx = M_inv_approx @ (2 * I_k - M_f32 @ M_inv_approx)
-            
-        ctx.save_for_backward(M, M_inv_approx) # Save M and the approx inverse
+        ctx.save_for_backward(M, M_inv_approx) 
         return M_inv_approx.to(M.dtype)
 
     @staticmethod
     def backward(ctx, grad_output):
-        # Backward pass uses the gradient of the EXACT inverse
-        # The gradient of M_inv = M^-1 w.r.t. M is -M^-T @ grad_output @ M^-T
         M, M_inv_approx = ctx.saved_tensors
         
-        # Use the more accurate approximation for the backward pass grad
         M_inv_approx_T = M_inv_approx.T 
         grad_M = -M_inv_approx_T @ grad_output @ M_inv_approx_T
         
         return grad_M, None # No grad for num_iter
 
-class FastCayleyLinear(nn.Module):
-    # This class is identical to your LowrankWoodburyCayleyLinear,
-    # except it calls our custom autograd function.
+class FastWoodburyCayleyLinear(nn.Module):
     def __init__(self, in_features: int, out_features: int, rank: int, 
                  num_iter: int = 4, bias: bool = False):
         super().__init__()
@@ -908,7 +751,6 @@ class FastCayleyLinear(nn.Module):
 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # ... (same forward pass up to M)
         original_shape = x.shape
         x_flat = x.reshape(-1, self.in_features)
         
@@ -918,7 +760,6 @@ class FastCayleyLinear(nn.Module):
         R_T_L = R.T @ L
         M = torch.eye(2 * self.rank, device=x.device, dtype=x.dtype) - R_T_L
 
-        # Use our custom function
         M_inv = CayleyInverse.apply(M, self.num_iter)
         
         R_T_x = x_flat @ R
@@ -931,59 +772,6 @@ class FastCayleyLinear(nn.Module):
         if self.bias is not None:
             y_sliced += self.bias
         return y_sliced.reshape(*original_shape[:-1], self.out_features)
-
-class cl(nn.Module):
-    def __init__(self, features: int, rank: int, num_iter: int = 4, bias: bool = False):
-        super().__init__()
-        
-        self.features = features
-        self.rank = rank
-        self.num_iter = num_iter
-
-        # Learnable low-rank parameters U and V for the skew-symmetric part
-        self.U = nn.Parameter(torch.empty(features, rank))
-        self.V = nn.Parameter(torch.empty(features, rank))
-        
-        # A robust initialization for orthogonal/unitary matrices
-        nn.init.orthogonal_(self.U)
-        nn.init.orthogonal_(self.V)
-
-        if bias:
-            self.bias = nn.Parameter(torch.empty(features))
-            nn.init.zeros_(self.bias)
-        else:
-            self.register_parameter('bias', None)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Reshape for batched matrix operations
-        original_shape = x.shape
-        x_flat = x.reshape(-1, self.features)
-        
-        L = torch.cat([self.U, -self.V], dim=1) # Shape: (C, 2k)
-        R = torch.cat([self.V, self.U], dim=1)  # Shape: (C, 2k)
-
-        # 1. Compute the small matrix M = (I - R^T L) that needs to be inverted
-        I_k = torch.eye(2 * self.rank, device=x.device, dtype=x.dtype)
-        R_T_L = R.T @ L # (2k, C) @ (C, 2k) -> (2k, 2k)
-        M = I_k - R_T_L
-        
-        M_inv = I_k.to(torch.float32) # Initial guess is identity
-        M_f32 = M.to(torch.float32)   # Use float32 for stability
-        for _ in range(self.num_iter):
-            M_inv = M_inv @ (2 * I_k - M_f32 @ M_inv)
-        M_inv = M_inv.to(x.dtype)
-
-        # 3. Apply the transformation using the approximate inverse
-        R_T_x = x_flat @ R # (B, C) @ (C, 2k) -> (B, 2k)
-        M_inv_R_T_x = R_T_x @ M_inv.T # (B, 2k) @ (2k, 2k) -> (B, 2k)
-        L_M_inv_R_T_x = M_inv_R_T_x @ L.T # (B, 2k) @ (2k, C) -> (B, C)
-        
-        y_flat = x_flat + 2 * L_M_inv_R_T_x
-        
-        if self.bias is not None:
-            y_flat += self.bias
-        
-        return y_flat.reshape(original_shape)
 
 
 class AnalyticalCayleyLinear(nn.Module):
@@ -1065,26 +853,6 @@ class AnalyticalCayleyLinear(nn.Module):
         
         return y_sliced.reshape(*original_shape[:-1], self.out_features)
 
-class ProjectedCayleyLinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, rank: int, 
-                 num_iter: int = 4, bias: bool = False):
-        super().__init__()
-        
-        self.pre_proj = nn.Linear(in_features, out_features, bias=False)
-        
-        self.cayley_square = cl(
-            features=out_features, 
-            rank=rank, 
-            num_iter=num_iter, 
-            bias=bias
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Apply the two stages sequentially
-        x_reduced = self.pre_proj(x)
-        y = self.cayley_square(x_reduced)
-        return y
-
 class LowRankLinear(nn.Module):
     def __init__(self, in_features, out_features, rank):
         super().__init__()
@@ -1107,78 +875,3 @@ class LowRankButterflyLinear(nn.Module):
         x1, x2 = x.split(self.n, dim=-1)
         y1 = self.proj1(x1) + self.proj2(x2)
         return y1
-
-class GivensButterflyLinear(nn.Module):
-    def __init__(self, in_features: int, bias: bool = True):
-        super().__init__()
-        
-        if in_features % 2 != 0:
-            raise ValueError(f"in_features must be an even number, but got {in_features}")
-        
-        self.in_features = in_features
-        self.out_features = in_features // 2
-        self.n = self.out_features
-
-        self.theta = nn.Parameter(torch.empty(self.n))
-        
-        if bias:
-            self.bias = nn.Parameter(torch.empty(self.out_features))
-        else:
-            self.register_parameter('bias', None)
-            
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        nn.init.zeros_(self.theta)
-        if self.bias is not None:
-            nn.init.zeros_(self.bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x1, x2 = x.split(self.n, dim=-1)
-        
-        c = torch.cos(self.theta)
-        s = torch.sin(self.theta)
-        
-        y1 = c * x1 - s * x2
-        
-        if self.bias is not None:
-            y1 = y1 + self.bias
-            
-        return y1
-
-class DiagonalButterflyLinear(nn.Module):
-    def __init__(self, in_features: int, bias: bool = True):
-        super().__init__()
-        
-        if in_features % 2 != 0:
-            raise ValueError(f"in_features must be an even number, but got {in_features}")
-        
-        self.in_features = in_features
-        self.out_features = in_features // 2
-        self.n = self.out_features
-
-        self.weight1 = nn.Parameter(torch.empty(self.n))
-        self.weight2 = nn.Parameter(torch.empty(self.n))
-        
-        if bias:
-            self.bias = nn.Parameter(torch.empty(self.out_features))
-        else:
-            self.register_parameter('bias', None)
-            
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        nn.init.kaiming_uniform_(self.weight1.unsqueeze(0), a=math.sqrt(5))
-        nn.init.kaiming_uniform_(self.weight2.unsqueeze(0), a=math.sqrt(5))
-        if self.bias is not None:
-            nn.init.zeros_(self.bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x1, x2 = x.split(self.n, dim=-1)
-        
-        y = (self.weight1 * x1) + (self.weight2 * x2)
-        
-        if self.bias is not None:
-            y = y + self.bias
-            
-        return y

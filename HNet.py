@@ -143,16 +143,17 @@ class Patcher(nn.Module):
         self.up_drain = nn.Parameter(torch.ones(outer_dim))
 
         
-        self.query_block = modules.Block(outer_dim, 4, 0.0,False)
+        #self.query_block = modules.SSMBlock(outer_dim, 0.0, False)
+        self.query_block = modules.Block(outer_dim, 4, 0.0, False)
         self.gather_block = modules.CombineBlock(outer_dim, 4, 0.0,False)
     
     def abstract_up(self, x):
-        #scan = self.up_scan(x)
+        scan = self.up_scan(x, causal = False)
         ##scan = F.softmax(scan, dim=-1)
-        #scan = self.up_norm(scan)
-        #gate = self.up_gate(scan).squeeze(-1)
+        scan = self.up_norm(scan)
+        gate = self.up_gate(scan).squeeze(-1)
         ##gate = F.softmax(gate, dim=-1)
-        #gate = self.upgate_norm(gate)
+        #gate = self.up_gate(x).squeeze(-1)
         #
         ##losses = F.mse_loss(x[:,1:,:],scan[:,:-1,:],reduction="none")
         ##gate = losses.sum(dim=-1)
@@ -160,37 +161,52 @@ class Patcher(nn.Module):
         #
         #gathered = quantizer.GatherByGate.apply(gate, scan, self.inner_seq)
         #compressed sensing says that random samples should suffice?
-        q = self.query_block(x, causal = False)[:,-self.inner_seq:,:]
-        gathered = self.gather_block(x,q, causal = False)
+        gathered = self.query_block(x, causal = True)
+        #gathered = gathered[:,-self.inner_seq:,:]
+        _,idx = torch.topk(gate,self.inner_seq)
+        #idx = utils.bluenoise_indices(x.shape[0], self.outer_seq, self.inner_seq,device=x.device)
+    
+        eidx = idx.unsqueeze(-1).expand(-1, -1, x.shape[-1])
+        gathered = torch.gather(gathered,1,eidx)
+        #gathered = quantizer.GatherByGate.apply(gate, gathered, self.inner_seq)
+        #gathered = self.gather_block(x, gathered, causal = True)
         up = self.up_proj(gathered)
-        up, hot = self.AE(up)
-        return up, [x,hot]
+        ae_up, hot = self.AE(up)
+        aux = F.mse_loss(up, ae_up)
+        return up, [x,hot, idx, aux]
     
     def abstract_down(self, x, residual):
         #sg = self.down_gate(x[...,:self.sdim].reshape(x.shape[0], self.inner_seq*self.sdim))
-        residual, hot = residual
-        aux = F.binary_cross_entropy(self.AE.quant(x)[:,:-1,:], hot.detach()[:,1:,:])#ablate
+        residual, hot, idx, upaux = residual
+        #aux = F.binary_cross_entropy(self.AE.quant(x)[:,:-1,:], hot.detach()[:,1:,:])#ablate
+        aux=0
         pgd = p_down = self.down_proj(x)
-        pgd =self.down_scan(pgd)[:,-1,:]
+        pgd = self.down_scan(pgd)[:,-1,:]
         sg = self.down_gate(pgd)
         #sg = F.softmax(sg, dim=-1) 
         sg = self.gate_norm(sg)
-        #scattered = quantizer.ScatterByGate.apply(sg, x, self.outer_seq)# technically causal leak
         
         pos = torch.arange(0, self.outer_seq, dtype=torch.long, device=device) 
-        phot = F.one_hot(pos, self.outer_seq).to(x.dtype)
-        pos_emb = self.output_pos_emb(phot.detach()).expand(x.shape[0],-1,-1)
+        phot = F.one_hot(pos, self.outer_seq).to(x.dtype).detach()
+        pos_emb = self.output_pos_emb(phot).expand(x.shape[0],-1,-1)
         #query = scattered + pos_emb 
         query = pos_emb 
         #query = query + self.resid_up(residual)
-        pds = self.down_scatter(x, query)#maybe detach.
+        
+        scattered = torch.zeros(x.shape[0], self.outer_seq, x.shape[2], dtype=x.dtype, device=x.device)
+        
+        eidx = idx.unsqueeze(-1).expand(-1, -1, x.shape[-1])
+        scattered.scatter_(1, eidx, x)
+        #scattered = torch.scatter(1,x,idx)
+        #scattered = quantizer.ScatterByGate.apply(gate, x, self.outer_seq)# technically causal leak
+        pds = self.down_scatter(scattered, query, causal=True)#maybe detach.
         pds = self.down_proj(pds)
-
+        #print(query.shape)
         query = self.down_proj(query)+residual#ablate
         p_down = self.down_scatter2(pds, query, causal=True)#
         #pds = self.down_scatter(x, pos_emb)# self.resid_up(residual))
         #p_down=residual+p_down
-
+        aux = aux+upaux
         return self.down_scan(p_down), aux
     
     def forward(self, x, center):
@@ -273,11 +289,11 @@ class HNet(nn.Module):
             x = x[:,self.mem_block_size:,:].contiguous()
         else:
             x = self.innerb(x)
-            for i in range(4):
-                x = self.innerb2(x)
+            x = self.innerb2(x)
         aux=0
         for i in reversed(range(len(self.sLayers))):
             layer = self.sLayers[i]
+            #print(residuals[i][0].shape)
             x, auxl = layer.abstract_down(x, residuals[i])
             aux = aux+auxl
         

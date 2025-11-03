@@ -712,36 +712,15 @@ def justnorm(x, idim=-1):
     res = (x / x.norm(p=2, dim=idim, keepdim=True)).to(dtype=dtype) 
     return res
 
-class SpectralInspector:
-    def __init__(self, name: str, max_entries: int = 100):
-        self.name = name
-        self.max_entries = max_entries # Safety brake for memory
-        self.spectra = {'weight_param': [], 'weight_ortho': []}
+@torch.compile(backend='inductor', mode='max-autotune')
+def bluenoise_indices(batch_size, sequence_length, num_indices, device='cuda'):
+    bin_width = sequence_length / num_indices
+    bin_starts = torch.arange(0, num_indices, device=device) * bin_width
+    jitter = torch.rand(batch_size, num_indices, device=device) * bin_width
+    stratified_indices = bin_starts.unsqueeze(0) + jitter
+    final_indices = torch.clamp(stratified_indices, 0, sequence_length - 1).long()
+    return final_indices
 
-    def __call__(self, module, input, output):
-        # This logic is mostly the same, but we add a check to prevent memory leak
-        if len(self.spectra['weight_param']) >= self.max_entries:
-            return # Stop collecting if we've hit the limit
-
-        if hasattr(module, 'weight_param'):
-            s_param = torch.linalg.svdvals(module.weight_param.detach())
-            self.spectra['weight_param'].append(s_param.cpu().numpy())
-
-        if hasattr(module, 'last_weight_ortho'):
-            s_ortho = torch.linalg.svdvals(module.last_weight_ortho.detach())
-            self.spectra['weight_ortho'].append(s_ortho.cpu().numpy())
-    def get_latest_spectra(self):
-        """Returns the spectra from the most recent forward pass."""
-        if not self.spectra['weight_param']:
-            return None, None
-        return self.spectra['weight_param'][-1], self.spectra['weight_ortho'][-1]
-
-    def clear(self):
-        """Clears the stored spectra."""
-        self.spectra = {
-            'weight_param': [],
-            'weight_ortho': []
-        }
 @torch.compile(backend='inductor', mode='max-autotune')
 def orthogonalize_gradients(grad, params):
     w = params.view(-1)
