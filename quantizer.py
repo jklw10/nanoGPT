@@ -127,70 +127,6 @@ class GumbelGatherByGate(torch.autograd.Function):
         
         return grad_gate_logits, grad_candidate_pool, None
 
-
-class GatherByGate(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, gate_logits, candidate_pool, k):
-        
-        b, ct, c = candidate_pool.shape
-        b, gt = gate_logits.shape
-        assert gt == ct
-        _, top_indices = torch.topk(gate_logits, k=k, dim=-1) #b, k
-        expanded_indices = top_indices.unsqueeze(-1).expand(b, k, c)
-        output = torch.gather(candidate_pool, 1, expanded_indices) #b, k, c
-        ctx.save_for_backward(gate_logits, candidate_pool, output)
-        ctx.k = k
-        return output
-
-    @staticmethod
-    def backward(ctx, g):
-        gate_logits, candidate_pool, y = ctx.saved_tensors
-        k = ctx.k
-        grad_gate_logits = grad_candidate_pool = None
-
-        with torch.no_grad():
-            ideal_targets = y - g#scale gradient somehow. normalize both, hyper param, rangenorm
-            
-            #ideal_targets = y + g
-            Q = ideal_targets #B, K, C
-            K = candidate_pool #B, P, C
-          
-            # b,k,c dot b, c, p ->  b, k, p
-            #A has shape (..., M, N)
-            #B has shape (..., N, P)
-            #The result will have shape (..., M, P)
-            attn_scores = Q @ K.transpose(-2, -1) # b, K, pool
-            attn_scores = F.softmax(attn_scores, dim=-1)
-            scoresum = attn_scores.sum(dim=1) # b, p
-            _, best_candidate_indices = torch.topk(scoresum, k=k, dim=-1) 
-           
-        
-        if ctx.needs_input_grad[0]:
-            # The goal is to make the model's logits produce these top_overall_indices.
-            hard_target = torch.zeros_like(gate_logits) # Shape (b, p)
-            #the indices should be in range for this
-            hard_target.scatter_(dim=1, index=best_candidate_indices, value=1.0)
-            
-            # Use a stable, cross-entropy-like gradient.
-            #probs = F.softmax(gate_logits, dim=-1)
-            probs = F.sigmoid(gate_logits)
-            grad_gate_logits = probs - hard_target
-        if ctx.needs_input_grad[1]:
-            b,p,c = candidate_pool.shape
-            
-        
-            ideal_indices = best_candidate_indices.unsqueeze(-1).expand(b, k, c)
-            
-            y_ideal = torch.gather(candidate_pool, 1, ideal_indices)
-            delta = y - y_ideal
-            g_corrected = g - delta
-            grad_candidate_pool = torch.zeros_like(candidate_pool)
-            grad_candidate_pool.scatter_add_(1, ideal_indices, g_corrected)
-        
-        
-        return grad_gate_logits, grad_candidate_pool, None
-
-
 class ScatterByGate(torch.autograd.Function):
     @staticmethod
     def forward(ctx, gate_logits, patches, output_len):
@@ -651,7 +587,7 @@ class debugAutoencoderWithVQ(nn.Module):
         return torch.optim.AdamW(optim_groups, lr=LEARNING_RATE) 
 
 
-class GatherByGate2(torch.autograd.Function):
+class GatherByGate(torch.autograd.Function):
     @staticmethod
     def forward(ctx, gate_logits, candidate_pool, k):
         
@@ -707,28 +643,20 @@ class GatherByGate2(torch.autograd.Function):
         
         return grad_gate_logits, grad_candidate_pool, None
 
-class GatherByGateAutoencoder(nn.Module):
+class LTAutoencoder(nn.Module):
     def __init__(self, input_dim, hidden_dim, embed_dim, quant_dim, k):
         super().__init__()
         self.quant_dim = quant_dim
         self.embed_dim = embed_dim
         self.k = k
-        self.shape_n = 16
-        self.shape_dim = 16
-        self.shape_K = quant_dim // self.shape_dim
         
+            
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, self.shape_n * self.shape_dim)
+            modules.LTLinear(hidden_dim, quant_dim, ThresHot.apply)
         )
-        self.gate = nn.Sequential(
-            nn.Linear(self.shape_n * self.shape_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, self.shape_n)
-        )
-        self.candidate_pool = nn.Parameter(torch.randn(1, self.shape_n, self.shape_dim))
-
+        
         self.codebook = nn.Linear(self.quant_dim, embed_dim, bias=False)
        
         self.decoder = nn.Sequential(
@@ -745,20 +673,10 @@ class GatherByGateAutoencoder(nn.Module):
         return reconstruction, khot, vq_loss, k
 
     def quant(self, x):
-        batch_size = x.shape[0]
         encoding = self.encoder(x)
-
-        gate = self.gate(encoding)
-        #pool = self.candidate_pool.expand(batch_size, -1, -1)
-        pool = encoding.view(batch_size, self.shape_n, self.shape_dim)
-        gg = GatherByGate2.apply(gate, pool, self.shape_K)
-        #gg = GumbelGatherByGate.apply(gate, pool, self.shape_K, 1.0, self.training, 1e-10)
-        #pool = encoding.view(batch_size, self.shape_n, self.shape_dim)
-        #agg = GatherByGate2.apply(gate, pool, self.shape_K, )
-        #aux = F.mse_loss(gg.view(batch_size, -1), agg.view(batch_size, -1))
+        hot = encoding
+        #hot = ThresHot.apply(encoding)
         aux = 0.0
-        hot = ThresHot.apply(gg)
-        hot = hot.view(batch_size, -1)
         return hot, aux
     
     def k_from_hot(self, hot):
@@ -776,7 +694,89 @@ class GatherByGateAutoencoder(nn.Module):
         print(f"ae parameters: {num_ae}")
         # This optimizer setup is compatible with your harness
         return torch.optim.AdamW(self.parameters(), lr=LR)
+class SelfAttentionPaletteAE(nn.Module):
+    def __init__(self, input_dim, hidden_dim, embed_dim, quant_dim, k):
+        super().__init__()
+        self.quant_dim = quant_dim
+        self.embed_dim = embed_dim
+        self.k = k # Not directly used in this version, but kept for consistency
+        
+        self.shape_n = 16 # How many shapes in our dynamic palette
+        self.shape_dim = 16 # The dimension of each shape
+        self.shape_K = quant_dim // self.shape_dim # How many shapes to select
+
+        # Encoder generates the dynamic palette of "Keys" and "Values"
+        self.encoder_palette_generator = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, self.shape_n * self.shape_dim)
+        )
+        
+        # A separate network generates the "Query"
+        self.query_generator = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, self.shape_dim) # Query must have same dim as shapes
+        )
+
+        # Standard codebook and decoder
+        self.codebook = nn.Linear(self.quant_dim, embed_dim, bias=False)
+        self.decoder = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, input_dim)
+        )
+        self.attn = modules.Attention(self.shape_dim, 1, 0.0, False)
     
+    def forward(self, x):
+        # Your harness expects this forward signature
+        k_hot, vq_loss, logits = self.quant(x)
+        k = self.k_from_hot(k_hot).detach() 
+        reconstruction = self.dequant(k_hot)
+        return reconstruction, logits, vq_loss, k
+
+    def quant(self, x):
+        batch_size = x.shape[0]
+        
+        # 1. Generate the dynamic palette (our Keys and Values)
+        flat_palette = self.encoder_palette_generator(x)
+        dynamic_palette = flat_palette.view(batch_size, self.shape_n, self.shape_dim)
+
+        # 2. Generate the query
+        #query_vector = self.query_generator(x) # Shape: (B, shape_dim)
+        #
+        ## 3. Calculate gate logits via dot-product attention
+        ## (B, 1, C) @ (B, C, P) -> (B, 1, P) -> squeeze -> (B, P)
+        ## Here, C=shape_dim, P=shape_n
+        #gate_logits = torch.bmm(query_vector.unsqueeze(1), dynamic_palette.transpose(1, 2)).squeeze(1)
+#
+        ## 4. Gather the top K shapes from the dynamic palette
+        ## Here we can use your best performing GumbelGatherByGate or a simpler one
+        #selected_shapes = GatherByGate2.apply(gate_logits, dynamic_palette, self.shape_K)
+        
+        selected_shapes = self.attn(dynamic_palette,causal=False)[:,:self.shape_K,:]
+
+        # 5. Quantize the selected shapes and flatten
+        hot = ThresHot.apply(selected_shapes)
+        hot = hot.view(batch_size, -1)
+        
+        # Return gate_logits for perplexity calculation
+        return hot, 0.0, selected_shapes
+    
+    def k_from_hot(self, hot):
+        return hot.sum(dim=-1, keepdim=True).clamp(1,self.quant_dim).detach()
+
+    def dequant(self, hot, norm = True):
+        if norm:
+            k = self.k_from_hot(hot)
+            hot = hot / k
+        q = self.codebook(hot)
+        return self.decoder(q)
+        
+    def optimizer(self, LR):
+        num_ae = sum(p.numel() for p in self.parameters())
+        print(f"ae parameters: {num_ae}")
+        return torch.optim.AdamW(self.parameters(), lr=LR)
 # --- The Autoencoder and Experiment Setup ---
 class debugAutoencoder(nn.Module):
     def __init__(self, input, hidden, embed, qdim, quantizer, Act , k = None):
@@ -1013,11 +1013,13 @@ if __name__ == '__main__':
         #"BCER k 1":   Autoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHotBCE, 1),
         #"thot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHotBCE, TaylorThresHotActivation, 32),
         #"bspline":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHotBCE, BSplineActivation, 32),
-        "GatherByGate": GatherByGateAutoencoder(
+        #"GatherByGate": GatherByGateAutoencoder(input_dim=INPUT_DIM,hidden_dim=HIDDEN_DIM,embed_dim=EMBED_DIM,quant_dim=QUANT_DIM, k=32),
+        #"attnGather": SelfAttentionPaletteAE(input_dim=INPUT_DIM,hidden_dim=HIDDEN_DIM,embed_dim=EMBED_DIM,quant_dim=QUANT_DIM, k=32),
+        "ltae": LTAutoencoder(
             input_dim=INPUT_DIM,
             hidden_dim=HIDDEN_DIM,
             embed_dim=EMBED_DIM,
-            quant_dim=QUANT_DIM, # quant_dim is the size of our candidate pool
+            quant_dim=QUANT_DIM, 
             k=32
         ),
         #"topkCE":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM,  Hotmod(TopKHot,32), nn.SiLU ),

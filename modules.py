@@ -8,7 +8,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import utils
 import quantizer
-
+from torch.optim.optimizer import Optimizer
 
 
 class SSM(nn.Module):
@@ -64,6 +64,14 @@ class CombineAttention(nn.Module):
         
         self.qm = nn.Parameter(torch.ones(self.head_dim).normal_(mean=1, std=0.1))
         
+    def _create_mask(self, T_q, T_kv, device):
+        scaling_factor = T_kv / T_q
+        query_indices = torch.arange(T_q, device=device)
+        key_indices = torch.arange(T_kv, device=device)
+        max_key_indices = ((query_indices + 1) * scaling_factor).floor() - 1
+        mask = key_indices[None, :] > max_key_indices[:, None]
+        return mask
+    
     def forward(self, x, sx, causal = False):
         B, T, C = x.size() 
         sB, sT, sC = sx.size() 
@@ -73,11 +81,16 @@ class CombineAttention(nn.Module):
         q = q.view(B, sT, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, sT, hs)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        attn_mask=None
+        if causal:
+            if sT != T:
+                attn_mask = self._create_mask(sT, T, x.device)
+                causal = False
 
         y = torch.nn.functional.scaled_dot_product_attention(
             q * (math.log(T)*self.qm),
             k, v, 
-            attn_mask=None, dropout_p=self.dropout if self.training else 0,
+            attn_mask=attn_mask, dropout_p=self.dropout if self.training else 0,
             is_causal= causal)
         
         y = y.transpose(1, 2).contiguous().view(B, sT, C) 
@@ -97,8 +110,6 @@ class CombineBlock(nn.Module):
         self.mlp = MLP(n_embd, dropout, bias)
 
     def forward(self, x, sx, causal = False):
-        if causal:
-            assert x.shape == sx.shape
         a = self.attn(self.ln_1(x), self.ln_2(sx), causal)
         sx = sx + a
         sx = sx + self.mlp(self.ln_3(sx))
@@ -875,3 +886,128 @@ class LowRankButterflyLinear(nn.Module):
         x1, x2 = x.split(self.n, dim=-1)
         y1 = self.proj1(x1) + self.proj2(x2)
         return y1
+
+class GradientPredictor(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, output_dim)
+        )
+
+    def forward(self, grad_output, original_input, weight):
+        flat_input = original_input.flatten(1)
+        flat_weight = weight.flatten(1)
+        flat_grad_output = grad_output.flatten(1)
+
+        if original_input.shape[0] > 1:
+            flat_input = flat_input.mean(dim=0, keepdim=True)
+            flat_grad_output = flat_grad_output.mean(dim=0, keepdim=True)
+
+        x = torch.cat([flat_grad_output, flat_input, flat_weight], dim=-1)
+        return self.net(x)
+
+class GradientLearnerOptimizer(Optimizer):
+    def __init__(self, params, defaultOptim, lr=1e-3, meta_lr=1e-4):
+        defaults = dict(lr=lr)
+        super().__init__(params, defaults)
+        
+        self.meta_lr = meta_lr
+        self.gradient_predictors = {}
+        self.predictor_params = []
+        # --- Initialization Step ---
+        # Find all parameters that will need a learned gradient and build a predictor for each.
+        for group in self.param_groups:
+            for i, p in enumerate(group['params']):
+                # We need a way to identify these special layers.
+                # Let's assume we add a flag during model creation.
+                if hasattr(p, '_is_learnable_gradient'):
+                    # The dimensions are tricky and need to be defined carefully
+                    input_dim = ... 
+                    output_dim = p.numel()
+                    
+                    predictor = GradientPredictor(input_dim, output_dim)
+                    self.gradient_predictors[id(p)] = predictor
+                    self.predictor_params.append(predictor.parameters())
+        
+        self.defaultOptim= defaultOptim()
+
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                if hasattr(p.grad, '_gradient_context'):
+                    ctx = p.grad._gradient_context
+                    predictor = self.gradient_predictors[id(p)]
+                    predictor_optim = self.predictor_optimizers[id(p)]
+                    
+                    with torch.enable_grad():
+                        predicted_grad = predictor(ctx['grad_output'], ctx['input'], ctx['weight'])
+                        predicted_grad = predicted_grad.view_as(p)
+
+                    with torch.enable_grad():
+                        temp_p = p.detach().clone()
+                        updated_p = temp_p - group['lr'] * predicted_grad
+
+                        output_after_update = F.linear(ctx['input'], updated_p, ctx['bias'])
+                        output_after_update = ctx['func'](output_after_update)
+                        
+                        target_output = F.linear(ctx['input'], p, ctx['bias']) - ctx['grad_output']
+                        predictor_loss = F.mse_loss(output_after_update, target_output.detach())
+
+                        predictor_optim.zero_grad()
+                        predictor_loss.backward() # This computes grads for the predictor's params
+                        predictor_optim.step()
+
+                    p.add_(predicted_grad.detach(), alpha=-group['lr'])
+
+                else:
+                    p.add_(p.grad, alpha=-group['lr'])
+        
+        return loss
+class GradientContext(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input_tensor, weight, bias, func):
+        # We need the inputs to the linear layer for the backward pass
+        linear_input = input_tensor.clone()
+        ctx.save_for_backward(linear_input, weight, bias)
+        ctx.func = func
+        
+        output = F.linear(input_tensor, weight, bias)
+        return func(output)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input_tensor, weight, bias = ctx.saved_tensors
+        
+        dummy_grad_w = torch.zeros_like(weight)
+        dummy_grad_b = torch.zeros_like(bias) if bias is not None else None
+        
+        dummy_grad_w._gradient_context = {
+            "input": input_tensor,
+            "weight": weight,
+            "bias": bias,
+            "grad_output": grad_output,
+            "func": ctx.func
+        }
+        return None, dummy_grad_w, dummy_grad_b, None   
+    
+class LNLinear(nn.Linear):
+    def __init__(self, in_features, out_features, func):
+        super().__init__(in_features, out_features, bias=True)
+        self.func = func
+        
+    def forward(self, input):
+        return GradientContext.apply(input, self.weight, self.bias, self.func)

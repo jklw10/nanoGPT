@@ -27,6 +27,8 @@ DIM_L3 = 256
 K_GATHER_L1 = 64
 K_GATHER_L2 = 16
 
+mem_size = 48
+
 max_iters = 30000
 eval_interval = 1000
 learning_rate = 1e-3
@@ -39,7 +41,7 @@ min_lr = 1e-4
 
 idk_enabled = False
 cl          = False
-mem         = False
+mem         = True
 gradlog     = False
 gen         = True
 memcheat    = False
@@ -152,6 +154,7 @@ class Patcher(nn.Module):
         ##scan = F.softmax(scan, dim=-1)
         scan = self.up_norm(scan)
         gate = self.up_gate(scan).squeeze(-1)
+        scan = self.query_block(x, causal = True)
         ##gate = F.softmax(gate, dim=-1)
         #gate = self.up_gate(x).squeeze(-1)
         #
@@ -161,25 +164,25 @@ class Patcher(nn.Module):
         #
         #gathered = quantizer.GatherByGate.apply(gate, scan, self.inner_seq)
         #compressed sensing says that random samples should suffice?
-        gathered = self.query_block(x, causal = True)
-        #gathered = gathered[:,-self.inner_seq:,:]
-        _,idx = torch.topk(gate,self.inner_seq)
-        #idx = utils.bluenoise_indices(x.shape[0], self.outer_seq, self.inner_seq,device=x.device)
-    
-        eidx = idx.unsqueeze(-1).expand(-1, -1, x.shape[-1])
-        gathered = torch.gather(gathered,1,eidx)
+        gathered = self.query_block(x, causal = False)
+        gathered = gathered[:,-self.inner_seq:,:]
+        #_,idx = torch.topk(gate,self.inner_seq)
+        ###idx = utils.bluenoise_indices(x.shape[0], self.outer_seq, self.inner_seq,device=x.device)
+        ##
+        #eidx = idx.unsqueeze(-1).expand(-1, -1, x.shape[-1])
+        #gathered = torch.gather(gathered,1,eidx)
         #gathered = quantizer.GatherByGate.apply(gate, gathered, self.inner_seq)
-        #gathered = self.gather_block(x, gathered, causal = True)
+        gathered = self.gather_block( x,gathered, causal = False)
         up = self.up_proj(gathered)
         ae_up, hot = self.AE(up)
         aux = F.mse_loss(up, ae_up)
-        return up, [x,hot, idx, aux]
+        return ae_up, [x,hot, gate, aux]
     
     def abstract_down(self, x, residual):
         #sg = self.down_gate(x[...,:self.sdim].reshape(x.shape[0], self.inner_seq*self.sdim))
-        residual, hot, idx, upaux = residual
-        #aux = F.binary_cross_entropy(self.AE.quant(x)[:,:-1,:], hot.detach()[:,1:,:])#ablate
-        aux=0
+        residual, hot, gate, upaux = residual
+        aux = F.binary_cross_entropy(self.AE.quant(x)[:,:-1,:], hot.detach()[:,1:,:])#ablate
+        #aux=0
         pgd = p_down = self.down_proj(x)
         pgd = self.down_scan(pgd)[:,-1,:]
         sg = self.down_gate(pgd)
@@ -191,18 +194,19 @@ class Patcher(nn.Module):
         pos_emb = self.output_pos_emb(phot).expand(x.shape[0],-1,-1)
         #query = scattered + pos_emb 
         query = pos_emb 
-        #query = query + self.resid_up(residual)
+        query = query + self.resid_up(residual)
         
-        scattered = torch.zeros(x.shape[0], self.outer_seq, x.shape[2], dtype=x.dtype, device=x.device)
-        
-        eidx = idx.unsqueeze(-1).expand(-1, -1, x.shape[-1])
-        scattered.scatter_(1, eidx, x)
+        #scattered = torch.zeros(x.shape[0], self.outer_seq, x.shape[2], dtype=x.dtype, device=x.device)
+        #
+        #_,idx = torch.topk(gate,self.inner_seq)
+        #eidx = idx.unsqueeze(-1).expand(-1, -1, x.shape[-1])
+        #scattered.scatter_(1, eidx, x)
         #scattered = torch.scatter(1,x,idx)
         #scattered = quantizer.ScatterByGate.apply(gate, x, self.outer_seq)# technically causal leak
-        pds = self.down_scatter(scattered, query, causal=True)#maybe detach.
+        pds = self.down_scatter(x.detach(), query, causal=False)#maybe detach.
         pds = self.down_proj(pds)
         #print(query.shape)
-        query = self.down_proj(query)+residual#ablate
+        query = self.down_proj(query)#+residual#ablate
         p_down = self.down_scatter2(pds, query, causal=True)#
         #pds = self.down_scatter(x, pos_emb)# self.resid_up(residual))
         #p_down=residual+p_down
@@ -232,7 +236,7 @@ class HNet(nn.Module):
         
         if mem:
             memconf = {
-                'mem_block_size': 48,
+                'mem_block_size': mem_size,
                 'dropout': 0.0,
                 'n_embd': DIM_L3,
                 'n_head': 4,
@@ -254,6 +258,7 @@ class HNet(nn.Module):
         if self.training and not self.memory_frozen:
             with torch.no_grad():
                 self.memory = (self.memory+update*malpha)
+    
 
     def forward(self, idx, targets=None):
         device = idx.device
@@ -270,32 +275,19 @@ class HNet(nn.Module):
             x, res = layer.abstract_up(x)
             residuals.append(res)
         if mem:
-            cb,ct,cc = x.shape
-            x1 = x
-            x = torch.cat([self.memory.expand(cb,-1,-1), x],dim=1) #probably needs a batch swizzle to pervent cheating
-            x = self.innerb(x)
-            x = self.innerb2(x)
-            malpha = 1.0
-            if memcheat:
-                mem2 = ((self.memory+self.mem_form(x)*malpha)).expand(cb,-1,-1)
-            else:
-                mh1 = ((self.memory+self.mem_form(x[:cb//2,...])*malpha)).expand(cb//2,-1,-1)
-                mh2 = ((self.memory+self.mem_form(x[cb//2:,...])*malpha)).expand(cb//2,-1,-1)
-                mem2 = torch.cat([mh2,mh1],dim=0)
-            x = torch.cat([mem2, x1],dim=1) #try what memorization enhances the score
-            x = self.innerb(x)
-            x = self.innerb2(x)
-            self.mem_update(self.mem_form(x),malpha)
-            x = x[:,self.mem_block_size:,:].contiguous()
+            x = self.mem_center(x)
         else:
             x = self.innerb(x)
             x = self.innerb2(x)
         aux=0
         for i in reversed(range(len(self.sLayers))):
             layer = self.sLayers[i]
-            #print(residuals[i][0].shape)
             x, auxl = layer.abstract_down(x, residuals[i])
             aux = aux+auxl
+        
+        if targets is None: #during inference skip the losses
+            logits = self.head(x[:, -skiptok:, :])
+            return logits
         
         if cl:
             total_cl = 0.0
@@ -312,30 +304,48 @@ class HNet(nn.Module):
                 current_input_rep = encoded_input
                 current_output_rep = encoded_output
         
-        loss = None
-        gloss = None
-        if targets is not None:
-            logits = self.head(x)
-            B, T_out, C = logits.shape
-            targets_aligned = targets[:, :T_out]
+        
+        logits = self.head(x)
+        B, T_out, C = logits.shape
+        targets_aligned = targets[:, :T_out]
+        
+        loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets_aligned.reshape(-1))
+        gloss = 0.0
+        #gloss = F.cross_entropy(logits[:,:-1,:].reshape(-1, C), targets_aligned[:,:-1,:].reshape(-1))
+        if self.training:
+            if idk_enabled:
+                loss = utils.idk_loss(loss, logits, targets, idk_token) 
             
-            loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets_aligned.reshape(-1))
-            gloss = 0.0
-            #gloss = F.cross_entropy(logits[:,:-1,:].reshape(-1, C), targets_aligned[:,:-1,:].reshape(-1))
-            if self.training:
-                
-                if idk_enabled:
-                    loss = utils.idk_loss(loss, logits, targets, idk_token) 
-                
-                
-                loss = loss+aux
-                if cl:
-                    loss = loss+total_cl
+            loss = loss+aux
+            if cl:
+                loss = loss+total_cl
+
+        return logits, loss, gloss 
+
+    def mem_center(self, x):
+        cb,ct,cc = x.shape
+        x1 = x
+        x = torch.cat([self.memory.expand(cb,-1,-1), x],dim=1) #probably needs a batch swizzle to pervent cheating
+        x = self.innerb(x)
+        x = self.innerb2(x)
+        
+        if not self.training:
+            return x[:,self.mem_block_size:,:].contiguous()
+        
+        malpha = 1.0
+        if memcheat:
+            mem2 = ((self.memory+self.mem_form(x)*malpha)).expand(cb,-1,-1)
         else:
-            logits = self.head(x[:, -skiptok:, :])
-
-
-        return logits, loss, gloss    
+            mh1 = ((self.memory+self.mem_form(x[:cb//2,...])*malpha)).expand(cb//2,-1,-1)
+            mh2 = ((self.memory+self.mem_form(x[cb//2:,...])*malpha)).expand(cb//2,-1,-1)
+            mem2 = torch.cat([mh2,mh1],dim=0)
+        x = torch.cat([mem2, x1],dim=1) #try what memorization enhances the score
+        x = self.innerb(x)
+        x = self.innerb2(x)
+        
+        self.mem_update(self.mem_form(x),malpha)
+        x = x[:,self.mem_block_size:,:].contiguous()
+        return x   
     
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
@@ -344,7 +354,7 @@ class HNet(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= block_size else idx[:, -block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -skiptok:, :] / temperature
             #         record for super pos

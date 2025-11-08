@@ -24,14 +24,14 @@ n_embed = 228
 n_head = 6
 n_layer = 4
 
-dropout = 0.1
-max_iters = 30000
+dropout = 0.0
+max_iters = 50000
 eval_interval = 1000
 learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 device_type = 'cuda'
 warmup_iters = 200
-lr_decay_iters = 15000
+lr_decay_iters = 30000
 min_lr = learning_rate/10
 
 
@@ -42,12 +42,12 @@ idk_enabled = False
 cl          = False
 mem         = False
 gradlog     = False
-gen         = True
+gen         = False
 memcheat    = False
 wnorm       = False
 genloss     = True
 
-qkhwn       = True
+qkhwn       = False
 #todo, wnorm, midreset, lr on memory, memswizzle,
 #ablate hierarchy, add innerblocks, make hierarchical output generation
 
@@ -240,6 +240,8 @@ class Model(nn.Module):
         else:
             self.lm_head =  nn.Linear(n_embed, vocab_size, bias=False)
             self.transformer.wte.weight = self.lm_head.weight 
+            #self.lm_head2 =  nn.Linear(n_embed, vocab_size, bias=False)
+        
         self.lambda_corrected = 0.0
         self.k = k 
         self.lambda_thought = lambda_thought 
@@ -309,28 +311,15 @@ class Model(nn.Module):
         
         ## PASS 3: BASELINE PASS (gen3)
         ## Note: We only pass the *new* tokens. The context is handled by the KV cache.
-        #hidden_states_T1_gt = self.transformer_forward(Y1_gt, past_key_values=kv_cache_X).last_hidden_state
-        #logits_t2_baseline = self.lm_head(hidden_states_T1_gt)
-        #L_baseline = F.cross_entropy(logits_t2_baseline.view(-1, logits_t2_baseline.size(-1)), Y2_gt.view(-1), reduction='none').view(Y2_gt.shape)
+        hidden_states_T1_gt = self.transformer_forward(Y1_gt, past_key_values=kv_cache_X).last_hidden_state
+        logits_t2_baseline = self.lm_head(hidden_states_T1_gt)
+        L_baseline = F.cross_entropy(logits_t2_baseline.view(-1, logits_t2_baseline.size(-1)), Y2_gt.view(-1), reduction='none').view(Y2_gt.shape)
         
         
         ## PASS 3: do a mtp head instead of full pass for self knowledge sample
-        logits_t2_baseline = self.lm_head2(hidden_states_X)
-        L_baseline = F.cross_entropy(logits_t2_baseline.view(-1, logits_t2_baseline.size(-1)), Y2_gt.view(-1), reduction='none').view(Y2_gt.shape)
+        #logits_t2_baseline = self.lm_head2(hidden_states_X)
+        #L_baseline = F.cross_entropy(logits_t2_baseline.view(-1, logits_t2_baseline.size(-1)), Y2_gt.view(-1), reduction='none').view(Y2_gt.shape)
         
-        # REWARD CALCULATION
-        #with torch.no_grad():
-        #Gain = L_baseline - L_corrected
-        #Gain = (Gain - Gain.mean().detach()) / (Gain.std().detach() + 1e-8) 
-        #Gain = torch.tanh(Gain / 2.0)
-        #    #Gain = torch.clamp(Gain, -5.0, 5.0) 
-        ##Gain = utils.minmaxnorm(Gain)
-        #log_probs_t1 = F.log_softmax(logits_t1, dim=-1)
-        #log_prob_T1_pred = torch.sum(log_probs_t1 * T1_pred_onehot, dim=-1)
-        #
-        #L_thought = -(Gain * log_prob_T1_pred)
-        
-        #try2
         with torch.no_grad():
             Gain = L_baseline - L_corrected
             T = 0.1 # A hyperparameter to tune
