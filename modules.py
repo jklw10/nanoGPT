@@ -47,14 +47,12 @@ class CombineAttention(nn.Module):
     def __init__(self, n_embd,n_head,dropout,bias):
         super().__init__()
         assert n_embd % n_head == 0
-        self.q_proj = nn.Linear(n_embd, n_embd, bias=bias)
-        self.k_proj = nn.Linear(n_embd, n_embd, bias=bias)
-        self.v_proj = nn.Linear(n_embd, n_embd, bias=bias)
+        self.q_proj = OrthogonalLinear(n_embd, n_embd, bias=bias)
+        self.k_proj = OrthogonalLinear(n_embd, n_embd, bias=bias)
+        self.v_proj = OrthogonalLinear(n_embd, n_embd, bias=bias)
       
-        self.c_proj = nn.Linear(n_embd,  n_embd, bias=bias)
+        self.c_proj = OrthogonalLinear(n_embd,  n_embd, bias=bias)
         
-        self.attmod = nn.Linear(n_embd,  n_embd, bias=bias)
-      
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
         self.n_head = n_head 
@@ -127,11 +125,14 @@ class Attention(nn.Module):
     def __init__(self, n_embd, n_head, dropout, bias, **kwargs):
         super().__init__()
         assert n_embd % n_head == 0
-        self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=bias)
+        self.q_proj = OrthogonalLinear(n_embd, n_embd, bias=bias)
+        self.k_proj = OrthogonalLinear(n_embd, n_embd, bias=bias)
+        self.v_proj = OrthogonalLinear(n_embd, n_embd, bias=bias)
       
-        self.c_proj = nn.Linear(n_embd,  n_embd, bias=bias)
+      
+        self.c_proj = OrthogonalLinear(n_embd,  n_embd, bias=bias)
         
-        self.attmod = nn.Linear(n_embd,  n_embd, bias=bias)
+        self.attmod = OrthogonalLinear(n_embd,  n_embd, bias=bias)
       
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
@@ -144,7 +145,9 @@ class Attention(nn.Module):
         
     def forward(self, x, causal=True):
         B, T, C = x.size() 
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
@@ -324,7 +327,7 @@ class Dreamer(nn.Module):
         super().__init__()
         self.block = Block(**kwargs)
         self.causal = causal
-        self.comp = LearnableFourierResampler(mem_block_size * 2, mem_block_size, 64)
+        self.comp = ResampFFTGaps(mem_block_size * 2, mem_block_size, 64)
         self.ln = LayerNorm(**kwargs)
         
     def forward(self, x):

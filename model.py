@@ -13,10 +13,12 @@ from dataclasses import dataclass
 
 from numpy import float32
 from pandas import infer_freq
+from sympy import true
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import modules
+import optim
 import utils
 import wackmodel
 from cut_cross_entropy import linear_cross_entropy
@@ -29,7 +31,7 @@ Orthlin = modules.OrthogonalLinear
 #settings :)
 #known good
 diffSplits      = 1
-ssmax           = False
+ssmax           = True
 mtp             = False
 CCE             = True
 #ungraded
@@ -58,7 +60,7 @@ think           = False
 repeat_block    = False
 repeatCenter    = False
 
-Qrotention      = True
+Qrotention      = False
 symloss         = False
 midchaos        = False
 
@@ -71,7 +73,7 @@ nmix            = False
 losspred        = False
 
 dynskip         = False
-k_atten         = False
+k_atten         = True
 moe             = False
 sprs            = False
 wnll            = False
@@ -280,7 +282,7 @@ class Attention(nn.Module):
 
         return y
 
-class TopKSparseAttention(nn.Module):
+class Kattention(nn.Module):
     def __init__(self, config, k_sparse=1):
         super().__init__()
         assert config.n_embd % config.n_head == 0
@@ -292,9 +294,6 @@ class TopKSparseAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         
-        # Simple, query-independent scorer
-        self.key_scorer = nn.Linear(self.head_dim, 1)
-        
         self.k_sparse = k_sparse
 
     def forward(self, x, causal = True):
@@ -305,50 +304,23 @@ class TopKSparseAttention(nn.Module):
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
-        # 1. Get query-independent scores for all keys.
-        key_scores = self.key_scorer(k).squeeze(-1) # Shape: (B, nh, T)
 
-        # --- The New, Elegant Causal Selection ---
-
-        # 2. Create a causal mask for the scores.
-        # This will be used to filter the scores *before* topk.
         causal_mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, T, T)
         
-        # We need to expand the scores to a (T, T) matrix for each query
-        # to apply the mask.
-        scores_for_selection = key_scores.unsqueeze(2).expand(-1, -1, T, -1) # (B, nh, T, T)
-        
-        # 3. Apply the causal mask to the scores.
-        # We use masked_fill to ensure that future keys have no chance of being selected.
-        causally_masked_scores = scores_for_selection.masked_fill(causal_mask == 0, float('-inf'))
-        
-        # 4. Now, perform Top-K on these causally valid scores.
-        # For each query (dim=2), we select the top k keys from its past (dim=3).
-        # This is guaranteed to be causal and NaN-free.
-        # We also need to handle the case where t < k_sparse.
         k_val = min(self.k_sparse, T)
-        _, top_indices = torch.topk(causally_masked_scores, k=k_val, dim=-1) # (B, nh, T, k_val)
 
-        # --- The rest of the attention mechanism is now simpler and safer ---
-
-        # 5. Gather the Keys and Values based on the valid indices.
-        # This gather is the same complex gather as before.
-        expanded_indices = top_indices.unsqueeze(-1).expand(-1, -1, -1, -1, self.head_dim)
-        k_expanded = k.unsqueeze(2).expand(-1, -1, T, -1, -1)
-        v_expanded = v.unsqueeze(2).expand(-1, -1, T, -1, -1)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         
-        sparse_k = torch.gather(k_expanded, 3, expanded_indices)
-        sparse_v = torch.gather(v_expanded, 3, expanded_indices)
+        #if self.training: 
+        #    att = att - torch.log(-torch.log(torch.rand_like(att) + 1e-9) + 1e-9)
+            
         
-        # 6. Perform the efficient dot-product.
-        # The logits matrix is guaranteed to have valid entries because our selection was valid.
-        q_for_attn = q.unsqueeze(3)
-        attn_logits = (q_for_attn @ sparse_k.transpose(-2, -1)).squeeze(3) * (1.0 / math.sqrt(self.head_dim))
-        
-        # 7. Final softmax and value application.
-        # No need for stability fixes here, as we have no all-'-inf' rows.
-        sparse_probs = F.softmax(attn_logits, dim=-1)
-        y = (sparse_probs.unsqueeze(3) @ sparse_v).squeeze(3)
+        att = att.masked_fill(causal_mask == 0, float('-inf'))
+        k_hot_mask = quantizer.TopKHot.apply(att, k_val)
+        att = att.masked_fill(k_hot_mask == 0, float('-inf'))
+        att = torch.softmax(att,dim=-1) 
+        #att = F.gumbel_softmax(att,tau= 1.0, hard=true, dim =-1)
+        y = att@v
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
@@ -489,8 +461,8 @@ class Block(nn.Module):
         self.ln_1 = LayerNorm(config)
         if(Qrotention):
             self.attn = QrotAttention(config)
-        elif sprs:
-            self.attn = TopKSparseAttention(config)
+        elif k_atten:
+            self.attn = Kattention(config)
         
         else:
             self.attn = Attention(config)
@@ -522,7 +494,6 @@ class Block(nn.Module):
         ) 
         return sploss
     
-
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -946,7 +917,9 @@ class GPT(nn.Module):
                 optimizer = torch.optim.SGD(optim_groups, lr=learning_rate, **extra_args)
             case "phi2":
                 optimizer = wackmodel.Phi2Optimizer(optim_groups,lr=learning_rate, **extra_args)
-            
+            case "bubbles":
+                base = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+                optimizer = optim.ChaosRollbackOptimizer(self, base_optimizer=base)
             #optimizer =torch.optim.Adadelta(optim_groups)#, **extra_args)# lr=learning_rate, **extra_args)
         print(f"using fused AdamW: {use_fused}")
                         

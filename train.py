@@ -24,6 +24,7 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch._dynamo
 import torch._inductor.config
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -31,6 +32,9 @@ from torch.distributed import init_process_group, destroy_process_group
 from model import MLP, GPTConfig, GPT
 import optim
 import utils
+
+
+from torch.func import functional_call, vmap
 
 from torch.utils.data import Dataset, DataLoader
 
@@ -257,12 +261,20 @@ gradorth            = False
 gwrot               = False
 wwhite_enabled      = False
 
-gsphere             = False
 ndiff_enabled       = False
-gchaos              = False #or best
-ggauss              = False #or best
-
 decay_wa            = False
+
+gd4sphere           = False
+
+#not abysmal
+gsphere             = False
+ggauss              = False #or best
+gchaos              = False #or best
+
+grefl               = False
+
+wstep               = False
+
 #known good
 gfft                = False #or best
 gnorm               = False #or best
@@ -275,12 +287,13 @@ muon                = False
 #for fftmem owt: 1e-5 #beta2 dependent
 #for fftmem skspr: 5e-5 #beta2 dependent
 #no clue why this way of passing is needed here but not for the bools. love python
-config["swna"]      = 1e-5 if dataset == "openwebtext" else 1e-3
-config["swwa"]      = 1.0e-5 if dataset == "openwebtext" else 1e-4
+wfunc = utils.apply_reflection
+#wfunc = utils.range_norm
+config["swfa"]      = 1e-5 if dataset == "openwebtext" else 1e-3
 zcastep             = 2 #2, 5
 szcapow             = 2 #2, 10
 
-ghook = gwrot or gdiff_enabled or ndiff_enabled or gnorm or dfw_enabled or grokfast or gfft or gzca_enabled or sign_enabled or gsphere or ggauss or gchaos or gradorth or muon
+ghook = grefl or gd4sphere or gwrot or gdiff_enabled or ndiff_enabled or gnorm or dfw_enabled or grokfast or gfft or gzca_enabled or sign_enabled or gsphere or ggauss or gchaos or gradorth or muon
 
 decay               = False
 decaying = 1.0
@@ -333,8 +346,36 @@ def custom_gradient_adjustment(grad, param, wema = None, gema = None):
         adjusted_grad = ((adjusted_grad - grad_avg) / grad_range)  * (2 - 2 / input_size) 
     if(gchaos):
         adjusted_grad += torch.rand_like(adjusted_grad)*1e-3
-    if(gsphere and d2): 
-        adjusted_grad = adjusted_grad / adjusted_grad.norm() # * (2 - 2 / input_size) 
+    if(gsphere): 
+        nd = [-1,-2] if d2 else [-1]
+        adjusted_grad = adjusted_grad / adjusted_grad.norm(dim =nd, keepdim= True) # * (2 - 2 / input_size) 
+        
+    if(gd4sphere): 
+        nd = [-1,-2] if d2 else [-1]
+        g_norm = adjusted_grad.norm(dim = nd, keepdim= True)
+        adjusted_grad = adjusted_grad / (g_norm+1e-10)
+        #adjusted_grad = adjusted_grad * F.tanh(g_norm)
+        adjusted_grad = adjusted_grad * torch.log(0.9+g_norm)
+    #if(gd4sphere ): 
+    #    ogs =adjusted_grad.shape
+    #    if d2:
+    #        adjusted_grad = adjusted_grad.view(ogs[0], ogs[1]//4, 4)
+    #    else:
+    #        adjusted_grad = adjusted_grad.view(ogs[0]//4, 4)
+    #    adjusted_grad = adjusted_grad / adjusted_grad.norm(dim =[-1], keepdim= True) 
+    #    adjusted_grad = adjusted_grad.view(ogs)
+    if grefl:
+        nd = -1# [-1,-2] if d2 else [-1]
+        #adjusted_grad = utils.apply_reflection(adjusted_grad)
+        npar = param - adjusted_grad
+        norms = npar.norm(dim=nd, keepdim=True)
+    
+        escaped_mask = norms > 1.0
+
+        reflected_weights = npar / (norms.pow(2) + 1e-8)
+        reflected_grad = -(reflected_weights - param)
+        adjusted_grad = torch.where(escaped_mask, reflected_grad, adjusted_grad)
+    
     
     center = torch.tensor(0.5,device=device)
     width = torch.tensor(3,device=device)
@@ -515,8 +556,8 @@ if plot:
                torch.linalg.svdvals(porth).detach().cpu())
 
     plot_spectra(s_ortho, iter_num, fig, axes)
-            
-#@torch.compile(backend='inductor', mode='max-autotune')
+  
+
 def model_step(iter_num, tl, best_val_loss, config):
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
@@ -588,78 +629,43 @@ def model_step(iter_num, tl, best_val_loss, config):
         return 0, False, best_val_loss
     
     
+   
     X, Y = get_batch('train',seqbatch)
+    #@torch.compile()
     def closure():
         torch.compiler.cudagraph_mark_step_begin()
         logits, loss = model(X, Y)
-        loss = loss / gradient_accumulation_steps 
-        loss = loss.mean(dim=0)
-        #loss.mean().backward()
+        loss = loss.mean()
+        loss.backward()
         return loss
-    l1 = closure()
-    l1.mean().backward()
+        
+    _ = closure()
+    #l1.mean().backward()
     #loss.backward()
     
     if(force_gc):
         torch.cuda.empty_cache()  
     
-    # clip the gradient
-    if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     for mod in model.modules():
         if isinstance(mod, optim.OptimizedLinear):
             pass
-            #mod.prestep(loss)
 
-    # step the optimizer and scaler if training in fp16
-    optimizer.step()
+    optimizer.step(closure)
     
-    #optimizer.zero_grad(set_to_none=True)
-    #l2 = closure()
-    #rdiff = (l2 - l1.detach() )
-    #loss = l2 * (rdiff-rdiff.mean())
-    #loss.mean().backward()
-    #optimizer.step()
-
     for mod in model.modules():
         if isinstance(mod, optim.OptimizedLinear):
             mod.poststep()
-
-    #optimizer.zero_grad(set_to_none=True)
-    #if(iter_num % 2 == 1):
-    #    model.model_freezeToggle()
-    #else:
-    #    model.memory_freezeToggle()
-    #if(iter_num > 1):
-    #    if(iter_num % itresetage == 0):
-    #        model.model_freezeToggle()
-    #if(iter_num > 1 and (iter_num // itresetage) % 2 ):
-    #    if(iter_num % itreset == 1):
-    #        #model.reinit_nonmem()
-    #        model.model_freezeToggle()
-    #    if(iter_num % itreset == itunfreeze):
-    #        model.model_freezeToggle()
 
     with torch.no_grad():
         if decay_wa:
             lrgpu = torch.tensor(lr, device='cuda') 
         if lrfinder:
             lr = 1
-        if wscrnorm:
-            wscrna = lrgpu/20.0 if decay_wa else config["swna"]
-            utils.wscrnorm(model, wscrna)
-
-        if swnorm_enabled:
-            swna = lrgpu/20.0 if decay_wa else config["swna"]
-            utils.softwnorm(model, swna)
-
-        if wwhite_enabled:
-            swwa = lrgpu/20.0 if decay_wa else config["swwa"]
-            utils.wwhite(model, swwa)
-        if(dfw_enabled):
-            utils.wfunny(model, wemas)  
         
+        if wstep:
+            wscrna = lrgpu/20.0 if decay_wa else config["swfa"]
+            utils.wstep(model, wfunc, alphas = [0.0, wscrna])
+
         model.resetsink()
 
     optimizer.zero_grad(set_to_none=True)

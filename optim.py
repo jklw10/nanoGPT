@@ -1,9 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import copy
 import math
 
 import utils
+
+from torch.func import functional_call, vmap
 
 ema_thing = True
 alpha = 0.9
@@ -227,3 +230,95 @@ class OptimizedLinear(nn.Module):
         # check if sane, i'm suspicious of .mul on the data itself.
         self.current_lr_mean.data.mul_(1 - self.lr_update_momentum).add_(new_mean * self.lr_update_momentum)
         self.current_lr_var.data.mul_(1 - self.lr_update_momentum).add_(new_var * self.lr_update_momentum)
+
+
+class ChaosRollbackOptimizer(torch.optim.Optimizer):
+    def __init__(self, 
+                 model, 
+                 base_optimizer, 
+                 checkpoint_freq=50, 
+                 sensitivity=1.1, 
+                 sigma=1e-4,
+                 **kwargs):
+        super().__init__(base_optimizer.param_groups, base_optimizer.defaults)
+        
+        self.model = model
+        self.base_optim = base_optimizer
+        self.state = base_optimizer.state
+        
+        self.checkpoint_freq = checkpoint_freq
+        self.sensitivity = sensitivity
+        self.sigma = sigma
+        self.lgn = 0
+        self.grad_ma = None
+        self.steps = 0
+        self.safe_harbor_state = None 
+        self.safe_harbor_optim = None
+        self.warmup_steps= 1000
+        self._checkpoint()
+
+    def _checkpoint(self):
+        self.safe_harbor_state = {
+            k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()
+        }
+        self.safe_harbor_optim = copy.deepcopy(self.base_optim.state_dict())
+
+    def _rollback_and_perturb(self):
+        # 1. Load weights
+        self.model.load_state_dict(self.safe_harbor_state)
+        
+        # 2. Load optimizer state (clears momentum buffers that were heading towards the cliff)
+        self.base_optim.load_state_dict(self.safe_harbor_optim)
+        
+        with torch.no_grad():
+            for group in self.base_optim.param_groups:
+                for p in group['params']:
+                    if p.grad is None: 
+                        continue
+                    scale = p.abs().mean() + 1e-6
+                    noise = torch.randn_like(p) * scale * self.sigma
+                    p.add_(noise)
+   
+    def _rollback(self):
+        self.model.load_state_dict(self.safe_harbor_state)
+        self.base_optim.load_state_dict(self.safe_harbor_optim)
+        
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        grad_norm = self.get_gradnorm()
+        
+        if self.grad_ma is None:
+            self.grad_ma = grad_norm
+
+        is_singularity = False
+        if self.steps > self.warmup_steps:
+            is_singularity = grad_norm > (self.grad_ma * self.sensitivity)
+            self.lgn = grad_norm
+
+        if is_singularity:
+            self._rollback_and_perturb()
+            
+            self.grad_ma = self.grad_ma * self.sensitivity
+            self.zero_grad()
+            with torch.enable_grad():
+                loss = closure()
+            self.base_optim.step()
+            self.zero_grad()
+            return loss
+
+        # 3. Standard Step
+        self.base_optim.step()
+        
+        # Update MA
+        self.grad_ma = 0.9 * self.grad_ma + 0.1 * grad_norm
+        
+        # 4. Manage Checkpoints
+        self.steps += 1
+        if self.steps % self.checkpoint_freq == 0:
+            self._checkpoint()
+
+    def get_gradnorm(self):
+        stack = [p.grad.norm(p=2) for group in self.param_groups for p in group['params'] if p.grad is not None]
+        grad_norm = torch.norm(torch.stack(stack), p=2) if len(stack) > 0 else torch.tensor(0.0)
+        return grad_norm

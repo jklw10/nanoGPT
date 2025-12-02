@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import model
+import modules
 import utils
 import wackmodel
 from cut_cross_entropy import linear_cross_entropy
@@ -43,7 +44,7 @@ class Scanner(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.d = config.n_embd
-        self.sampler = model.LearnableFourierResampler(config.n_embd * 2, config.n_embd, 64)
+        self.sampler = modules.ResampFFTGaps(config.n_embd * 2, config.n_embd, 64)
         
 
     def forward(self, x: torch.Tensor, y: torch.Tensor):

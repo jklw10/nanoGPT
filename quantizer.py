@@ -163,6 +163,86 @@ class ScatterByGate(torch.autograd.Function):
             
         return grad_gate_logits, grad_patches, None
 
+class TopKEmbedding(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, logits, embedding_layer, k):
+        if k != 1:
+            raise NotImplementedError("EfficientTopKEmbedding is currently implemented for k=1")
+            
+        predicted_indices = torch.topk(logits, k=1, dim=-1).indices.squeeze(-1)
+        
+        embedded_output = embedding_layer(predicted_indices)
+
+        ctx.save_for_backward(logits, embedding_layer.weight)
+        ctx.k = k
+        
+        return embedded_output
+
+    @staticmethod
+    def backward(ctx, grad_output_from_transformer):
+        logits, embedding_weights = ctx.saved_tensors
+        k = ctx.k
+
+        grad_output_from_transformer = grad_output_from_transformer.unsqueeze(-2)
+        embedding_weights = embedding_weights.unsqueeze(0).unsqueeze(0)
+        grad_to_one_hot = torch.matmul(grad_output_from_transformer.squeeze(-2), embedding_weights.squeeze(0).squeeze(0).T)
+        
+
+        g = grad_to_one_hot
+
+        with torch.no_grad():
+            topk_vals, topk_indices = torch.topk(-g, k=k, dim=-1)
+            soft_weights = F.softmax(topk_vals, dim=-1)
+            soft_target = torch.zeros_like(logits).scatter_(-1, topk_indices, soft_weights)
+
+        grad_logits = F.softmax(logits, dim=-1) - soft_target
+        
+        return grad_logits, None, None
+
+
+class ExplorativeTKE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, logits, embedding_layer, k):
+        if k != 1:
+            raise NotImplementedError("EfficientTopKEmbedding is currently implemented for k=1")
+            
+        predicted_indices = torch.topk(logits, k=1, dim=-1).indices.squeeze(-1)
+        
+        embedded_output = embedding_layer(predicted_indices)
+
+        ctx.save_for_backward(logits, embedding_layer.weight)
+        ctx.k = k
+        
+        return embedded_output
+
+    @staticmethod
+    def backward(ctx, grad_output_from_transformer):
+        logits, embedding_weights = ctx.saved_tensors
+        k = ctx.k
+
+        grad_output_from_transformer = grad_output_from_transformer.unsqueeze(-2)
+        embedding_weights = embedding_weights.unsqueeze(0).unsqueeze(0)
+        g = torch.matmul(grad_output_from_transformer.squeeze(-2), embedding_weights.squeeze(0).squeeze(0).T)
+        
+
+
+        with torch.no_grad():
+            topk_vals, topk_indices = torch.topk(-g, k=k, dim=-1)
+            soft_weights = F.softmax(topk_vals, dim=-1)
+            soft_target = torch.zeros_like(logits).scatter_(-1, topk_indices, soft_weights)
+
+        grad_logits = F.softmax(logits, dim=-1) - soft_target
+        # Calculate a per-token learning modulator
+        with torch.no_grad():
+            # High entropy -> high uncertainty -> learn more aggressively
+            # Low entropy -> high certainty -> learn more cautiously
+            entropy = -torch.sum(F.softmax(logits, dim=-1) * F.log_softmax(logits, dim=-1), dim=-1, keepdim=True)
+            # Normalize to a reasonable range, e.g., [0.5, 1.5]
+            learning_modulator = 0.5 + (entropy / torch.log(torch.tensor(logits.size(-1))))
+
+        grad_logits = grad_logits * learning_modulator
+        return grad_logits, None, None
+
 class TopKHot(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x,  k):
@@ -186,7 +266,6 @@ class TopKHot(torch.autograd.Function):
             soft_target = torch.zeros_like(x).scatter_(-1, topk_indices, soft_weights)
 
         grad_x = F.softmax(x, dim=-1) - soft_target
-        
         return grad_x,  None
 
 class TopKHotBCE(torch.autograd.Function):
@@ -203,15 +282,10 @@ class TopKHotBCE(torch.autograd.Function):
         x, = ctx.saved_tensors
         k = ctx.k
         with torch.no_grad():
-            
             topk_vals, topk_indices = torch.topk(-g, k=k, dim=-1)
-
             soft_weights = F.softmax(topk_vals, dim=-1)
-
             soft_target = torch.zeros_like(x).scatter_(-1, topk_indices, soft_weights)
-
         grad_x = F.sigmoid(x) - soft_target
-        
         return grad_x,  None
     
 class HardTopKHotBCE(torch.autograd.Function):
@@ -230,9 +304,7 @@ class HardTopKHotBCE(torch.autograd.Function):
         with torch.no_grad():
             _, topk_indices = torch.topk(-g, k=k, dim=-1)
             hard_target = torch.zeros_like(x).scatter_(-1, topk_indices, 1.0)
-
         grad_x = F.sigmoid(x) - hard_target
-        
         return grad_x,  None
     
 class ThresHot(torch.autograd.Function):
@@ -252,16 +324,44 @@ class ThresHot(torch.autograd.Function):
             
             soft_target = torch.where(g < g_mean, 1.0, 0.0)
 
-        # Calculate the BCE-style surrogate gradient
         grad_x = F.sigmoid(x) - soft_target
-        
-        # Optional: Scale by the magnitude of the centered gradient tiny bit worse
-        #grad_x = grad_x * torch.abs(g - g_mean)
-        
         return grad_x
-    #todo test as kolmogorov function selector
 
 
+class MaskedMeanThresHot(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, mask=None):
+        if mask is None:
+            valid_mask = torch.ones_like(x, dtype=torch.bool)
+            N = torch.full((x.shape[0], 1, 1, 1), x.shape[-1], device=x.device)
+        else:
+            valid_mask = (mask > 0)
+            N = valid_mask.sum(dim=-1, keepdim=True).float()
+
+        x_safe = torch.where(valid_mask, x, torch.zeros_like(x))
+        
+        mean = x_safe.sum(dim=-1, keepdim=True) / N.clamp(min=1.0)
+        
+        k_hot = torch.where((x >= mean-1e-5) & valid_mask, 1.0, 0.0)
+        
+        ctx.save_for_backward(x, valid_mask, N)
+        return k_hot
+
+    @staticmethod
+    def backward(ctx, g):
+        x, valid_mask, N = ctx.saved_tensors
+
+        g_safe = torch.where(valid_mask, g, torch.zeros_like(g))
+        g_mean = g_safe.sum(dim=-1, keepdim=True) / N.clamp(min=1.0)
+        
+        grad_x = torch.sigmoid(x)
+        
+        target_one_mask = (g-1e-5 <= g_mean) & valid_mask
+        grad_x[target_one_mask] -= 1.0
+        
+        grad_x = grad_x * valid_mask.float()
+
+        return grad_x, None 
 
 class dynFKHot(torch.autograd.Function):
     @staticmethod
@@ -791,7 +891,7 @@ class debugAutoencoder(nn.Module):
             ac=Act()
             ac2=Act()
         self.encoder = nn.Sequential(nn.Linear(input, hidden), ac, nn.Linear(hidden, qdim))
-        self.quantizer = quantizer#Hotmod(quantizer, k)
+        self.quantizer = Hotmod(quantizer, k)
         self.codebook = nn.Linear(self.qdim, embed, bias=False)
         self.decoder = nn.Sequential(nn.Linear(embed, hidden), ac2, nn.Linear(hidden, input))
         
@@ -1010,18 +1110,19 @@ if __name__ == '__main__':
         #"BCEGR k 1":      NKQAE(INPUT_DIM, EMBED_DIM, HIDDEN_DIM, QUANT_DIM, 1),
         #"CER k 1":    Autoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopOneHot,  1),
         #"CER2 k 1":   debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHot,    1),
-        #"BCER k 1":   Autoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHotBCE, 1),
-        #"thot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHotBCE, TaylorThresHotActivation, 32),
+        "thot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, ThresHot, nn.SiLU, 32),
+        "thot2":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, ThresHotV2, nn.SiLU, 32),
+        
         #"bspline":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHotBCE, BSplineActivation, 32),
         #"GatherByGate": GatherByGateAutoencoder(input_dim=INPUT_DIM,hidden_dim=HIDDEN_DIM,embed_dim=EMBED_DIM,quant_dim=QUANT_DIM, k=32),
         #"attnGather": SelfAttentionPaletteAE(input_dim=INPUT_DIM,hidden_dim=HIDDEN_DIM,embed_dim=EMBED_DIM,quant_dim=QUANT_DIM, k=32),
-        "ltae": LTAutoencoder(
-            input_dim=INPUT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            embed_dim=EMBED_DIM,
-            quant_dim=QUANT_DIM, 
-            k=32
-        ),
+        #"ltae": LTAutoencoder(
+        #    input_dim=INPUT_DIM,
+        #    hidden_dim=HIDDEN_DIM,
+        #    embed_dim=EMBED_DIM,
+        #    quant_dim=QUANT_DIM, 
+        #    k=32
+        #),
         #"topkCE":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM,  Hotmod(TopKHot,32), nn.SiLU ),
         #"topkBCE":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM,  Hotmod(TopKHotBCE,32), nn.SiLU),
         #"topkHBCE": debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, Hotmod(HardTopKHotBCE, 32), nn.SiLU),

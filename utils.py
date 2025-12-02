@@ -637,57 +637,36 @@ def whiten_3d_global(x, **kwargs):
     
     return x_whitened
 
-@torch.compile(backend='inductor', mode='max-autotune')
-def wfunny(model, wemas):
-    for i, p in enumerate(model.parameters()):
-        if p.requires_grad:
-            #if p.dim() > 0:
-            p.data.copy_(funnyMulti(wemas[i],p.data))
-
-@torch.compile(backend='inductor', mode='max-autotune')
-def wunfunny(model, wemas):
-    for i, p in enumerate(model.parameters()):
-        if p.requires_grad:
-            #if p.dim() > 0:
-            p.data.copy_(unfunnyMulti(p.data, wemas[i]))
-
 def snormstep(p, alpha, dim):
     return (p.data - range_norm(p.data,dim=dim)) * alpha 
 
-@torch.compile(backend='inductor', mode='max-autotune')
-def softwnorm(model, alpha = 1e-5):
+def wstep(model, func, alphas = [0.0, 1e-5]):
     for i, p in enumerate(model.parameters()):
         if p.requires_grad:
             with torch.no_grad():
                 if p.ndim >= 2:
-                    a = alpha
+                    a = alphas[1]
                     dim = [-1,-2]
                 elif p.ndim >= 1:
-                    a = alpha * 1e-5
+                    a = alphas[0]
                     dim = [-1]
                 else:
                     continue
-
-                pstep = snormstep(p, a, dim) 
-                #pstep = (p.data - (p.data / p.data.norm(p=2,dim=dim,keepdim=True)))*a
+                
+                pstep = (p.data - func(p.data,dim=dim)) * a 
                 p.data.sub_(pstep)
 
 
-@torch.compile(backend='inductor', mode='max-autotune')
-def wscrnorm(model, alpha = 1e-5):
-    for i, p in enumerate(model.parameters()):
-        if p.requires_grad:
-            with torch.no_grad():
-                if p.ndim >= 2:
-                    a = alpha
-                    dim = [-1,-2]
-                else:
-                    a = alpha * 1e-5
-                    dim = [-1]
-
-                pstep = (p.data - soft_range_clip_norm(p.data, dim=dim)) * a 
-                #pstep = (p.data - (p.data / p.data.norm(p=2,dim=dim,keepdim=True)))*a
-                p.data.sub_(pstep)
+def apply_reflection(weight, dim = [-1]):
+    norms = weight.norm(dim=dim, keepdim=True)
+    
+    escaped_mask = norms > 1.0
+    
+    reflected_weights = weight / (norms.pow(2) + 1e-8)
+    
+    projected_weight = torch.where(escaped_mask, reflected_weights, weight)
+    
+    return projected_weight
 
 @torch.compile(backend='inductor', mode='max-autotune')
 def acwrap(x, ac, z0 = None):
@@ -711,6 +690,9 @@ def justnorm(x, idim=-1):
     x = x.float()
     res = (x / x.norm(p=2, dim=idim, keepdim=True)).to(dtype=dtype) 
     return res
+
+def k_from_hot(k_hot, max):
+    return k_hot.sum(dim=-1, keepdim=True).clamp(1,max)
 
 @torch.compile(backend='inductor', mode='max-autotune')
 def bluenoise_indices(batch_size, sequence_length, num_indices, device='cuda'):

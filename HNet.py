@@ -3,7 +3,6 @@ import os
 import time
 
 #os.environ['CUDA_LAUNCH_BLOCKING'] = "0" 
-from cut_cross_entropy import linear_cross_entropy
 import requests
 import pickle
 import numpy as np
@@ -47,8 +46,12 @@ gen         = True
 memcheat    = False
 wnorm       = False
 genloss     = False
+resid       = True
+ael         = False
 #todo, wnorm, midreset, lr on memory, memswizzle,
 #ablate hierarchy, add innerblocks, make hierarchical output generation
+
+Linear = modules.OrthogonalLinear# nn.Linear
 
 def get_lr(it):
     
@@ -110,29 +113,29 @@ class Patcher(nn.Module):
         self.sdim = 10
 
         self.up_scan = modules.Block(outer_dim,4,0.0,False)
-        self.up_proj = nn.Linear(outer_dim,inner_dim)
-        self.AE = quantizer.Autoencoder(inner_dim,inner_dim,inner_dim,128,quantizer.ThresHot)
-        self.resid_up = nn.Linear(outer_dim, inner_dim)
+        self.up_proj = Linear(outer_dim,inner_dim)
+        self.AE = quantizer.Autoencoder(inner_dim,inner_dim,inner_dim,inner_dim,quantizer.ThresHot)
+        self.resid_up = Linear(outer_dim, inner_dim)
         
-        self.output_pos_emb = nn.Linear(outer_seq, inner_dim)
+        self.output_pos_emb = Linear(outer_seq, inner_dim)
         
         self.down_scatter = modules.CombineBlock(inner_dim, 4, 0.0,False)
         self.down_scatter2 = modules.CombineBlock(outer_dim, 4, 0.0,False)
-        self.down_proj = nn.Linear(inner_dim,outer_dim)
+        self.down_proj = Linear(inner_dim,outer_dim)
         self.down_scan = modules.Block(outer_dim,4,0.0,False)
         
         #self.up_gate = nn.Linear(self.sdim*outer_seq, outer_seq)
         self.up_gate = nn.Sequential(
-            nn.Linear(outer_dim, outer_dim // 4),
+            Linear(outer_dim, outer_dim // 4),
             nn.ReLU(),
-            nn.Linear(outer_dim // 4, 1)
+            Linear(outer_dim // 4, 1)
         )
 
         #self.down_gate = nn.Linear(self.sdim*inner_seq, outer_seq)
         self.down_gate = nn.Sequential(
-            nn.Linear(outer_dim, outer_dim // 4),
+            Linear(outer_dim, outer_dim // 4),
             nn.ReLU(),
-            nn.Linear(outer_dim // 4, outer_seq)
+            Linear(outer_dim // 4, outer_seq)
         )
 
 
@@ -150,11 +153,11 @@ class Patcher(nn.Module):
         self.gather_block = modules.CombineBlock(outer_dim, 4, 0.0,False)
     
     def abstract_up(self, x):
-        scan = self.up_scan(x, causal = False)
-        ##scan = F.softmax(scan, dim=-1)
-        scan = self.up_norm(scan)
-        gate = self.up_gate(scan).squeeze(-1)
-        scan = self.query_block(x, causal = True)
+        #scan = self.up_scan(x, causal = False)
+        #scan = F.softmax(scan, dim=-1)
+        #scan = self.up_norm(scan)
+        #gate = self.up_gate(scan).squeeze(-1)
+        #scan = self.query_block(x, causal = True)
         ##gate = F.softmax(gate, dim=-1)
         #gate = self.up_gate(x).squeeze(-1)
         #
@@ -164,8 +167,12 @@ class Patcher(nn.Module):
         #
         #gathered = quantizer.GatherByGate.apply(gate, scan, self.inner_seq)
         #compressed sensing says that random samples should suffice?
-        gathered = self.query_block(x, causal = False)
-        gathered = gathered[:,-self.inner_seq:,:]
+        
+        #TODO
+        gathered = self.query_block(x, causal = False)#AE causality requires causality here
+        gathered = gathered[:,-self.inner_seq:,:]#usefullness requires a real gather here.
+        
+        
         #_,idx = torch.topk(gate,self.inner_seq)
         ###idx = utils.bluenoise_indices(x.shape[0], self.outer_seq, self.inner_seq,device=x.device)
         ##
@@ -176,26 +183,30 @@ class Patcher(nn.Module):
         up = self.up_proj(gathered)
         ae_up, hot = self.AE(up)
         aux = F.mse_loss(up, ae_up)
-        return ae_up, [x,hot, gate, aux]
+        return ae_up, [x,hot, None, aux]
     
     def abstract_down(self, x, residual):
         #sg = self.down_gate(x[...,:self.sdim].reshape(x.shape[0], self.inner_seq*self.sdim))
-        residual, hot, gate, upaux = residual
-        aux = F.binary_cross_entropy(self.AE.quant(x)[:,:-1,:], hot.detach()[:,1:,:])#ablate
-        #aux=0
-        pgd = p_down = self.down_proj(x)
-        pgd = self.down_scan(pgd)[:,-1,:]
-        sg = self.down_gate(pgd)
-        #sg = F.softmax(sg, dim=-1) 
-        sg = self.gate_norm(sg)
+        residual, hot, _, upaux = residual
+        aux=0
+        if ael:
+            aux = F.binary_cross_entropy(self.AE.quant(x)[:,:-1,:], hot.detach()[:,1:,:])#ablate
+        #pgd = p_down = self.down_proj(x)
+        #pgd = self.down_scan(pgd)[:,-1,:]
+        #sg = self.down_gate(pgd)
+        ##sg = F.softmax(sg, dim=-1) 
+        #sg = self.gate_norm(sg)
         
         pos = torch.arange(0, self.outer_seq, dtype=torch.long, device=device) 
         phot = F.one_hot(pos, self.outer_seq).to(x.dtype).detach()
         pos_emb = self.output_pos_emb(phot).expand(x.shape[0],-1,-1)
         #query = scattered + pos_emb 
         query = pos_emb 
-        query = query + self.resid_up(residual)
+        pds = self.down_scatter(x, query, causal=False)#maybe detach.
+        pds = self.down_proj(pds)
         
+        if resid:
+            query = query + self.resid_up(residual)
         #scattered = torch.zeros(x.shape[0], self.outer_seq, x.shape[2], dtype=x.dtype, device=x.device)
         #
         #_,idx = torch.topk(gate,self.inner_seq)
@@ -203,8 +214,6 @@ class Patcher(nn.Module):
         #scattered.scatter_(1, eidx, x)
         #scattered = torch.scatter(1,x,idx)
         #scattered = quantizer.ScatterByGate.apply(gate, x, self.outer_seq)# technically causal leak
-        pds = self.down_scatter(x.detach(), query, causal=False)#maybe detach.
-        pds = self.down_proj(pds)
         #print(query.shape)
         query = self.down_proj(query)#+residual#ablate
         p_down = self.down_scatter2(pds, query, causal=True)#
@@ -225,7 +234,7 @@ class HNet(nn.Module):
         super().__init__()
         self.token_embedder = nn.Embedding(vocab_size, DIM_L1)
         self.pos_embedder = nn.Embedding(block_size, DIM_L1)
-        self.head = nn.Linear(DIM_L1, vocab_size)
+        self.head = Linear(DIM_L1, vocab_size)
         self.n_layer = 2
         self.sLayers = nn.ModuleList([
             Patcher(DIM_L1,DIM_L2,block_size,K_GATHER_L1),
@@ -416,7 +425,7 @@ class cascadenet(nn.Module):
         self.ln_out = nn.LayerNorm(n_embd)
 
         # Final output layer
-        self.lm_head = nn.Linear(n_embd, vocab_size)
+        self.lm_head = Linear(n_embd, vocab_size)
 
         self.apply(self._init_weights)
 
