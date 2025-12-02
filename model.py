@@ -17,6 +17,7 @@ from sympy import true
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import kattn
 import modules
 import optim
 import utils
@@ -311,15 +312,11 @@ class Kattention(nn.Module):
 
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         
-        #if self.training: 
-        #    att = att - torch.log(-torch.log(torch.rand_like(att) + 1e-9) + 1e-9)
-            
-        
         att = att.masked_fill(causal_mask == 0, float('-inf'))
-        k_hot_mask = quantizer.TopKHot.apply(att, k_val)
-        att = att.masked_fill(k_hot_mask == 0, float('-inf'))
-        att = torch.softmax(att,dim=-1) 
-        #att = F.gumbel_softmax(att,tau= 1.0, hard=true, dim =-1)
+        #k_hot_mask = quantizer.TopKHot.apply(att, k_val)
+        #att = att.masked_fill(k_hot_mask == 0, float('-inf'))
+        #att = torch.softmax(att,dim=-1) 
+        att = F.gumbel_softmax(att,tau= 0.5, hard=true, dim =-1)
         y = att@v
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
@@ -462,7 +459,7 @@ class Block(nn.Module):
         if(Qrotention):
             self.attn = QrotAttention(config)
         elif k_atten:
-            self.attn = Kattention(config)
+            self.attn = kattn.KattentionFused(config)
         
         else:
             self.attn = Attention(config)
