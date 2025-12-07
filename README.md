@@ -2,7 +2,15 @@
 # jklw10's fork
 
 it's a mess, uncommented, and wacky. but it's mainly here so i can point at things when discussing it.
+most interesting pieces imo:
 
+correctorSSM.
+quantizer.
+Kattention (in model.py)
+Hnet
+
+if you wish to see graphs, then badly labeled ones are in:
+https://docs.google.com/spreadsheets/d/1825onhH1uPmXJjqjOOZLDkHyJ_BaYP1LKGJzq5vDf4s/edit?usp=sharing
 
 # nanoGPT
 
