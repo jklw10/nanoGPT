@@ -49,7 +49,26 @@ def dimnumel(x: torch.tensor, dim):
             return x.size(dim)
         else:
             return math.prod([x.shape[d] for d in dim])
+
+def concordance_correlation_loss(x, y):
     
+    mean_x = x.mean(dim=-1, keepdim=True)
+    mean_y = y.mean(dim=-1, keepdim=True)
+    
+    var_x = x.var(dim=-1, keepdim=True)
+    var_y = y.var(dim=-1, keepdim=True)
+    
+    xm = x - mean_x
+    ym = y - mean_y
+    cov = (xm * ym).mean(dim=-1, keepdim=True)
+    
+    numerator = 2 * cov
+    denominator = var_x + var_y + (mean_x - mean_y)**2 + 1e-8
+    
+    ccc = numerator / denominator
+    
+    return 1.0 - ccc.mean()
+
 @torch.compile(backend='inductor', mode='max-autotune')
 def range_norm(x: torch.tensor, dim = -1, scale = None):  
     if scale is None: #batchsize independent
@@ -357,6 +376,53 @@ def pscan(x_in: torch.Tensor, func: nn.Module, ident: torch.Tensor) -> torch.Ten
     return final_result
 
 @torch.compile(backend='inductor', mode='max-autotune')
+def pscan2(x_in: torch.Tensor, func: nn.Module, ident: torch.Tensor) -> torch.Tensor:
+    """
+    A compile-friendly implementation of Blelloch scan.
+    Avoids index_select/index_put in favor of reshape/view logic which fuses better.
+    """
+    B, T, C = x_in.shape
+    
+    next_pow_of_2 = 2**math.ceil(math.log2(T))
+    if T != next_pow_of_2:
+        padding_size = next_pow_of_2 - T
+        # Expanding ident is cheap (metadata only)
+        identity_padding = ident.expand(B, padding_size, C)
+        x = torch.cat([x_in, identity_padding], dim=1)
+    else:
+        x = x_in
+
+    tree = [x]
+    
+    depth = int(math.log2(next_pow_of_2))
+    
+    for _ in range(depth):
+        current = tree[-1]
+        L = current.shape[1]
+        
+        reshaped = current.view(B, L // 2, 2, C)
+        
+        left = reshaped[:, :, 0]
+        right = reshaped[:, :, 1]
+        
+        merged = func(left, right)
+        tree.append(merged)
+
+    acc = ident.view(1, 1, C).expand(B, 1, C)
+    for i in range(depth - 1, -1, -1):
+        current_level_vals = tree[i]
+        
+        reshaped_vals = current_level_vals.view(B, -1, 2, C)
+        left_vals = reshaped_vals[:, :, 0] 
+        right_acc = func(acc, left_vals)
+        
+        acc = torch.stack([acc, right_acc], dim=2).flatten(1, 2)
+
+    final_res = func(acc, x)
+    
+    return final_res[:, :T]
+
+@torch.compile(backend='inductor', mode='max-autotune')
 def pscan_naive(x: torch.Tensor, func: nn.Module, ident: torch.tensor) -> torch.Tensor:
     T = x.shape[1]
     cumulative_prod = torch.empty_like(x)
@@ -407,6 +473,21 @@ def maprotgate(q: torch.Tensor) -> torch.Tensor:
     s = torch.sigmoid(q[..., 0].view(B, T, C, 1))
 
     return exponential_map(rot*s) 
+
+
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device)  # type: ignore
+    freqs = torch.outer(t, freqs).float()  # type: ignore
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    return freqs_cis
+
+def apply_rotary_emb(xq: torch.Tensor, freqs_cis: torch.Tensor):
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    if freqs_cis.dim() == 2:
+        freqs_cis = freqs_cis.unsqueeze(0) # [1, T, C/2]
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(-2)
+    return xq_out.type_as(xq)
 
 @torch.compile(backend='inductor', mode='max-autotune')
 def exponential_map(rot: torch.Tensor, epsilon=1e-8) -> torch.Tensor:
@@ -1080,3 +1161,47 @@ def quaternionize(x):
     x_norm = x4d.norm(dim=-1, keepdim=True) 
     x_normalized = x4d / x_norm             
     return x_normalized
+
+
+def fast_polar_decomposition(A, polar_iter=2, inv_iter=2, power_iter=2):
+    """A cursed attempt at a fast polar decomp, 
+    apparently works better for weight orthogonalization than real one
+    """
+    U = A.clone()
+    d = U.shape[0]
+    I_k = torch.eye(d, device=U.device, dtype=U.dtype)
+    v = torch.randn(d, 1, device=U.device, dtype=U.dtype)
+    for _ in range(polar_iter):
+        
+        u_p = U @ v
+        s = u_p.norm() + 1e-8 
+        U_scaled = U / s
+
+        U_scaled_inv = 2 * I_k - U_scaled
+            
+        U_inv = U_scaled_inv / s
+        
+        U_inv_T = U_inv.transpose(-2, -1)
+        U = 0.5 * (U + U_inv_T)
+        
+    return U
+def fast_polar_decomposition2(A, polar_iter=3):
+    U = A 
+    d = U.shape[0]
+
+    with torch.no_grad():
+        v = torch.randn(d, 1, device=U.device, dtype=U.dtype)
+        v = F.normalize(v, dim=0)
+        # Power iteration step
+        u_curr = U @ v
+        v_next = U.t() @ u_curr
+        s = v_next.norm() 
+        
+    U = U / (s.detach() + 1e-6)
+
+    for _ in range(polar_iter):
+        Gram = U.T @ U          # (d, d)
+        Correction = U @ Gram     # (d, d)
+        U = 1.5 * U - 0.5 * Correction
+        
+    return U

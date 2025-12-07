@@ -107,124 +107,6 @@ class LayerNorm(nn.Module):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
 
-class PrecomputedFourierResampler(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int, num_filters: int):
-        super().__init__()
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.num_filters = num_filters
-        self.max_freq = input_dim // 2
-        self.min_freq = 1.0
-        if csbr:
-            frequencies = self.min_freq + (self.max_freq - self.min_freq) * torch.rand(self.num_filters)
-            frequencies = torch.sort(frequencies).values
-        else:
-            frequencies = torch.linspace(self.min_freq, self.max_freq, num_filters)
-        self.register_buffer("frequencies", frequencies)
-        t_in = torch.linspace(0, 1, input_dim)
-        t_out = torch.linspace(0, 1, output_dim)
-        freqs = self.frequencies.unsqueeze(1)
-        arg_in = 2 * math.pi * freqs * t_in.unsqueeze(0)
-        self.register_buffer("sin_basis_in", torch.sin(arg_in))
-        self.register_buffer("cos_basis_in", torch.cos(arg_in))
-        arg_out = 2 * math.pi * freqs * t_out.unsqueeze(0)
-        self.register_buffer("sin_basis_out", torch.sin(arg_out))
-        self.register_buffer("cos_basis_out", torch.cos(arg_out))
-
-    def forward(self, x: torch.Tensor, dim: int = -1) -> torch.Tensor:
-     
-        if x.shape[dim] != self.input_dim:
-            raise ValueError(
-                f"Input tensor dimension {dim} has size {x.shape[dim]}, "
-                f"but module was initialized with input_dim {self.input_dim}."
-            )
-
-        x_permuted = x.transpose(dim, -1)
-        original_shape = x_permuted.shape
-        x_flattened = x_permuted.reshape(-1, self.input_dim)
-
-        # the Fourier coefficients (the compressed representation).
-        c_sin = torch.einsum('ns,fs->nf', x_flattened, self.sin_basis_in)
-        c_cos = torch.einsum('ns,fs->nf', x_flattened, self.cos_basis_in)
-
-        # precomputed SYNTHESIS bases using the calculated coefficients.
-        sin_recon = torch.einsum('nf,fs->ns', c_sin, self.sin_basis_out)
-        cos_recon = torch.einsum('nf,fs->ns', c_cos, self.cos_basis_out)
-
-        x_reconstructed = sin_recon + cos_recon
-
-        output_shape = original_shape[:-1] + (self.output_dim,)
-        output = x_reconstructed.view(output_shape)
-        output = output.transpose(dim, -1).contiguous()
-
-        return output
-
-nlfft = True
-
-    
-class Scanner(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.d = config.n_embd
-        #self.sampler = modules.FastCayleyLinear(config.n_embd * 2, config.n_embd, 64, bias=False)
-        #self.sampler = modules.ExponentialCayleyLinear(config.n_embd * 2, config.n_embd, 64)
-        #self.sampler = modules.LipschitzLinear(config.n_embd * 2, config.n_embd)
-        #self.sampler = modules.ProcrustesLinear(config.n_embd * 2, config.n_embd, method="qr")
-        self.proj = modules.ProcrustesButterflyLinear(config.n_embd * 2, method="polar")
-        
-    def forward(self, x: torch.Tensor, y: torch.Tensor, p_weight=None):
-        #z = torch.cat((y, x), dim=-1)
-        #z = self.sampler(z)
-        z = self.proj(x,y,p_weight).to(x.dtype)
-        #z = self.proj1(y)+self.proj2(x)
-        
-        #z = (self.weight1 * x) + (self.weight2 * y)
-        z = utils.range_norm(z)
-        return z
-
-class QrotAttention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-
-        self.q_attn =  Orthlin(config.n_embd, config.n_embd, bias=config.bias)
-        self.v_attn =  Linear(config.n_embd, config.n_embd, bias=config.bias)
-        
-        self.c_proj = Linear(config.n_embd,  config.n_embd, bias=config.bias)
-
-        self.scanner = Scanner(config)
-        self.identity = nn.Parameter(torch.rand(config.n_embd))
-        
-
-        self.attn_dropout = nn.Dropout(config.dropout) #todo
-        self.resid_dropout = nn.Dropout(config.dropout) #todo
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-        self.n_head = config.n_head 
-        self.head_dim = config.n_embd//config.n_head * 2
-        self.win = config.block_size // config.n_layer
-
-     
-
-    def forward(self, x: torch.tensor, causal = False): #same signature to allow easy swapping.
-        B, T, C = x.size() 
-        q = self.q_attn(x) 
-        v = self.v_attn(x)
-        QC = q.shape[2]
-        
-        q = q.view(B, T, QC)
-        v = v.view(B, T, C)
-        ow = self.scanner.proj.compute_orthogonal_weights()
-        def scan(left, right):
-            return self.scanner(left, right, p_weight=ow)
-        #print(self)
-        q = utils.pscan(q, scan, self.identity)
-        
-        Y = q*v 
-        Y = Y.view(B, T, -1)
-        Y = self.c_proj(Y)
-        Y = self.resid_dropout(Y)
-        return Y
-
 class Attention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -457,7 +339,7 @@ class Block(nn.Module):
         super().__init__()
         self.ln_1 = LayerNorm(config)
         if(Qrotention):
-            self.attn = QrotAttention(config)
+            self.attn = modules.SSM(config)
         elif k_atten:
             self.attn = kattn.KattentionFused(config)
         

@@ -11,7 +11,6 @@ import quantizer
 from torch.optim.optimizer import Optimizer
 
 
-
 class SSM(nn.Module):
     def __init__(self, n_embd, dropout, bias):
         super().__init__()
@@ -27,22 +26,42 @@ class SSM(nn.Module):
         self.resid_dropout = nn.Dropout(dropout) #todo
         self.n_embd = n_embd
         self.dropout = dropout
-        self.scanner = ProcrustesButterflyLinear(n_embd * 2, method="polar")
-        
-    def forward(self, x: torch.tensor, causal = False): #same signature to allow easy swapping.
+        self.scanner = ProcrustesButterflyLinear(n_embd)
+    
+    def get_weight(self):
+        return self.scanner.compute_orthogonal_weights()
+
+    def forward(self, x: torch.tensor, weight = None): #same signature to allow easy swapping.
         B, T, C = x.size() 
         q = self.q_attn(x) 
         v = self.v_attn(x)
-        ow = self.scanner.compute_orthogonal_weights()
+        if weight is None:
+            weight = self.scanner.compute_orthogonal_weights()
         def scan(left, right):
-            z = self.scanner(left,right,ow).to(x.dtype)
+            z = self.scanner(left,right,weight).to(x.dtype)
             return utils.range_norm(z)
-        q = utils.pscan(q, scan, self.identity)
+        q = utils.pscan2(q, scan, self.identity)
         
         Y = q*v 
         Y = self.c_proj(Y)
         Y = self.resid_dropout(Y)
-        return Y
+        return Y, q
+    
+    def nexts(self, prev: torch.tensor, x: torch.tensor, weight = None): #same signature to allow easy swapping.
+        B, T, C = x.size() 
+        q = self.q_attn(x) 
+        v = self.v_attn(x)
+        if weight is None:
+            weight = self.scanner.compute_orthogonal_weights()
+        def scan(left, right):
+            z = self.scanner(left,right,weight).to(x.dtype)
+            return utils.range_norm(z)
+        q = scan(prev,q)
+        
+        Y = q*v 
+        Y = self.c_proj(Y)
+        Y = self.resid_dropout(Y)
+        return Y, q
 
 class CombineAttention(nn.Module):
     def __init__(self, n_embd,n_head,dropout,bias):
@@ -208,67 +227,8 @@ class SSMBlock(nn.Module):
         return x
 
 csbr = True
-class LearnableFourierResampler(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int, num_filters: int):
-        super().__init__()
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.num_filters = num_filters
-        self.max_freq = input_dim // 2
-        self.min_freq = 1.0
-        if csbr:
-            initial_frequencies = self.min_freq + (self.max_freq - self.min_freq) * torch.rand(self.num_filters)
-            initial_frequencies = torch.sort(initial_frequencies).values # Optional: for easier interpretation
-        else:
-            # compressed sensing says that random samples wouldbe better?
-            initial_frequencies = torch.linspace(self.min_freq, self.max_freq, num_filters)
-        initial_logits = torch.log(initial_frequencies - self.min_freq) \
-            - torch.log(self.max_freq - initial_frequencies)
-        self.frequency_logits = nn.Parameter(initial_logits)
 
-        t_in = torch.linspace(0, 1, input_dim)
-        t_out = torch.linspace(0, 1, output_dim)
-        self.register_buffer("t_in", t_in)
-        self.register_buffer("t_out", t_out)
-
-    def forward(self, x: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        assert x.shape[dim] == self.input_dim, \
-            f"Input tensor dim {dim} has size {x.shape[dim]}, " \
-            f"but module was initialized with input_dim {self.input_dim}."
-            
-        x_permuted = x.transpose(dim, -1)
-        original_shape = x_permuted.shape
-        x_flattened = x_permuted.reshape(-1, self.input_dim)
-        
-        scaled_sigmoid = torch.sigmoid(self.frequency_logits)
-        freqs = self.min_freq + (self.max_freq - self.min_freq) * scaled_sigmoid
-        freqs.unsqueeze_(1) 
-
-        arg_in = 2 * math.pi * freqs * self.t_in.unsqueeze(0)
-        sin_basis_in = torch.sin(arg_in)
-        cos_basis_in = torch.cos(arg_in)
-        
-        arg_out = 2 * math.pi * freqs * self.t_out.unsqueeze(0)
-        sin_basis_out = torch.sin(arg_out)
-        cos_basis_out = torch.cos(arg_out)
-        
-        c_sin = torch.einsum('ns,fs->nf', x_flattened, sin_basis_in)
-        c_cos = torch.einsum('ns,fs->nf', x_flattened, cos_basis_in)
-        
-        sin_recon = torch.einsum('nf,fs->ns', c_sin, sin_basis_out)
-        cos_recon = torch.einsum('nf,fs->ns', c_cos, cos_basis_out)
-        
-        x_reconstructed = sin_recon + cos_recon 
-        
-        output_shape = original_shape[:-1] + (self.output_dim,)
-        output = x_reconstructed.view(output_shape)
-        
-        output = output.transpose(dim, -1).contiguous()
-        
-        return output
-
-
-class ResampFFTGaps(nn.Module):
+class FFTResampler(nn.Module):
     def __init__(self, input_dim: int, output_dim: int, num_filters: int):
         super().__init__()
         self.input_dim = input_dim
@@ -328,7 +288,7 @@ class Dreamer(nn.Module):
         super().__init__()
         self.block = Block(**kwargs)
         self.causal = causal
-        self.comp = ResampFFTGaps(mem_block_size * 2, mem_block_size, 64)
+        self.comp = FFTResampler(mem_block_size * 2, mem_block_size, 64)
         self.ln = LayerNorm(**kwargs)
         
     def forward(self, x):
@@ -476,53 +436,18 @@ class RotorLinear(nn.Module):
         W = self._get_orthogonal_weight()
         return F.linear(input, W, self.bias)
 
-def fast_polar_decomposition(A, polar_iter=2, inv_iter=2, power_iter=2):
-    U = A.clone()
-    d = U.shape[0]
-    I_k = torch.eye(d, device=U.device, dtype=U.dtype)
-    v = torch.randn(d, 1, device=U.device, dtype=U.dtype)
-    for _ in range(polar_iter):
-        
-        u_p = U @ v
-        s = u_p.norm() + 1e-8 
-        U_scaled = U / s
-
-        U_scaled_inv = 2 * I_k - U_scaled
-            
-        U_inv = U_scaled_inv / s
-        
-        U_inv_T = U_inv.transpose(-2, -1)
-        U = 0.5 * (U + U_inv_T)
-        
-    return U
-
-
 class ProcrustesLinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, method: str = 'svd'):
+    def __init__(self, in_features: int, out_features: int):
         
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         
-        if method not in ['svd', 'polar', 'qr']:
-            raise ValueError("method must be one of 'svd', 'polar', or 'qr'")
-        self.method = method
-
         self.weight_param = nn.Parameter(torch.empty(out_features, in_features))
         nn.init.orthogonal_(self.weight_param)
     
     def compute_orthogonal_weight(self):
-        
-        if self.method == 'svd':
-            param_f32 = self.weight_param.to(torch.float32)
-            U, S, Vh = torch.linalg.svd(param_f32, full_matrices=False)
-            return (U @ Vh)
-        elif self.method == 'polar':
-            return fast_polar_decomposition(self.weight_param.to(torch.float32))
-        elif self.method == 'qr':
-            param_f32 = self.weight_param.to(torch.float32)
-            Q, R = torch.linalg.qr(param_f32)
-            return Q
+        return utils.fast_polar_decomposition(self.weight_param.to(torch.float32))
         
     def forward(self, x: torch.Tensor, weight_ortho: torch.Tensor =None) -> torch.Tensor:
         if weight_ortho is None:
@@ -530,19 +455,16 @@ class ProcrustesLinear(nn.Module):
         else:
             weight_ortho = weight_ortho
         
-        
         return F.linear(x, weight_ortho, None)
 
 class ProcrustesButterflyLinear(nn.Module):
-    def __init__(self, in_features: int, method='qr'):
+    def __init__(self, in_features: int):
         super().__init__()
         
-        self.in_features = in_features
-        self.out_features = in_features // 2
-        self.n = self.out_features
+        self.n = in_features
 
-        self.proj1 = ProcrustesLinear(self.n, self.n, method=method)
-        self.proj2 = ProcrustesLinear(self.n, self.n, method=method)
+        self.proj1 = ProcrustesLinear(self.n, self.n)
+        self.proj2 = ProcrustesLinear(self.n, self.n)
     
     def compute_orthogonal_weights(self):
         return self.proj1.compute_orthogonal_weight(), self.proj2.compute_orthogonal_weight()

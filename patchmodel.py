@@ -44,7 +44,7 @@ class Scanner(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.d = config.n_embd
-        self.sampler = modules.ResampFFTGaps(config.n_embd * 2, config.n_embd, 64)
+        self.sampler = modules.FFTResampler(config.n_embd * 2, config.n_embd, 64)
         
 
     def forward(self, x: torch.Tensor, y: torch.Tensor):

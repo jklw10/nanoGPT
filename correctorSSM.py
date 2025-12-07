@@ -24,16 +24,16 @@ n_embed = 228
 n_head = 6
 n_layer = 4
 
-dropout = 0.0
-max_iters = 50000
+dropout = 0.1
+max_iters = 30000
 eval_interval = 1000
 learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 device_type = 'cuda'
 warmup_iters = 200
-lr_decay_iters = 30000
+lr_decay_iters = 15000
 min_lr = learning_rate/10
-beta2 = 0.999 
+
 
 torch._inductor.config.disable_cpp_codegen = True
 
@@ -42,14 +42,12 @@ idk_enabled = False
 cl          = False
 mem         = False
 gradlog     = False
-gen         = False
+gen         = True
 memcheat    = False
 wnorm       = False
 genloss     = True
 
-lbc         = True
-
-qkhwn       = False
+qkhwn       = True
 #todo, wnorm, midreset, lr on memory, memswizzle,
 #ablate hierarchy, add innerblocks, make hierarchical output generation
 
@@ -99,125 +97,142 @@ if dataset == "shakespeare_char":
 else:
     vocab_size = 50304
 
-
 def get_batch(split):
     data = np.memmap(os.path.join(data_dir, f'{split}.bin'), dtype=np.uint16, mode='r')
-    # We now need block_size + 2 tokens for each sample
+    
+    # We grab block_size + 2 tokens total
     ix = torch.randint(len(data) - (block_size + 2), (batch_size,))
     
-    # X is the context, from i to i+block_size
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    
-    # Y1 is the target for T+1, from i+1 to i+1+block_size
-    y1 = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-
-    # Y2 is the target for T+2, from i+2 to i+2+block_size
-    y2 = torch.stack([torch.from_numpy((data[i+2:i+2+block_size]).astype(np.int64)) for i in ix])
+    # One single tensor fetch
+    chunk = torch.stack([torch.from_numpy((data[i:i+block_size+2]).astype(np.int64)) for i in ix])
     
     if device_type == 'cuda': 
-        x, y1, y2 = x.pin_memory().to(device, non_blocking=True), y1.pin_memory().to(device, non_blocking=True), y2.pin_memory().to(device, non_blocking=True)
+        chunk = chunk.pin_memory().to(device, non_blocking=True)
     else: 
-        x, y1, y2 = x.to(device), y1.to(device), y2.to(device)
+        chunk = chunk.to(device)
         
-    return x, y1, y2
-
-@dataclass
-class TransformerOutput:
-    last_hidden_state: torch.Tensor
-    past_key_values: tuple = None
-    # You can add other outputs like attentions if needed
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, n_embed, n_head, dropout, bias):
-        super().__init__()
-        assert n_embed % n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        if qkhwn:
-            self.q_attn = wn(nn.Linear(n_embed, n_embed, bias=bias))
-            self.k_attn = wn(nn.Linear(n_embed, n_embed, bias=bias))
-        else:
-            self.q_attn = nn.Linear(n_embed, n_embed, bias=bias)
-            self.k_attn = nn.Linear(n_embed, n_embed, bias=bias)
-
-        self.v_attn = nn.Linear(n_embed, n_embed, bias=bias)
-
-        # output projection
-        self.c_proj = nn.Linear(n_embed, n_embed, bias=bias)
-        # regularization
-        self.attn_dropout = nn.Dropout(dropout)
-        self.resid_dropout = nn.Dropout(dropout)
-        self.n_head = n_head
-        self.n_embed = n_embed
-        self.dropout = dropout
-        # causal mask to ensure that attention is only applied to the left in the input sequence
-        self.register_buffer("bias", torch.tril(torch.ones(1024, 1024))
-                                     .view(1, 1, 1024, 1024))
-
-    def forward(self, x, past_key_values=None):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embed)
-
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q = self.q_attn(x)
-        k = self.k_attn(x)
-        v = self.v_attn(x)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        
-        # KV Caching logic
-        if past_key_values is not None:
-            # The past_key_values are of shape (B, nh, T_past, hs)
-            past_key, past_value = past_key_values
-            k = torch.cat((past_key, k), dim=-2)
-            v = torch.cat((past_value, v), dim=-2)
-        
-        # The T dimension for k and v might be different from q if we're using a cache
-        T_kv = k.shape[-2]
-        present_key_values = (k, v)
-
-
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T_kv) -> (B, nh, T, T_kv)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / (k.size(-1)**0.5))
-        att = att.masked_fill(self.bias[:,:,:T,:T_kv] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
-        y = att @ v # (B, nh, T, T_kv) x (B, nh, T_kv, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side-by-side
-
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        return y, present_key_values
-
-class MLP(nn.Module):
-    def __init__(self, n_embed, dropout, bias):
-        super().__init__()
-        self.c_fc    = nn.Linear(n_embed, 4 * n_embed, bias=bias)
-        self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * n_embed, n_embed, bias=bias)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
+    return chunk
 
 class Block(nn.Module):
-    def __init__(self, n_embed, n_head, dropout, bias):
+    def __init__(self, n_embed, dropout, bias):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(n_embed)
-        self.attn = CausalSelfAttention(n_embed, n_head, dropout, bias)
-        self.ln_2 = nn.LayerNorm(n_embed)
-        self.mlp = MLP(n_embed, dropout, bias)
-
-    def forward(self, x, past_key_values=None):
-        attn_output, present_key_values = self.attn(self.ln_1(x), past_key_values=past_key_values)
+        self.ln_1 = modules.LayerNorm(n_embed, bias)
+        self.attn = modules.SSM(n_embed, dropout, bias)
+        self.ln_2 = modules.LayerNorm(n_embed, bias)
+        self.mlp = modules.MLP(n_embed, dropout, bias)
+    def get_weight(self):
+        return self.attn.get_weight()
+    def forward(self, x, prev=None, weights=None):
+        if prev is not None:
+             attn_output, present_key_values = self.attn.nexts(prev, self.ln_1(x),weights)
+        else:
+             attn_output, present_key_values = self.attn(self.ln_1(x),weights)
         x = x + attn_output
         x = x + self.mlp(self.ln_2(x))
         return x, present_key_values
+def compute_discounted_return(rewards, gamma=0.95):
+    r_flipped = torch.flip(rewards, dims=[1])
+    
+    if gamma == 1.0:
+        returns = torch.cumsum(r_flipped, dim=1)
+    else:
+        B, T = rewards.shape
+        returns = torch.zeros_like(rewards)
+        running_add = torch.zeros(B, device=rewards.device)
+        
+        for t in range(T):
+            running_add = r_flipped[:, t] + gamma * running_add
+            returns[:, t] = running_add
+            
+    return torch.flip(returns, dims=[1])
 
+def CE_bkw(logits, target_indices):
+    #try sigmoid at some point
+    probs = F.softmax(logits, dim=-1)
+    
+    target_hot = torch.zeros_like(probs)
+    target_hot.scatter_(-1, target_indices.unsqueeze(-1), 1.0)
+    
+    return probs - target_hot
 
+class HypothesisLoss(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, g1, g2, g3, idx_data):
+        
+        ctx.save_for_backward(g1, g2, g3, idx_data)
+        
+        return F.cross_entropy(g1.reshape(-1, g1.size(-1)), idx_data[:, 1:-1].reshape(-1))
+        
+    @staticmethod
+    def backward(ctx, grad_output):
+        g1, g2, g3, idx_data = ctx.saved_tensors
+        
+        idx_data_flat = idx_data.view(-1, 1)
+        g1_flat = g1.view(-1, 1)
+        g2_flat = g2.view(-1, 1)
+        g3_flat = g3.view(-1, 1)
+        
+        grad_g3 = CE_bkw(g3, idx_data[:,2:])
+
+        grad_input = torch.zeros_like(g1)
+
+        return grad_input, None, None, None
+
+class AdaptiveDIEMLoss(nn.Module):
+    def __init__(self, momentum=0.01):
+        super().__init__()
+        self.momentum = momentum
+        
+        self.register_buffer('running_mean_dist', torch.tensor(1.0))
+        self.register_buffer('running_var_dist', torch.tensor(1.0))
+        
+    def forward(self, pred, target):
+        d_actual = torch.norm(pred - target, p=2, dim=-1)
+        
+        if self.training:
+            with torch.no_grad():
+                flat_target = target.view(-1, target.size(-1))
+                
+                perm = torch.randperm(flat_target.size(0), device=target.device)
+                shuffled_target = flat_target[perm]
+                flat_pred = pred.view(-1, pred.size(-1))
+                
+                d_random = torch.norm(flat_pred - shuffled_target, p=2, dim=-1)
+                
+                batch_mean = d_random.mean()
+                batch_var = d_random.var()
+                
+                self.running_mean_dist = (1 - self.momentum) * self.running_mean_dist + self.momentum * batch_mean
+                self.running_var_dist = (1 - self.momentum) * self.running_var_dist + self.momentum * batch_var
+
+        sigma = torch.sqrt(self.running_var_dist) + 1e-8
+        mu = self.running_mean_dist
+        
+        loss = (d_actual - mu) / sigma
+        
+        return loss.mean()
+def vicreg_loss(pred, target, sim_coeff=25.0, std_coeff=25.0, cov_coeff=1.0):
+    # 1. Invariance (MSE)
+    mse_loss = F.mse_loss(pred, target)
+    
+    std_pred = torch.sqrt(pred.var(dim=0) + 1e-4)
+    std_targ = torch.sqrt(target.var(dim=0) + 1e-4)
+    std_loss = torch.mean(F.relu(1 - std_pred)) + torch.mean(F.relu(1 - std_targ))
+    
+    B = pred.shape[0]
+    C = pred.shape[1]
+    
+    pred_cent = pred - pred.mean(dim=0)
+    cov_pred = (pred_cent.T @ pred_cent) / (B - 1)
+    
+    cov_loss = (off_diagonal(cov_pred)**2).sum() / C
+    
+    return sim_coeff * mse_loss + std_coeff * std_loss + cov_coeff * cov_loss
+
+def off_diagonal(x):
+    n, m = x.shape
+    assert n == m
+    return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
 class Model(nn.Module):
     def __init__(self, vocab_size, k=5, lambda_thought=0.1, **kwargs):
         super().__init__()
@@ -227,124 +242,145 @@ class Model(nn.Module):
             wte = (nn.Embedding(vocab_size, n_embed))
         else:
             wte = nn.Embedding(vocab_size, n_embed)
+        
         self.transformer = nn.ModuleDict(dict(
             wte = wte,
-            wpe = nn.Embedding(block_size, n_embed),
-            h = nn.ModuleList([Block(n_embed, n_head, dropout, False) for _ in range(n_layer)]),
+            wpe = nn.Embedding(block_size+1, n_embed),
+            h = nn.ModuleList([Block(n_embed, dropout, False) for _ in range(n_layer)]),
             ln_f = nn.LayerNorm(n_embed),
         ))
         
         if qkhwn:
             self.lm_head =  (modules.OrthogonalLinear(n_embed, vocab_size, bias=False))
-            #self.lm_head.parametrizations.weight[0] = self.transformer.wte.parametrizations.weight[0]
             self.transformer.wte.weight = self.lm_head.weight 
-            self.lm_head2 =  (modules.OrthogonalLinear(n_embed, vocab_size, bias=False))
+            #self.lm_head2 =  (modules.OrthogonalLinear(n_embed, vocab_size, bias=False))
         else:
             self.lm_head =  nn.Linear(n_embed, vocab_size, bias=False)
             self.transformer.wte.weight = self.lm_head.weight 
-            #self.lm_head2 =  nn.Linear(n_embed, vocab_size, bias=False)
-        
         self.lambda_corrected = 0.0
         self.k = k 
         self.lambda_thought = lambda_thought 
 
-    def transformer_forward(self, x, past_key_values=None, use_cache=False, ):
+    def get_weights(self):
+        return [block.get_weight() for block in self.transformer.h]
+    
+    def ssmfwd(self, x, prevs = None, weights =None):
         
-
-
-        present_key_values = []
-
+        qs = []
         for i, block in enumerate(self.transformer.h):
-            past_kv = past_key_values[i] if past_key_values is not None else None
-            x, present_kv = block(x, past_key_values=past_kv)
-            if use_cache:
-                present_key_values.append(present_kv)
+            
+            weight = weights[i] if weights is not None else None
+            prev = prevs[i] if prevs is not None else None
+            
+            x, q_out = block(x, prev, weight)
+            qs.append(q_out)
+        return x, qs
 
-        x = self.transformer.ln_f(x)
+    def forward(self, idx, Train=False, gumbel_temp=1.0, cl = 0.0):
 
-        if use_cache:
-            return TransformerOutput(last_hidden_state=x, past_key_values=tuple(present_key_values))
-        else:
-            return TransformerOutput(last_hidden_state=x)
-
-    def forward(self, idx, targets=None, decay=1.0):
         
         B, T = idx.size()
-        pos_emb = self.transformer.wpe(torch.arange(T, device=device))
-        if targets is None:
-            tok_emb = self.transformer.wte(idx)
-            x = tok_emb + pos_emb
-            hidden_states = self.transformer_forward(x).last_hidden_state
+        T -= 2
+        device = idx.device
+        if not Train:
+            x = self.transformer.wte(idx)
+            hidden_states, _ = self.ssmfwd(x)
             logits = self.lm_head(hidden_states)
             return logits, None, None
         
-        Y1_gt, Y2_gt = targets
-       
-        # PASS 1: HYPOTHESIS PASS (gen1)
-        
         tok_emb = self.transformer.wte(idx)
 
-        x = tok_emb + pos_emb
-        transformer_output_X = self.transformer_forward(x, use_cache=True)
-        hidden_states_X = transformer_output_X.last_hidden_state
-        kv_cache_X = transformer_output_X.past_key_values
+        #pos_emb = self.transformer.wpe(torch.arange(T, device=device))#replace by rope
+
+        x = tok_emb[:,:-2,:]
+        Y1_gt = idx[:, 1:-1]
+        Y2_gt_flat = idx[:, 2:].reshape(-1)
+        ws = self.get_weights()
+        # PASS 1: HYPOTHESIS PASS (gen1)
+        #gen1_x, gen1_qs = self.ssmfwd(x, weights=ws)
+        #tok_emb_g3 = tok_emb[:, 1:-1, :]
+        #gen3_x, _ = self.ssmfwd(tok_emb_g3, prevs=gen1_qs, weights=ws)
+        #logits_g1 = self.lm_head(gen1_x)
+        #logits_g3 = self.lm_head(gen3_x)
+
+        full_x, full_qs = self.ssmfwd(tok_emb[:,:-1,:], weights=ws)
         
-        logits_t1 = self.lm_head(hidden_states_X)
-        L_standard = F.cross_entropy(logits_t1.view(-1, logits_t1.size(-1)), Y1_gt.view(-1), reduction='none').view(Y1_gt.shape)
-        g2 = None
-        g1 = None
-        if lbc:
-            #T1_pred_onehot = quantizer.TopKHot.apply(logits_t1, 1)
-            t = 0.1 + decay*0.9
-            T1_pred_onehot = F.gumbel_softmax(logits_t1, tau=t, hard=True, dim=-1)
-            soft_embeddings_pred = T1_pred_onehot @ self.transformer.wte.weight
-            #soft_embeddings_pred = quantizer.ExplorativeTKE.apply(logits_t1, self.transformer.wte, 1)
+        logits_full= self.lm_head(full_x)
+        logits_g1 = logits_full[:, :-1,:]
+        #logits_g3 = logits_full[:, 1:, :]
 
-            # PASS 2: TEST PASS (gen2)
-            x2 = pos_emb+soft_embeddings_pred
-            hidden_states_T1_pred = self.transformer_forward(x2, past_key_values=kv_cache_X).last_hidden_state
-            logits_t2_corrected = self.lm_head(hidden_states_T1_pred)
-            L_corrected = F.cross_entropy(logits_t2_corrected.view(-1, logits_t2_corrected.size(-1)), Y2_gt.view(-1), reduction='none').view(Y2_gt.shape)
-            ## PASS 3: BASELINE PASS (gen3)
-            ## Note: We only pass the *new* tokens. The context is handled by the KV cache.
-            
-            
-            tok_emb = self.transformer.wte(Y1_gt)
-            x3 = tok_emb + pos_emb
-            hidden_states_T1_gt = self.transformer_forward(x3, past_key_values=kv_cache_X).last_hidden_state
-            logits_t2_baseline = self.lm_head(hidden_states_T1_gt)
-            L_baseline = F.cross_entropy(logits_t2_baseline.view(-1, logits_t2_baseline.size(-1)), Y2_gt.view(-1), reduction='none').view(Y2_gt.shape)
+        ## PASS 3: do a mtp head instead of full pass for self knowledge sample
+        
+        
+        #T1_pred_onehot = quantizer.TopKHot.apply(logits_t1, 1)
+        g1_pred_onehot = F.gumbel_softmax(logits_g1, tau=gumbel_temp, hard=True, dim=-1)
+        g1_guess_emb = g1_pred_onehot @ self.transformer.wte.weight
+        
+        #g1_guess_emb = g1_guess_emb + self.transformer.wpe(torch.arange(1,T+1, device=device)) #this is why rope would be better in my intuition
+        # PASS 2: TEST PASS (gen2)
+        #gen2_x, _ = self.ssmfwd(g1_guess_emb, prevs=gen1_qs, weights= ws)
+        #gen1_qs = [layer_q[:, :-1, :] for layer_q in full_qs]
+        
+        gen2_x, _ = self.ssmfwd(g1_guess_emb,  weights= ws)
+        #logits_g2 = self.lm_head(gen2_x)
 
-
-            ## PASS 3: do a mtp head instead of full pass for self knowledge sample
-            #logits_t2_baseline = self.lm_head2(hidden_states_X)
-            #L_baseline = F.cross_entropy(logits_t2_baseline.view(-1, logits_t2_baseline.size(-1)), Y2_gt.view(-1), reduction='none').view(Y2_gt.shape)
-
-            with torch.no_grad():
-                Gain = L_baseline - L_corrected
-                T = 0.1 # A hyperparameter to tune
-                trust_score = torch.sigmoid(Gain / T)
-            L_masked_standard = L_standard * (1.0 - trust_score)
-
-            if self.training:
-                #loss = L_standard.mean()
-                #loss = loss + L_masked_standard.mean() 
-                loss = L_masked_standard.mean() 
-                loss = loss + (trust_score * L_corrected).mean()
-                loss = loss + L_baseline.mean()*0.1
-                #loss = loss + 0.1 * L_masked_standard.mean() #
-            else:
-                loss = L_standard.mean()
-            g1 = trust_score.mean().detach()
-            g2 = L_corrected.mean().detach()
+        #L_guess = utils.concordance_correlation_loss(gen2_x, tok_emb[:,2:,:].detach())
+        L_guess = vicreg_loss(gen2_x, tok_emb[:,2:,:].detach())
+        #L_guess = F.cross_entropy(logits_g2.reshape(-1, logits_g2.size(-1)), Y2_gt_flat, reduction='none').view(Y1_gt.shape)
+        #L_standard = F.cross_entropy(logits_g1.reshape(-1, logits_g1.size(-1)), Y1_gt.reshape(-1), reduction='none').view(Y1_gt.shape)
+        #L_baseline = F.cross_entropy(logits_g3.reshape(-1, logits_g3.size(-1)), Y2_gt_flat, reduction='none').view(Y1_gt.shape)
+        L_all = F.cross_entropy(
+            logits_full.reshape(-1, logits_full.size(-1)), 
+            idx[:, 1:].reshape(-1), 
+            reduction='none'
+            ).view(idx[:, 1:].shape)
+        L_T1 = L_all[:, :-1]
+        L_T2 = L_all[:, 1:]   
+        if self.training:
+            loss = L_all.mean()+L_guess
         else:
-            
-            if self.training:
-                loss = L_standard.mean()#+L_corrected.mean()
-            else:
-                loss = L_standard.mean()
-        #gloss = None#torch.zeros(1).detach()
-        return logits_t1, loss, (g1, g2)
+            loss = L_all[:, :-1].mean()
+        #loss, gloss = self.correction_loss(logits_g1, L_standard, L_baseline, g1_pred_onehot, L_corrected)
+        #loss, gloss = self.trust_loss2(L_T1, L_T2, L_guess)
+        #L_guess = L_guess.mean().detach()
+        L_guess = None
+        gloss = None#torch.zeros(1).detach()
+        return logits_g1, loss, (gloss, L_guess)
+
+
+    def trust_loss2(self, L_standard, L_baseline, L_guess):
+        relative_improvement = L_baseline - L_guess
+        
+        # 2. Cumulative Future Gain (The Butterfly Effect)
+        # We sum improvements from the future back to the present
+        cumulative_gain = torch.flip(torch.cumsum(torch.flip(relative_improvement, [1]), dim=1), [1])
+        
+        # 3. The Trust Gate
+        # We divide by a small temp (e.g., 0.1) to make the switch sharper.
+        # gain > 0 -> gate -> 1.0 (Trust the Guess)
+        # gain < 0 -> gate -> 0.0 (Trust the Dataset)
+        trust_gate = torch.sigmoid(cumulative_gain / 0.1)
+
+        if self.training:
+            loss = (trust_gate * L_guess) + ((1.0 - trust_gate) * L_baseline)
+        else:
+            loss = L_standard.mean()
+        return loss, trust_gate
+    def trust_loss(self, L_standard, L_baseline, L_corrected):
+        with torch.no_grad():
+            Gain = L_baseline - L_corrected
+            T = 0.1 # A hyperparameter to tune
+            trust_score = torch.sigmoid(Gain / T)
+        L_masked_standard = L_standard * (1.0 - trust_score)
+
+        if self.training:
+            loss = L_masked_standard.mean() 
+            loss = loss + (trust_score * L_corrected).mean()
+            loss = loss + L_baseline.mean()*0.1
+        else:
+            loss = L_standard.mean()
+        gloss = trust_score.mean().detach()
+        return loss,gloss
     
     def configure_optimizers(self, weight_decay=0.1, learning_rate=1e-3, betas=(0.9, 0.95)):
         # start with all of the candidate parameters
@@ -389,10 +425,9 @@ class Model(nn.Module):
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
-
         return idx
 
-model = Model(vocab_size=vocab_size ,betas=(0.9,0.999))
+model = Model(vocab_size=vocab_size)
 model.to(device)
 optimizer = model.configure_optimizers(learning_rate=learning_rate)
 torch.set_float32_matmul_precision('medium')
@@ -427,8 +462,11 @@ for iter in range(max_iters):
     lr = get_lr(iter)
     # In your training loop
     with torch.no_grad():
-        lambda_warmup_iters = 30000 
-        current_lambda =  1.0- min(1.0, iter / lambda_warmup_iters)
+        max_lambda = 0.1 # Final value
+        lambda_warmup_iters = 5000 # Ramp up over 5k steps
+    
+        # Calculate current lambda for this iteration
+        current_lambda = max_lambda * min(1.0, iter / lambda_warmup_iters)
         
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
@@ -436,11 +474,10 @@ for iter in range(max_iters):
         t2 = time.time()
         model.eval()
         losses = {}
-        
         for split in ['train', 'val']:
-            X_val, Y1_val, Y2_val = get_batch(split)
+            X_val = get_batch(split)
             with torch.no_grad():
-                _, loss, gloss = model(X_val, (Y1_val, Y2_val), decay = current_lambda)
+                _, loss, gloss = model(X_val, True, cl = current_lambda)
             losses[split] = loss.detach().item()
             if genloss and split == 'val':
                 glosses = [
@@ -449,6 +486,7 @@ for iter in range(max_iters):
                 ]
         optimizer.zero_grad(set_to_none=True)
         t1 = time.time()
+        
         print(f"step {iter:{len(str(max_iters))}d}: "
               f"train loss: {losses['train']:.4f}, "
               f"val loss: {losses['val']:.4f}, ",end="")
@@ -461,8 +499,8 @@ for iter in range(max_iters):
         model.train()
         t0 = time.time()
 
-    X, Y1, Y2 = get_batch('train')
-    logits, loss, gloss = model(X, (Y1, Y2), decay = current_lambda)
+    X = get_batch('train')
+    logits, loss, gloss = model(X, True, cl = current_lambda)
 
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
@@ -476,8 +514,7 @@ for iter in range(max_iters):
     if wnorm:
         with torch.no_grad():
             utils.softwnorm(model,1e-4)
-
-
+    
 if gen:
     meta_path = os.path.join('data', 'shakespeare_char/meta.pkl')
 
@@ -498,7 +535,7 @@ if gen:
         return ''.join(decoded)
 
     print("sanity check")
-    X, Y, _ = get_batch('train')
+    X = get_batch('train')
     with torch.no_grad():
         model.eval()
         outp = model.generate(X[0].unsqueeze(0), 100, temperature=1.0, top_k=5)
