@@ -529,7 +529,7 @@ class GPT(nn.Module):
 
                         )
         
-        self.c_comp = modules.LearnableFourierResampler(config.n_embd,config.n_embd//2,config.n_embd//4)
+        self.c_comp = modules.FFTResampler(config.n_embd,config.n_embd//2,config.n_embd//4)
         
         self.decomp = torch.nn.Sequential(
                             torch.nn.Linear(config.n_embd//2,config.n_embd),
