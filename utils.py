@@ -50,8 +50,19 @@ def dimnumel(x: torch.tensor, dim):
         else:
             return math.prod([x.shape[d] for d in dim])
 
-def concordance_correlation_loss(x, y):
+def printReal(definer, cont, id):
+    if  cont is None or \
+        id >= len(cont) or \
+        cont[id] is None:
+        return
+    print(f"{definer}{cont[id]:.4f}, ",end="")
     
+def concordance_correlation_loss(x, y):
+    x=x.float()
+    y=y.float()
+    x = x / (x.norm(dim=-1, keepdim=True) + 1e-6)
+    y = y / (y.norm(dim=-1, keepdim=True) + 1e-6)
+
     mean_x = x.mean(dim=-1, keepdim=True)
     mean_y = y.mean(dim=-1, keepdim=True)
     
@@ -67,7 +78,7 @@ def concordance_correlation_loss(x, y):
     
     ccc = numerator / denominator
     
-    return 1.0 - ccc.mean()
+    return 1.0 - ccc#.mean()
 
 @torch.compile(backend='inductor', mode='max-autotune')
 def range_norm(x: torch.tensor, dim = -1, scale = None):  
@@ -129,6 +140,29 @@ def soft_range_clip_norm(x: torch.tensor, dim = -1, perc = 0.01, scale = None):
     w_min = x_softclip.amin(dim=dim, keepdim=True)
     w_range = torch.abs(w_max - w_min + 1e-10)
     return ((x_softclip - w_avg) / w_range) * scale
+
+@torch.compile(backend='inductor', mode='max-autotune')
+def soft_sigma_clip_norm(x: torch.tensor, dim=-1, sigma=2.5, scale=None):
+    if scale is None:
+        numel = dimnumel(x, dim)
+        scale = 1 + 2 / numel
+
+    mean = x.mean(dim=dim, keepdim=True)
+    std = x.std(dim=dim, keepdim=True)
+    
+    val_upper = mean + sigma * std
+    val_lower = mean - sigma * std
+    
+    x_clipped = torch.clamp(x, min=val_lower, max=val_upper)
+    x_softclip = x_clipped + torch.tanh(x - x_clipped)
+    
+    # 4. Range Norm on the "Cleaned" data
+    # Note: We can cheat here. We KNOW the approximate range is 2*sigma*std
+    # But calculating exact min/max of softclip is safer for non-normal dists
+    w_avg = x_softclip.mean(dim=dim, keepdim=True)
+    w_range = x_softclip.amax(dim=dim, keepdim=True) - x_softclip.amin(dim=dim, keepdim=True)
+    
+    return ((x_softclip - w_avg) / (w_range + 1e-10)) * scale
 
 @torch.compile(backend='inductor', mode='max-autotune')
 def minmaxnorm(x, dim = -1, epsilon= 1e-10):
@@ -772,6 +806,8 @@ def justnorm(x, idim=-1):
     res = (x / x.norm(p=2, dim=idim, keepdim=True)).to(dtype=dtype) 
     return res
 
+
+
 def k_from_hot(k_hot, max):
     return k_hot.sum(dim=-1, keepdim=True).clamp(1,max)
 
@@ -883,6 +919,20 @@ def fft_bmean_tsquish_add(x, x2):
         xc /= 2
     
     return torch.fft.ifft(xc,dim=1).real
+
+def neighbor_blend(grad,alpha=0.15):
+    if grad is None:
+        return
+        
+    left_neighbor = torch.roll(grad, shifts=-1, dims=-1)
+    
+    right_neighbor = torch.roll(grad, shifts=1, dims=-1)
+    
+    retention = 1.0 - (2 * alpha)
+    smeared_grad = (grad * retention) + (left_neighbor * alpha) + (right_neighbor * alpha)
+    
+    return smeared_grad
+
 def topological_adjacency_loss(x: torch.Tensor):
     xroll = torch.roll(x,1,dims=-1)
     return F.mse_loss(x, xroll)
@@ -1163,10 +1213,12 @@ def quaternionize(x):
     return x_normalized
 
 
-def fast_polar_decomposition(A, polar_iter=2, inv_iter=2, power_iter=2):
+def fast_polar_decomposition(A, dim=-1, polar_iter=2):
     """A cursed attempt at a fast polar decomp, 
     apparently works better for weight orthogonalization than real one
     """
+    if A.ndim < 2:
+        return A
     U = A.clone()
     d = U.shape[0]
     I_k = torch.eye(d, device=U.device, dtype=U.dtype)
@@ -1185,6 +1237,46 @@ def fast_polar_decomposition(A, polar_iter=2, inv_iter=2, power_iter=2):
         U = 0.5 * (U + U_inv_T)
         
     return U
+
+@torch.compile(backend='inductor', mode='max-autotune')
+def fast_polar_decomposition3(A, dim=-1, polar_iter=3):
+    """
+    Newton-Schulz iteration for Approximate Polar Decomposition.
+    Works on Rectangular matrices by orthogonalizing the smaller dimension.
+    """
+    if A.ndim < 2:
+        return A
+        
+    # Operate on a clone to avoid mutating original during calculation
+    X = A.clone()
+    
+    # 1. Pre-conditioning: The iteration only converges if spectral norm < sqrt(3)
+    # Using Frobenius norm as a safe upper bound proxy for spectral norm
+    norm = X.norm() + 1e-8
+    X = X / norm  # Scale down
+    
+    # 2. Iterate
+    r, c = X.shape
+    
+    for _ in range(polar_iter):
+        if r >= c:
+            # Tall Matrix (e.g. Output Head 50304x228): Orthogonalize Columns
+            # Update: X = X * (1.5*I - 0.5 * X.T @ X)
+            gram = X.T @ X
+            update = 1.5 * torch.eye(c, device=X.device, dtype=X.dtype) - 0.5 * gram
+            X = X @ update
+        else:
+            # Wide Matrix: Orthogonalize Rows
+            # Update: X = (1.5*I - 0.5 * X @ X.T) * X
+            gram = X @ X.T
+            update = 1.5 * torch.eye(r, device=X.device, dtype=X.dtype) - 0.5 * gram
+            X = update @ X
+            
+    # 3. Rescale? 
+    # Usually you want the UNITARY part (scale=1.0), so we return X.
+    # If you want to preserve the original 'energy' of the weights, multiply by 'norm'.
+    # But usually for weight ortho, you want the pure rotation.
+    return X*norm
 def fast_polar_decomposition2(A, polar_iter=3):
     U = A 
     d = U.shape[0]

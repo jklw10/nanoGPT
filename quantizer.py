@@ -327,41 +327,25 @@ class ThresHot(torch.autograd.Function):
         grad_x = F.sigmoid(x) - soft_target
         return grad_x
 
-
-class MaskedMeanThresHot(torch.autograd.Function):
+class ThresHot2(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, mask=None):
-        if mask is None:
-            valid_mask = torch.ones_like(x, dtype=torch.bool)
-            N = torch.full((x.shape[0], 1, 1, 1), x.shape[-1], device=x.device)
-        else:
-            valid_mask = (mask > 0)
-            N = valid_mask.sum(dim=-1, keepdim=True).float()
-
-        x_safe = torch.where(valid_mask, x, torch.zeros_like(x))
+    def forward(ctx, x):
         
-        mean = x_safe.sum(dim=-1, keepdim=True) / N.clamp(min=1.0)
-        
-        k_hot = torch.where((x >= mean-1e-5) & valid_mask, 1.0, 0.0)
-        
-        ctx.save_for_backward(x, valid_mask, N)
-        return k_hot
+        ctx.save_for_backward(x)
+        return (x > 0.0).float()
 
     @staticmethod
     def backward(ctx, g):
-        x, valid_mask, N = ctx.saved_tensors
+        x, = ctx.saved_tensors
 
-        g_safe = torch.where(valid_mask, g, torch.zeros_like(g))
-        g_mean = g_safe.sum(dim=-1, keepdim=True) / N.clamp(min=1.0)
-        
-        grad_x = torch.sigmoid(x)
-        
-        target_one_mask = (g-1e-5 <= g_mean) & valid_mask
-        grad_x[target_one_mask] -= 1.0
-        
-        grad_x = grad_x * valid_mask.float()
+        with torch.no_grad():
+            g_mean = torch.mean(g, dim=-1, keepdim=True)
+            
+            soft_target = torch.where(g < g_mean, 1.0, 0.0)
 
-        return grad_x, None 
+        grad_x = F.sigmoid(x) - soft_target
+        return grad_x
+
 
 class dynFKHot(torch.autograd.Function):
     @staticmethod

@@ -31,11 +31,6 @@ class GraphAttention(nn.Module):
         k = self.k_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
-        # ====================================================================
-        # Phase 1: Broadcasting (Sparse VIP Queries to All Keys)
-        # ====================================================================
-        
-        # 1. Score queries (scores are now shared across heads)
         query_scores = self.query_scorer(x).squeeze(-1) # Shape: (B, T)
         
         # 2. Create and apply causal mask before selection
@@ -60,14 +55,7 @@ class GraphAttention(nn.Module):
         key_pos = torch.arange(T, device=x.device).view(1,1,1,1,T)
         causal_mask_attn_b = top_q_indices.unsqueeze(1).unsqueeze(-1) >= key_pos
         attn_logits_b = attn_logits_b.masked_fill(~causal_mask_attn_b, float('-inf'))
-        # ... rest of broadcast phase (scattering) would follow ...
-        # For this example, we focus on the more critical gathering phase output
-
-        # ====================================================================
-        # Phase 2: Gathering (All Queries to Sparse VIP Keys) - MORE EFFICIENT
-        # ====================================================================
-        
-        # 1. Score keys (scores are shared across heads)
+      
         key_scores = self.key_scorer(x).squeeze(-1) # Shape: (B, T)
         
         # 2. Apply causal mask and find top-k VIP key indices
@@ -84,45 +72,16 @@ class GraphAttention(nn.Module):
         # Note: No need to expand the large k and v tensors anymore!
         sparse_k = torch.gather(k.unsqueeze(3).expand(-1,-1,-1,k_val,-1), 2, expanded_indices) # This still requires some expansion, let's optimize further
         
-        # *** The Truly Efficient Gather ***
         # We can avoid expanding k and v by indexing manually.
         # But a more pytorch-native way without large expansions:
         B, nh, T, hs = q.shape
-        # Flatten k and v for easier indexing
-        k_flat = k.transpose(1,2).reshape(B*T, self.n_head * self.head_dim) # Not ideal
-        
-        # Let's stick to a clean `gather` by just expanding the index, which is much cheaper
-        # Index needs to point to the `T` dim of k/v.
-        # k shape: (B, nh, T, hs)
-        # index shape: (B, T, k_val) -> needs to be (B, nh, T, k_val)
-        
-        # Add head dim to indices and expand head_dim for gather
         final_indices = top_k_indices.unsqueeze(1).expand(-1, nh, -1, -1) # Shape: (B, nh, T, k_val)
         final_indices = final_indices.unsqueeze(-1).expand(-1, -1, -1, -1, hs) # Shape: (B, nh, T, k_val, hs)
 
-        # Expand k and v only along the query dimension (T), not the key dimension
-        k_expanded = k.unsqueeze(2).expand(-1, -1, T, -1, -1)
-        v_expanded = v.unsqueeze(2).expand(-1, -1, T, -1, -1)
-        
         sparse_k = torch.gather(k, 2, final_indices[:,:,:,:,0]) # Simplified gather
         
-        # The most direct gather without large intermediate tensors is to use advanced indexing, which can be complex.
-        # The clearest performant PyTorch way is often a slight expansion:
-        
-        # Let's restart the gather with the simple index (B, T, k_val)
-        # Reshape k to (B, T, C)
-        k_flat_for_gather = k.transpose(1,2).reshape(B, T, C)
-        indices_for_gather = top_k_indices.view(B, T*k_val)
-        
-        # This problem is non-trivial. The cleanest method remains the first one proposed, even with expands.
-        # The key is that the index tensor is now much smaller.
-        
-        # Let's revert to the cleanest implementation with shared indices:
         indices_expanded_g = top_k_indices.unsqueeze(1).unsqueeze(-1).expand(-1, self.n_head, -1, -1, self.head_dim)
         
-        # Source tensors need to be indexed from.
-        # k_source shape: (B, nh, T, hs)
-        # We need to select from dim 2 based on an index of shape (B, nh, T, k_val)
         k_source_expanded = k.unsqueeze(2).expand(-1,-1,T,-1,-1) # Expand for each query
         v_source_expanded = v.unsqueeze(2).expand(-1,-1,T,-1,-1)
 

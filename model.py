@@ -11,9 +11,7 @@ import math
 import inspect
 from dataclasses import dataclass
 
-from numpy import float32
-from pandas import infer_freq
-from sympy import true
+from sympy import false
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -30,19 +28,7 @@ import quantizer
 Linear = nn.Linear
 Orthlin = modules.OrthogonalLinear
 #settings :)
-#known good
-diffSplits      = 1
-ssmax           = True
-mtp             = False
-CCE             = True
-#ungraded
-fftmem          = False
-qmem            = False
-mmnorm          = False
-normless        = False
-orthqk          = False
-orthHead        = False
-rmHead          = False
+
 #good in owt
 qnorm           = False
 #good in shkspr
@@ -70,16 +56,33 @@ topoloss        = False
 acebtl          = False
 acl1            = False # unimplemented
 
+#ungraded
+fftmem          = True
+qmem            = False
+mmnorm          = False
+normless        = False
+orthqkvc        = True
+orthHead        = True
+rmHead          = False
+
 nmix            = False
 losspred        = False
 
 dynskip         = False
-k_atten         = True
+k_atten         = False
 moe             = False
 sprs            = False
 wnll            = False
 
 csbr            = False
+
+shenanigans     = False
+residless       = False
+
+#known good
+ssmax           = True
+mtp             = False
+CCE             = True and not orthHead
 
 auxmod          = acl1 or acebtl #or topoloss
 
@@ -112,7 +115,55 @@ class Attention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        if orthqk:
+        if orthqkvc:
+            self.q_attn = Orthlin(config.n_embd,  config.n_embd, bias=config.bias)
+            self.k_attn = Orthlin(config.n_embd,  config.n_embd, bias=config.bias)
+            self.v_attn = Orthlin(config.n_embd,  config.n_embd, bias=config.bias)
+            self.c_proj = Orthlin(config.n_embd,  config.n_embd, bias=config.bias)
+        
+        else:
+            self.q_attn = Linear(config.n_embd,  config.n_embd, bias=config.bias)
+            self.k_attn = Linear(config.n_embd,  config.n_embd, bias=config.bias)
+            self.v_attn = Linear(config.n_embd,  config.n_embd, bias=config.bias)
+        
+            # output projection
+            self.c_proj = Linear(config.n_embd,  config.n_embd, bias=config.bias)
+        
+        # regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head 
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        self.head_dim =  self.n_embd //  self.n_head 
+        
+        self.qm = nn.Parameter(torch.ones(self.head_dim).normal_(mean=1, std=0.1))
+        
+    def forward(self, x, causal=True):
+        B, T, C = x.size() 
+        q = self.q_attn(x)
+        k = self.k_attn(x)
+        v = self.v_attn(x)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+
+        if ssmax:
+            y = torch.nn.functional.scaled_dot_product_attention(q*(math.log(T)*self.qm),k,  v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal= causal)
+        else:
+            y = torch.nn.functional.scaled_dot_product_attention(q,k,  v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal= causal)
+        
+        y = y.transpose(1, 2).contiguous().view(B, T, self.n_head * self.head_dim) 
+        y = self.resid_dropout(self.c_proj(y))
+
+        return y
+
+class Kattention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        # key, query, value projections for all heads, but in a batch
+        if orthqkvc:
             self.q_attn = (Orthlin(config.n_embd,  config.n_embd, bias=config.bias))
             self.k_attn = (Orthlin(config.n_embd,  config.n_embd, bias=config.bias))
         else:
@@ -133,76 +184,34 @@ class Attention(nn.Module):
         self.n_embd = config.n_embd
         self.dropout = config.dropout
         self.head_dim =  self.n_embd //  self.n_head 
-        
+
+        self.k_sparse=4
+
         self.qm = nn.Parameter(torch.ones(self.head_dim).normal_(mean=1, std=0.1))
         
-        #self.conv = wackmodel.CausalConv1d2()
-        # Memory positions are always visible
-        self.mem_len = config.mem_block_size
-        mask = torch.zeros((self.mem_len, self.mem_len*2),dtype=torch.bfloat16)
-        # Enforce causality for non-memory positions
-        for t in range(self.mem_len):
-            mask[t, self.mem_len + t + 1:] = float('-inf')
-        self.register_buffer("attn_mask", mask)
-
     def forward(self, x, causal=True):
         B, T, C = x.size() 
         q = self.q_attn(x)
         k = self.k_attn(x)
         v = self.v_attn(x)
-        #print("actually running")
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
 
-        if ssmax:
-            y = torch.nn.functional.scaled_dot_product_attention(q*(math.log(T)*self.qm),k,  v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal= causal)
-        else:
-            y = torch.nn.functional.scaled_dot_product_attention(q,k,  v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal= causal)
-        
-        y = y.transpose(1, 2).contiguous().view(B, T, self.n_head * self.head_dim) 
-        y = self.resid_dropout(self.c_proj(y))
-
-        return y
-
-class Kattention(nn.Module):
-    def __init__(self, config, k_sparse=1):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
-        
-        self.k_sparse = k_sparse
-
-    def forward(self, x, causal = True):
-        B, T, C = x.size()
-
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-
-
-        causal_mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, T, T)
-        
         k_val = min(self.k_sparse, T)
 
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        
+        att = (q*(math.log(T)*self.qm) @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+    
+        causal_mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, T, T)
         att = att.masked_fill(causal_mask == 0, float('-inf'))
-        #k_hot_mask = quantizer.TopKHot.apply(att, k_val)
-        #att = att.masked_fill(k_hot_mask == 0, float('-inf'))
-        #att = torch.softmax(att,dim=-1) 
-        att = F.gumbel_softmax(att,tau= 0.5, hard=true, dim =-1)
+        k_hot_mask = quantizer.TopKHot.apply(att, k_val)
+        att = att.masked_fill(k_hot_mask == 0, float('-inf'))
+        att = torch.softmax(att,dim=-1) 
+        #att = F.gumbel_softmax(att,tau= 1.0, hard=True, dim =-1)
         y = att@v
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.c_proj(y)
+        y = self.resid_dropout(self.c_proj(y))
         
         return y
 
@@ -233,11 +242,22 @@ class LearnableSpiral4D(nn.Module):
             output = output.view(b,t,c*4)
         return output
 
-
+def dtanh_bump(x):
+    # This is mathematically equivalent to sech^2(x)
+    # Peak is at 1.0, tails fall off cleaner than exp(-x^2)
+    t = torch.tanh(x)
+    return 1.0 - t.pow(2)
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.n_embd = config.n_embd
         up = 4
+        if shenanigans:
+            self.sinner = modules.PerWeightActivationLayer(config.n_embd,config.n_embd,torch.sin,bias=False)
+            self.c_fc    = Linear(config.n_embd, up * config.n_embd, bias=config.bias)
+        
+            self.com = modules.FFTResampler(config.n_embd*up,config.n_embd,config.n_embd)
+            return
         self.c_fc    = Linear(config.n_embd, up * config.n_embd, bias=config.bias)
         self.c_fc2    = Linear(config.n_embd, up * config.n_embd, bias=config.bias)
         if(qrot):
@@ -246,12 +266,14 @@ class MLP(nn.Module):
             self.gelu    = nn.GELU()
             self.c_proj  = Linear( up * config.n_embd, config.n_embd, bias=config.bias)
             self.c_proj2  = Linear( up * config.n_embd, config.n_embd, bias=config.bias)
+
         self.dropout = nn.Dropout(config.dropout)
-        self.rx0 = nn.Parameter(torch.zeros(up * config.n_embd))
-        self.n_embd = config.n_embd
 
     def forward(self, x):
-        #x2 = self.c_fc2(x)
+        if shenanigans:
+            return self.com(self.c_fc(x))
+            #return dtanh_bump(self.sinner(x))
+            #return self.sinner(x)
         x = self.c_fc(x)
         if(qrot):
             x = self.qrot(x)
@@ -259,7 +281,6 @@ class MLP(nn.Module):
             x = self.gelu(x)
         #x = x * quantizer.TopKHot.apply(x2, self.n_embd*2)
         x = self.c_proj(x)
-        #x2 = self.c_proj2(x)
         x = self.dropout(x)
         return x
 
@@ -339,9 +360,9 @@ class Block(nn.Module):
         super().__init__()
         self.ln_1 = LayerNorm(config)
         if(Qrotention):
-            self.attn = modules.SSM(config)
+            self.attn = modules.SSM(config.n_embd,config.dropout,config.bias)
         elif k_atten:
-            self.attn = kattn.KattentionFused(config)
+            self.attn = Kattention(config)
         
         else:
             self.attn = Attention(config)
@@ -356,8 +377,18 @@ class Block(nn.Module):
 
     def forward(self, x,  causal = True):
         self.block_input = x
-        x = x + self.attn(self.ln_1(x), causal)
-        x = x + self.mlp(self.ln_2(x))
+        
+        if(Qrotention):
+            x = x + self.attn(self.ln_1(x))[0]
+        else:
+            if residless:
+                x = self.attn(self.ln_1(x), causal)
+            else:
+                x = x + self.attn(self.ln_1(x), causal)
+        if residless:
+            x = self.mlp(self.ln_2(x))
+        else:
+            x = x + self.mlp(self.ln_2(x))
         return x
 
     def spl(self, x, mem = None):
@@ -473,10 +504,8 @@ class GPT(nn.Module):
                 self.register_buffer('memory', torch.randn(1, config.mem_block_size, config.n_embd)*1e-5)
             if(config.dropout > 0.0):
                 config.dropout = config.dropout / 4
-            self.dreamer = modules.Dreamer(**config)
+            self.dreamer = modules.Dreamer(config)
             self.memory_selector = Block(config)
-            
-            self.mem_comp = modules.LearnableFourierResampler(config.mem_block_size, config.mem_block_size//2, 32)
             
 
         self.surprise = 1
@@ -1111,17 +1140,7 @@ class GPT(nn.Module):
     def mem_form(self, x):
         #currently assumes mem size and block size are the same
         b, t, c = x.size()
-        #squishmem       = utils.rfft_trunc_squish(memory, target_dim= mt//2,dim=1).expand(b, self.config.mem_block_size//2, self.config.n_embd) #(b, m//2,c)
-        
-        #squishmem = self.mem_comp(memory.transpose(1,2).contiguous()).transpose(1,2)
-        #squishmem = squishmem.expand(b, self.config.mem_block_size//2, self.config.n_embd)
-        
         selectedMemory  = self.memory_selector(x, causal = False)[:,:self.config.mem_block_size,:] #(b, m, c)
-        
-        #selectedMemory  = utils.rfft_trunc_squish(selectedMemory, target_dim= mt//2,dim=1) #(b, m//2,c)
-        
-        #selectedMemory  = self.mem_comp(selectedMemory.transpose(1,2)).transpose(1,2)
-        #mh1             = torch.cat([selectedMemory,squishmem],dim =1)       #(b, m,c)
         
         mh1             = selectedMemory
         mh1             = self.dreamer(mh1)
@@ -1132,7 +1151,7 @@ class GPT(nn.Module):
         # init all weights
         self.apply(self._init_nonmem_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
-        memory_module_names = ('memory.', 'dreamer.', 'memory_selector.', 'mem_comp.')
+        memory_module_names = ('memory.', 'dreamer.', 'memory_selector.')
         
         for pn, p in self.named_parameters():
             # Skip any parameter that is part of a memory module
@@ -1143,7 +1162,7 @@ class GPT(nn.Module):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * self.config.n_layer))
 
     def _init_nonmem_weights(self, module):
-        if module is self.memory or module is self.dreamer or module is self.memory_selector or module is self.mem_comp:
+        if module is self.memory or module is self.dreamer or module is self.memory_selector:
             return
         #if isinstance(module, Linear):
         #    torch.nn.init.normal_(module.weight, mean=module.weight.mean(), std=(module.weight.std() + 1e-10))
@@ -1169,7 +1188,9 @@ class GPT(nn.Module):
         self.apply(self.toggle_weights)      
 
     def toggle_weights(self, module):
-        if not(module is self.memory or module is self.dreamer or module is self.memory_selector or module is self.mem_comp):
+        if not(module is self.memory or 
+               module is self.dreamer or 
+               module is self.memory_selector ):
             return
         for param in module.parameters():
             param.requires_grad = not self.model_frozen
@@ -1185,10 +1206,7 @@ class GPT(nn.Module):
         #if hasattr(self, 'dreamer') and self.dreamer is not None:
         #    for param in self.dreamer.parameters():
         #        param.requires_grad = not self.memory_frozen
-        #if hasattr(self, 'mem_comp') and self.mem_comp is not None:
-        #    for param in self.mem_comp.parameters():
-        #        param.requires_grad = not self.memory_frozen
-                
+              
     def get_patch_lengths(self, logits, end_token_idx, seq_len):
         """Returns tensor of patch lengths (batch_size,) based on first end token occurrence"""
         # Find first occurrence of end token in each sequence

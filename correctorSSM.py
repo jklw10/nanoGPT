@@ -4,6 +4,7 @@ import time
 
 #os.environ['CUDA_LAUNCH_BLOCKING'] = "0" 
 from cut_cross_entropy import linear_cross_entropy
+import cut_cross_entropy
 import requests
 import pickle
 import numpy as np
@@ -37,7 +38,7 @@ min_lr = learning_rate/10
 
 torch._inductor.config.disable_cpp_codegen = True
 
-
+ccc         = True
 idk_enabled = False
 cl          = False
 mem         = False
@@ -124,9 +125,9 @@ class Block(nn.Module):
         return self.attn.get_weight()
     def forward(self, x, prev=None, weights=None):
         if prev is not None:
-             attn_output, present_key_values = self.attn.nexts(prev, self.ln_1(x),weights)
+             attn_output, present_key_values = self.attn.nexts(prev, self.ln_1(x),weight=weights)
         else:
-             attn_output, present_key_values = self.attn(self.ln_1(x),weights)
+             attn_output, present_key_values = self.attn(self.ln_1(x),weight=weights)
         x = x + attn_output
         x = x + self.mlp(self.ln_2(x))
         return x, present_key_values
@@ -233,11 +234,13 @@ def off_diagonal(x):
     n, m = x.shape
     assert n == m
     return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+
+    
 class Model(nn.Module):
     def __init__(self, vocab_size, k=5, lambda_thought=0.1, **kwargs):
         super().__init__()
         # ... your usual model initialization (embedding, transformer blocks, lm_head)
-        
+        self.diem = AdaptiveDIEMLoss()
         if qkhwn:
             wte = (nn.Embedding(vocab_size, n_embed))
         else:
@@ -294,56 +297,58 @@ class Model(nn.Module):
 
         x = tok_emb[:,:-2,:]
         Y1_gt = idx[:, 1:-1]
-        Y2_gt_flat = idx[:, 2:].reshape(-1)
         ws = self.get_weights()
-        # PASS 1: HYPOTHESIS PASS (gen1)
-        #gen1_x, gen1_qs = self.ssmfwd(x, weights=ws)
-        #tok_emb_g3 = tok_emb[:, 1:-1, :]
-        #gen3_x, _ = self.ssmfwd(tok_emb_g3, prevs=gen1_qs, weights=ws)
-        #logits_g1 = self.lm_head(gen1_x)
-        #logits_g3 = self.lm_head(gen3_x)
-
-        full_x, full_qs = self.ssmfwd(tok_emb[:,:-1,:], weights=ws)
         
-        logits_full= self.lm_head(full_x)
+        full_x, _ = self.ssmfwd(tok_emb[:,:-1,:], weights=ws)
+        
+        logits_full = self.lm_head(full_x)
         logits_g1 = logits_full[:, :-1,:]
-        #logits_g3 = logits_full[:, 1:, :]
 
-        ## PASS 3: do a mtp head instead of full pass for self knowledge sample
-        
-        
-        #T1_pred_onehot = quantizer.TopKHot.apply(logits_t1, 1)
-        g1_pred_onehot = F.gumbel_softmax(logits_g1, tau=gumbel_temp, hard=True, dim=-1)
+        #g1_pred_onehot = quantizer.TopKHot.apply(logits_g1, 3) / 3.0
+        g1_pred_onehot = torch.softmax(logits_g1, dim=-1)
+        #g1_pred_onehot = F.gumbel_softmax(logits_g1, tau=gumbel_temp, hard=True, dim=-1)
         g1_guess_emb = g1_pred_onehot @ self.transformer.wte.weight
-        
-        #g1_guess_emb = g1_guess_emb + self.transformer.wpe(torch.arange(1,T+1, device=device)) #this is why rope would be better in my intuition
-        # PASS 2: TEST PASS (gen2)
-        #gen2_x, _ = self.ssmfwd(g1_guess_emb, prevs=gen1_qs, weights= ws)
-        #gen1_qs = [layer_q[:, :-1, :] for layer_q in full_qs]
         
         gen2_x, _ = self.ssmfwd(g1_guess_emb,  weights= ws)
         #logits_g2 = self.lm_head(gen2_x)
 
         #L_guess = utils.concordance_correlation_loss(gen2_x, tok_emb[:,2:,:].detach())
-        L_guess = vicreg_loss(gen2_x, tok_emb[:,2:,:].detach())
-        #L_guess = F.cross_entropy(logits_g2.reshape(-1, logits_g2.size(-1)), Y2_gt_flat, reduction='none').view(Y1_gt.shape)
+      
+        #L_guess = F.cross_entropy(
+        #    logits_g2.reshape(-1, logits_g2.size(-1)), 
+        #    idx[:, 2:].reshape(-1), 
+        #    reduction='none'
+        #    ).view(Y1_gt.shape)
+        bfw = self.lm_head.weight.to(torch.bfloat16)
+        
+        L_guess = linear_cross_entropy(
+            gen2_x.to(torch.bfloat16),
+            bfw, 
+            idx[:, 2:], 
+            impl='torch_compile', 
+            reduction='none',
+            ).view(Y1_gt.shape)
+
         #L_standard = F.cross_entropy(logits_g1.reshape(-1, logits_g1.size(-1)), Y1_gt.reshape(-1), reduction='none').view(Y1_gt.shape)
         #L_baseline = F.cross_entropy(logits_g3.reshape(-1, logits_g3.size(-1)), Y2_gt_flat, reduction='none').view(Y1_gt.shape)
-        L_all = F.cross_entropy(
-            logits_full.reshape(-1, logits_full.size(-1)), 
-            idx[:, 1:].reshape(-1), 
-            reduction='none'
+        
+        
+        L_all = linear_cross_entropy(
+            full_x.to(torch.bfloat16),
+            bfw, 
+            idx[:, 1:], 
+            impl='torch_compile', 
+            reduction='none',
             ).view(idx[:, 1:].shape)
-        L_T1 = L_all[:, :-1]
-        L_T2 = L_all[:, 1:]   
+        #L_T1 = L_all[:, :-1]
+        #L_T2 = L_all[:, 1:]   
         if self.training:
-            loss = L_all.mean()+L_guess
+            gk = utils.gaussian_kernel(L_guess,1.0,dim=-1)
+            loss = L_all.mean() + torch.tanh(gk*L_guess).mean()
         else:
-            loss = L_all[:, :-1].mean()
-        #loss, gloss = self.correction_loss(logits_g1, L_standard, L_baseline, g1_pred_onehot, L_corrected)
-        #loss, gloss = self.trust_loss2(L_T1, L_T2, L_guess)
-        #L_guess = L_guess.mean().detach()
-        L_guess = None
+            loss = L_all.mean()
+        L_guess = L_guess.mean().detach()
+        #L_guess = None
         gloss = None#torch.zeros(1).detach()
         return logits_g1, loss, (gloss, L_guess)
 
@@ -351,36 +356,32 @@ class Model(nn.Module):
     def trust_loss2(self, L_standard, L_baseline, L_guess):
         relative_improvement = L_baseline - L_guess
         
-        # 2. Cumulative Future Gain (The Butterfly Effect)
-        # We sum improvements from the future back to the present
         cumulative_gain = torch.flip(torch.cumsum(torch.flip(relative_improvement, [1]), dim=1), [1])
         
-        # 3. The Trust Gate
-        # We divide by a small temp (e.g., 0.1) to make the switch sharper.
-        # gain > 0 -> gate -> 1.0 (Trust the Guess)
-        # gain < 0 -> gate -> 0.0 (Trust the Dataset)
         trust_gate = torch.sigmoid(cumulative_gain / 0.1)
 
         if self.training:
             loss = (trust_gate * L_guess) + ((1.0 - trust_gate) * L_baseline)
+            loss.mean()
         else:
             loss = L_standard.mean()
         return loss, trust_gate
-    def trust_loss(self, L_standard, L_baseline, L_corrected):
+    
+    def trust_loss(self, L_standard, L_baseline, L_guess):
         with torch.no_grad():
-            Gain = L_baseline - L_corrected
+            Gain = L_baseline - L_guess
             T = 0.1 # A hyperparameter to tune
             trust_score = torch.sigmoid(Gain / T)
         L_masked_standard = L_standard * (1.0 - trust_score)
 
         if self.training:
             loss = L_masked_standard.mean() 
-            loss = loss + (trust_score * L_corrected).mean()
+            loss = loss + (trust_score * L_guess).mean()
             loss = loss + L_baseline.mean()*0.1
         else:
             loss = L_standard.mean()
         gloss = trust_score.mean().detach()
-        return loss,gloss
+        return loss, gloss
     
     def configure_optimizers(self, weight_decay=0.1, learning_rate=1e-3, betas=(0.9, 0.95)):
         # start with all of the candidate parameters
@@ -451,12 +452,6 @@ if gradlog:
 t0 = time.time()
 t2 = time.time()
 
-def printReal(definer, cont, id):
-    if  cont is None or \
-        id >= len(cont) or \
-        cont[id] is None:
-        return
-    print(f"{definer}{cont[id]:.4f}, ",end="")
 
 for iter in range(max_iters):
     lr = get_lr(iter)
@@ -491,8 +486,8 @@ for iter in range(max_iters):
               f"train loss: {losses['train']:.4f}, "
               f"val loss: {losses['val']:.4f}, ",end="")
         if genloss:
-            printReal("gen 1 loss: ", glosses, 0)
-            printReal("gen 2 loss: ", glosses, 1)
+            utils.printReal("gen 1 loss: ", glosses, 0)
+            utils.printReal("gen 2 loss: ", glosses, 1)
         print(f"time: {(t2-t0)*1000:.0f} ms, "
               f"Tval: {(t1-t2)*1000:.0f} ms")
         
@@ -500,17 +495,16 @@ for iter in range(max_iters):
         t0 = time.time()
 
     X = get_batch('train')
-    logits, loss, gloss = model(X, True, cl = current_lambda)
+    logits, loss, _ = model(X, True, cl = current_lambda)
 
-    optimizer.zero_grad(set_to_none=True)
     loss.backward()
     
     if gradlog and iter > 100:
         sorted_grads = sorted(gradient_norms.items(), key=lambda item: item[1], reverse=True)
         for i, (name, norm) in enumerate(sorted_grads):
             print(f"{i+1}. {name:<60} | Norm: {norm:.4f}")
-    #torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
     if wnorm:
         with torch.no_grad():
             utils.softwnorm(model,1e-4)

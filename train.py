@@ -264,8 +264,11 @@ wwhite_enabled      = False
 ndiff_enabled       = False
 decay_wa            = False
 
-gd4sphere           = False
+gball               = False
+gavg                = False
+grms                = False
 
+gstd                = False
 #not abysmal
 gsphere             = False
 ggauss              = False #or best
@@ -274,6 +277,8 @@ gchaos              = False #or best
 grefl               = False
 
 wstep               = False
+
+gblend              = False
 
 #known good
 gfft                = False #or best
@@ -286,14 +291,14 @@ plot                = False
 muon                = False
 #for fftmem owt: 1e-5 #beta2 dependent
 #for fftmem skspr: 5e-5 #beta2 dependent
-#no clue why this way of passing is needed here but not for the bools. love python
-wfunc = utils.apply_reflection
+wfunc               = utils.fast_polar_decomposition3
 #wfunc = utils.range_norm
+#no clue why this way of passing is needed here but not for the bools. love python
 config["swfa"]      = 1e-5 if dataset == "openwebtext" else 1e-3
 zcastep             = 2 #2, 5
 szcapow             = 2 #2, 10
 
-ghook = grefl or gd4sphere or gwrot or gdiff_enabled or ndiff_enabled or gnorm or dfw_enabled or grokfast or gfft or gzca_enabled or sign_enabled or gsphere or ggauss or gchaos or gradorth or muon
+ghook = gblend or gstd or grms or gavg or grefl or gball or gwrot or gdiff_enabled or ndiff_enabled or gnorm or dfw_enabled or grokfast or gfft or gzca_enabled or sign_enabled or gsphere or ggauss or gchaos or gradorth or muon
 
 decay               = False
 decaying = 1.0
@@ -306,31 +311,40 @@ lrfinder            = False
 
 
 if(ghook):
-    gemas = None
-    wemas = None
-    if(gdiff_enabled or dfw_enabled or muon):
-        if init_from!='resume':
-            wemas = [p.clone().detach()for p in model.parameters()]
+    if(gdiff_enabled or dfw_enabled or muon or grokfast):
+        for p in model.parameters():
+            if p.requires_grad:
+                if gdiff_enabled or dfw_enabled or muon:
+                    p.wema = torch.clone(p)
+                if grokfast:
+                    p.gema = torch.zeros_like(p)
 
-    if (grokfast):
-        gemas = [torch.zeros_like(p) for p in model.parameters()]
-    
     for i, p in enumerate(model.parameters()):
         if p.requires_grad:
-            wema = None if wemas is None else wemas[i]
-            gema = None if gemas is None else gemas[i]
-            
-            p.register_hook(lambda grad, p=p, gema=gema, wema=wema: custom_gradient_adjustment(grad, p, gema=gema, wema=wema))
+            p.register_hook(lambda grad, p=p,: custom_gradient_adjustment(grad, p))
 
 
 @torch.compile(backend='inductor', mode='max-autotune')
-def custom_gradient_adjustment(grad, param, wema = None, gema = None):
+def custom_gradient_adjustment(grad, param):
     if(grad is None):
         return
+    
+    if hasattr(param, "gema"):
+        gema = param.gema  
+    if hasattr(param, "wema"): 
+        wema = param.wema
     input_size = grad.size(0)
     adjusted_grad = torch.where(torch.isnan(grad), torch.zeros_like(grad), grad)
     device = grad.device
+    if gavg:
+        adjusted_grad -= adjusted_grad.nanmean()
     d2 = not (adjusted_grad.ndim < 2)
+    nd = [-1,-2] if d2 else [-1]
+
+    if(gzca_enabled and d2):
+        adjusted_grad = utils.zca_newton_schulz(adjusted_grad, zcastep, szcapow)
+    if gblend:
+        adjusted_grad = utils.neighbor_blend(adjusted_grad)
     if(gradorth and d2):
         adjusted_grad = utils.orthogonalize_gradients(adjusted_grad,param)
     if gwrot:
@@ -339,23 +353,30 @@ def custom_gradient_adjustment(grad, param, wema = None, gema = None):
         adjusted_grad = (1 - alpha) * grad + alpha * rgrad
     if(gchaos):
         adjusted_grad += torch.rand_like(adjusted_grad)*1e-3
+    
     if(gnorm): 
         
         grad_avg = adjusted_grad.nanmean()
         grad_range = adjusted_grad.max() - adjusted_grad.min() + 1e-10
         adjusted_grad = ((adjusted_grad - grad_avg) / grad_range)  * (2 - 2 / input_size) 
+    
     if(gchaos):
         adjusted_grad += torch.rand_like(adjusted_grad)*1e-3
+    
     if(gsphere): 
-        nd = [-1,-2] if d2 else [-1]
         adjusted_grad = adjusted_grad / adjusted_grad.norm(dim =nd, keepdim= True) # * (2 - 2 / input_size) 
         
-    if(gd4sphere): 
-        nd = [-1,-2] if d2 else [-1]
+    if(gball): 
         g_norm = adjusted_grad.norm(dim = nd, keepdim= True)
         adjusted_grad = adjusted_grad / (g_norm+1e-10)
         #adjusted_grad = adjusted_grad * F.tanh(g_norm)
-        adjusted_grad = adjusted_grad * torch.log(0.9+g_norm)
+        adjusted_grad = adjusted_grad * torch.log(1.0+g_norm)
+
+    if grms:
+        rms = torch.rsqrt(adjusted_grad.pow(2).mean(dim=nd, keepdim=True) + 1e-8)
+        adjusted_grad = adjusted_grad * rms
+    if gstd:
+        adjusted_grad = utils.soft_sigma_clip_norm(adjusted_grad)
     #if(gd4sphere ): 
     #    ogs =adjusted_grad.shape
     #    if d2:
@@ -383,8 +404,7 @@ def custom_gradient_adjustment(grad, param, wema = None, gema = None):
         adjusted_grad = utils.fft_gauss(adjusted_grad,center,width)
     if(sign_enabled):
         adjusted_grad = torch.sign(torch.round(adjusted_grad)) 
-    if(gzca_enabled and d2):
-        adjusted_grad = utils.zca_newton_schulz(adjusted_grad, zcastep, szcapow)
+
     if(ndiff_enabled):
         w_range = torch.abs(p.max() - p.min() + 1e-10)
         w_avg = param.nanmean()
@@ -396,7 +416,7 @@ def custom_gradient_adjustment(grad, param, wema = None, gema = None):
     
     
     if(gdiff_enabled or dfw_enabled):
-        wema += 0.01 * (adjusted_grad - wema)
+        wema += 0.99 * (param - wema)
 
     #if(gdiff_enabled ):
     #    awdiff = weight_ema - adjusted_grad 
@@ -409,8 +429,8 @@ def custom_gradient_adjustment(grad, param, wema = None, gema = None):
     #    adjusted_grad *= gdiff 
 
     if(gdiff_enabled and d2):
+        
         awdiff = wema - param 
-
         npar = torch.abs(wema)
         npar += torch.abs(adjusted_grad - awdiff) 
         gdiff = 1.0 / torch.abs(npar)
@@ -455,14 +475,14 @@ if ddp:
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
-    torch.compiler.cudagraph_mark_step_begin()
+    #torch.compiler.cudagraph_mark_step_begin()
     out = {}
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             
-            #torch.compiler.cudagraph_mark_step_begin()
+            torch.compiler.cudagraph_mark_step_begin()
             X, Y = get_batch(split)
             with ctx:
                 logits, loss = model(X, Y)
@@ -650,7 +670,14 @@ def model_step(iter_num, tl, best_val_loss, config):
         if isinstance(mod, optim.OptimizedLinear):
             pass
 
-    optimizer.step(closure)
+    #if grokfast:
+    #    with torch.no_grad():
+    #        for p in model.parameters():
+    #            if p.requires_grad:
+    #                p.gema += 0.99 * (p.grad - p.gema)
+    #                p.grad += p.gema * 2
+    #                p.grad /= 3
+    optimizer.step()
     
     for mod in model.modules():
         if isinstance(mod, optim.OptimizedLinear):
