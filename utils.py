@@ -1,6 +1,10 @@
 
 import math
+import os
+import pickle
 
+import numpy as np
+import tiktoken
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -357,7 +361,7 @@ def quatnorm(x):
     x = x /  torch.norm(x, p=2, dim=-1, keepdim=True)
     return x.view(b, t, c)
 
-@torch.compile(backend='inductor', mode='max-autotune')
+#@torch.compile(backend='inductor', mode='max-autotune')
 def pscan(x_in: torch.Tensor, func: nn.Module, ident: torch.Tensor) -> torch.Tensor:
     original_shape = x_in.shape
     B, T, C = original_shape
@@ -1117,6 +1121,21 @@ def rfft_trunc_squish(x, target_dim=None, dim=-1, band = "low"):
 
     return o
 
+def ramp(iteration, base, warmup):
+    if iteration < warmup:
+        return base * (iteration + 1) / (warmup + 1)
+
+def cosine_decay(iteration, base, minimum, decay_time, warmup):
+    if iteration < warmup:
+        return base 
+    
+    decay_ratio = (iteration - warmup) / (decay_time - warmup)
+    
+    if iteration > decay_time:
+        return minimum
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
+    return minimum + coeff * (base - minimum)
 
 @torch.compile(backend='inductor', mode='max-autotune')
 def fft_trunc_csquish(x, target_dim = None, band = "low"):
@@ -1142,6 +1161,11 @@ def fft_trunc_csquish(x, target_dim = None, band = "low"):
     o = torch.fft.irfft(xc,target_dim,dim=-1).real
     return o 
     
+def gaussian_bump(x):
+    #tails fall off cleaner than exp(-x^2)
+    t = torch.tanh(x)
+    return 1.0 - t.pow(2)
+
 @torch.compile(backend='inductor', mode='max-autotune')
 def gaussian_kernel(grad, center_offset: torch.Tensor, sigma = 3.0, dim=None) -> torch.Tensor:
     size = grad.size(dim)
@@ -1212,8 +1236,23 @@ def quaternionize(x):
     x_normalized = x4d / x_norm             
     return x_normalized
 
+def rms(x, dim=-1):
+    return x * torch.rsqrt(x.pow(2).mean(dim=dim, keepdim=True) + 1e-8)
 
-def fast_polar_decomposition(A, dim=-1, polar_iter=2):
+
+def surface_minimize(emb, hidden):
+    target_vec = hidden
+    v = torch.randn_like(target_vec)
+    vjp = torch.autograd.grad(
+        target_vec, emb, v, 
+        create_graph=True,   # Allows double-backprop
+        retain_graph=True,   # Keeps graph for the main task loss backward
+        only_inputs=True,
+        allow_unused=True    # Safety for decoupled graphs
+        )[0]
+    reg_loss = (vjp.norm()**2) / vjp.numel()
+    return reg_loss
+def fast_polar_decomposition(A, polar_iter=2):
     """A cursed attempt at a fast polar decomp, 
     apparently works better for weight orthogonalization than real one
     """
@@ -1237,63 +1276,286 @@ def fast_polar_decomposition(A, dim=-1, polar_iter=2):
         U = 0.5 * (U + U_inv_T)
         
     return U
-
-@torch.compile(backend='inductor', mode='max-autotune')
-def fast_polar_decomposition3(A, dim=-1, polar_iter=3):
-    """
-    Newton-Schulz iteration for Approximate Polar Decomposition.
-    Works on Rectangular matrices by orthogonalizing the smaller dimension.
-    """
-    if A.ndim < 2:
-        return A
-        
-    # Operate on a clone to avoid mutating original during calculation
-    X = A.clone()
-    
-    # 1. Pre-conditioning: The iteration only converges if spectral norm < sqrt(3)
-    # Using Frobenius norm as a safe upper bound proxy for spectral norm
-    norm = X.norm() + 1e-8
-    X = X / norm  # Scale down
-    
-    # 2. Iterate
-    r, c = X.shape
-    
+def fast_polar_decomposition2(W, polar_iter=2):
+    # 1. Normalize by spectral norm estimate (using Frobenius for speed)
+    # This ensures convergence of Newton-Schulz
+    norm = W.norm(p='fro') + 1e-9
+    X = W / norm
+    out_feat, in_feat = W.shape
+    # 2. Iterative Orthogonalization
     for _ in range(polar_iter):
-        if r >= c:
-            # Tall Matrix (e.g. Output Head 50304x228): Orthogonalize Columns
-            # Update: X = X * (1.5*I - 0.5 * X.T @ X)
-            gram = X.T @ X
-            update = 1.5 * torch.eye(c, device=X.device, dtype=X.dtype) - 0.5 * gram
-            X = X @ update
+        # For non-square matrices, we compute X * (3I - X^T X)
+        # If Out < In: X * X^T is smaller. 
+        if  out_feat < in_feat:
+            gram = X.mm(X.t())
+            eye = torch.eye(out_feat, device=X.device)
+            X = 0.5 * (3.0 * eye - gram).mm(X)
         else:
-            # Wide Matrix: Orthogonalize Rows
-            # Update: X = (1.5*I - 0.5 * X @ X.T) * X
-            gram = X @ X.T
-            update = 1.5 * torch.eye(r, device=X.device, dtype=X.dtype) - 0.5 * gram
-            X = update @ X
+            gram = X.t().mm(X)
+            eye = torch.eye(in_feat, device=X.device)
+            X = 0.5 * X.mm(3.0 * eye - gram)
+    
+    return (X * norm)
+def cursed_polar_decomposition_smart(A, polar_iter=2):
+    """
+    Handles Square, Wide (1:2), and Tall (2:1) matrices by chunking.
+    """
+    assert A.ndim >= 2, f"Input tensor must have at least 2 dimensions, got shape {A.shape}"
+    
+    h, w = A.shape
+    
+    if h == w:
+        return fast_polar_decomposition(A, polar_iter)
+        
+    elif w == 2 * h:
+        w1, w2 = A.chunk(2, dim=1)
+        # Decompose blocks independently
+        w1 = fast_polar_decomposition(w1, polar_iter)
+        w2 = fast_polar_decomposition(w2, polar_iter)
+        return torch.cat([w1, w2], dim=1)
+
+    elif h == 2 * w:
+        w1, w2 = A.chunk(2, dim=0)
+        w1 = fast_polar_decomposition(w1, polar_iter)
+        w2 = fast_polar_decomposition(w2, polar_iter)
+        return torch.cat([w1, w2], dim=0)
+
+    else:
+        #return A #fast_polar_decomposition2(A,polar_iter)
+        raise ValueError(
+            f"Unsupported Weight Shape: [{h}, {w}]. "
+            "Cursed decomposition only supports Square, 1:2 (Wide), or 2:1 (Tall) ratios."
+        )
+
+def get_meta(dataset, always_byte=False):
+    if dataset == "openwebtext":
+        if always_byte:
+            vocab_size = 256
+            def decode(ll):
+                valid_bytes = [b for b in ll if b < vocab_size] 
+                return bytes(valid_bytes).decode('utf-8', errors='replace')
+            return decode, vocab_size
+        enc = tiktoken.get_encoding("gpt2")
+        return enc.decode, 50304
+    dataset_dir = os.path.join('data', dataset)
+    meta_path = os.path.join(dataset_dir, 'meta.pkl')  
+    with open(meta_path, 'rb') as f: 
+        meta = pickle.load(f)
+    _, itos = meta['stoi'], meta['itos']
+    
+    def decode(ll):
+        decoded = []
+        for i in ll:
+            if i in itos:
+                decoded.append(itos[i])
+            else:
+                decoded.append(f'[UNK{i}]') 
+        return ''.join(decoded)
+    return decode, len(itos)
+class PreloadedLoader(nn.Module):
+    """
+    Loads the entire file into GPU VRAM. 
+    Use this for Validation data and Small datasets (Shakespeare).
+    """
+    def __init__(self, filepath, block_size, batch_size, device='cuda'):
+        super().__init__()
+        self.block_size = block_size
+        self.batch_size = batch_size
+        self.device=device
+        data_np = np.fromfile(filepath, dtype=np.uint16)
+        
+        if 'cuda' in device:
+            data = torch.from_numpy(data_np.astype(np.int64)).to(device).detach()
+        else:
+            data = torch.from_numpy(data_np.astype(np.int64)).to(device).detach()
             
-    # 3. Rescale? 
-    # Usually you want the UNITARY part (scale=1.0), so we return X.
-    # If you want to preserve the original 'energy' of the weights, multiply by 'norm'.
-    # But usually for weight ortho, you want the pure rotation.
-    return X*norm
-def fast_polar_decomposition2(A, polar_iter=3):
-    U = A 
-    d = U.shape[0]
-
-    with torch.no_grad():
-        v = torch.randn(d, 1, device=U.device, dtype=U.dtype)
-        v = F.normalize(v, dim=0)
-        # Power iteration step
-        u_curr = U @ v
-        v_next = U.t() @ u_curr
-        s = v_next.norm() 
+        self.register_buffer('data', data.clone().detach())
+            
+        print(f"Loaded {filepath} entirely to {device}. Size: {len(self.data)/1e6:.2f}M tokens.")
+    
+    @torch.compile(backend='inductor', mode='max-autotune')
+    def get_batch(self, size=None):
+        if size is None:
+            size = self.block_size
+        ix = torch.randint(len(self.data) - size, (self.batch_size,), device=self.device)
         
-    U = U / (s.detach() + 1e-6)
-
-    for _ in range(polar_iter):
-        Gram = U.T @ U          # (d, d)
-        Correction = U @ Gram     # (d, d)
-        U = 1.5 * U - 0.5 * Correction
+        block_idxs = ix.unsqueeze(1) + torch.arange(size + 1, device=self.device).unsqueeze(0)
         
-    return U
+        batch_data = self.data[block_idxs]
+        
+        x = batch_data[:, :-1].contiguous().detach()
+        y = batch_data[:, 1:].contiguous().detach()
+        
+        return x, y
+    
+def VotedGeometricMean(x, y):
+    mag = (x * y).abs().sqrt()
+
+    sign_vote = (x + y).sign()
+    w_eff = sign_vote * mag
+    return w_eff
+
+class BufferedLoader(nn.Module):
+    def __init__(self, filepath, block_size, batch_size, buffer_size_mb=256, device='cuda'):
+        super().__init__()
+        self.mm = np.memmap(filepath, dtype=np.uint16, mode='r')
+        self.file_len = len(self.mm)
+        self.block_size = block_size
+        self.batch_size = batch_size
+        self.device = device
+        
+        # Calculate buffer size
+        self.chunk_len = block_size + 1
+        self.total_samples = (buffer_size_mb * 1024 * 1024) // 2 // self.chunk_len
+        self.total_samples = int(self.total_samples)
+        
+        # Pre-allocate CPU staging
+        self.cpu_buffer = torch.empty((self.total_samples, self.chunk_len), dtype=torch.int16)
+        self.ptr = 0
+        self.register_buffer('gpu_buffer', self.cpu_buffer.clone().detach())
+        
+        print(f"Initialized Buffered Loader for {filepath}. Buffer: {buffer_size_mb}MB")
+        self.refill()
+
+    def refill(self):
+        # Random reads from disk
+        if self.chunk_len > self.file_len:
+            raise ValueError(
+                "I highly doubt you want this, file size is smaller than a single block."
+                "Either try PreloadedLoader or if you truly want this make your own data loader"
+            )
+        max_idx = self.file_len- self.chunk_len
+        ix = torch.randint(0, max_idx, (self.total_samples,))
+        # Numpy vectorized read
+        buf = self.cpu_buffer.numpy()
+        for i, start in enumerate(ix):
+            buf[i] = self.mm[start : start + self.chunk_len].astype(np.int16)
+            
+        # Move to GPU
+        self.gpu_buffer = self.cpu_buffer.pin_memory().to(self.device, non_blocking=True)
+        self.ptr = 0
+
+    def get_batch(self, size=None):
+        if size is None:
+            size = self.block_size
+        if self.ptr + self.batch_size >= self.total_samples:
+            self.refill()
+            
+        data = self.gpu_buffer[self.ptr : self.ptr+self.batch_size]
+        self.ptr += self.batch_size
+        
+        # Recover uint16
+        data = data.long() & 0xFFFF
+        
+        x = data[:, :size].contiguous()
+        y = data[:, 1:size+1].contiguous()
+        return x, y
+
+def get_get_batch_smart(block_size, batch_size, dataset, device):
+    data_dir = os.path.join('data', dataset)
+    train_path = os.path.join(data_dir, 'train.bin')
+    val_path = os.path.join(data_dir, 'val.bin')
+    
+    train_size_mb = os.path.getsize(train_path) / (1024 * 1024)
+    if train_size_mb < 512: # If less than 512MB, just load it all
+        train_loader = PreloadedLoader(train_path, block_size, batch_size, device).to(device)
+    else:
+        train_loader = BufferedLoader(train_path, block_size, batch_size, 256, device)
+    # 2. Check Val Size (Almost always small)
+    
+    val_size_mb = os.path.getsize(train_path) / (1024 * 1024)
+    if val_size_mb < 512: # If less than 512MB, just load it all
+        val_loader = PreloadedLoader(val_path, block_size, batch_size, device).to(device)
+    else:
+        val_loader = BufferedLoader(val_path, block_size, batch_size, 256, device)
+    
+    def get_batch(split, size=None):
+        loader = train_loader if split == 'train' else val_loader
+        return loader.get_batch(size)
+    return get_batch
+    
+
+#i found the name funny
+def get_get_batch(block_size, batch_size, dataset, device, always_byte=False,skip=0, single = False):
+    data_dir = os.path.join('data', dataset)
+    
+    # 1. Open the maps ONCE
+    train_path = os.path.join(data_dir, 'train.bin')
+    val_path = os.path.join(data_dir, 'val.bin')
+    
+    # We maintain persistent handles
+        
+    train_data = np.memmap(train_path, dtype=np.uint16, mode='r')
+    val_data = np.memmap(val_path, dtype=np.uint16, mode='r')
+    
+    if dataset == "openwebtext" and always_byte:
+        print("Building token-to-byte lookup table...")
+        enc = tiktoken.get_encoding("gpt2")
+        TOKEN_TO_BYTES = [torch.tensor(list(enc.decode_bytes([i])), dtype=torch.uint8) for i in range(enc.n_vocab)]
+    def tok2byte(split, size=None):
+        
+        if size is None:
+            size = block_size
+        data_tokens = train_data if split == 'train' else val_data
+        fetch_len = max(size, 32) 
+
+        ix = torch.randint(len(data_tokens) - fetch_len, (batch_size,))
+
+        batch_bytes = []
+
+        for i in ix:
+            token_chunk = data_tokens[i : i + fetch_len].astype(np.int64)
+
+            byte_seq = torch.cat([TOKEN_TO_BYTES[t] for t in token_chunk])
+
+            if len(byte_seq) < size + 1:
+                token_chunk = data_tokens[i : i + fetch_len * 2].astype(np.int64)
+                byte_seq = torch.cat([TOKEN_TO_BYTES[t] for t in token_chunk])
+
+            batch_bytes.append(byte_seq[:size + 1])
+
+        data = torch.stack(batch_bytes).to(torch.int64)
+
+        if device == 'cuda':
+            data = data.pin_memory().to(device, non_blocking=True)
+        else:
+            data = data.to(device)
+        
+        if single:
+            return data[:, :size]
+        x = data[:, :size].contiguous()
+        y = data[:, 1:size+1].contiguous()
+
+        return x, y
+    def get_batch(split, size=None):
+        
+        if size is None:
+            size = block_size
+        
+
+        if dataset == "openwebtext" and always_byte:
+            return tok2byte(split, size)
+        
+        data = train_data if split =="train" else val_data
+        ix = torch.randint(len(data) - size, (batch_size,))
+        
+        # torch.stack is faster here because it handles the memory copy directly 
+        # from the tiny individual numpy views into the final Tensor.
+        x = torch.stack([torch.from_numpy(data[i:i+size].astype(np.int64)) for i in ix])
+        if not single:
+            y = torch.stack([torch.from_numpy(data[i+1:i+1+size].astype(np.int64)) for i in ix])
+
+        if device == 'cuda':
+            x = x.pin_memory().to(device, non_blocking=True)
+            if not single:
+                y = y.pin_memory().to(device, non_blocking=True)
+        else:
+            x = x.to(device)
+            if not single:
+                y = y.to(device)
+                
+        if single:
+            return x
+        #print( x.shape)
+        return x, y
+    return get_batch

@@ -4,6 +4,9 @@ import torch.nn.functional as F
 import copy
 import math
 
+import torch.optim.adamw
+import torch.optim.sgd
+
 import utils
 
 from torch.func import functional_call, vmap
@@ -322,3 +325,39 @@ class ChaosRollbackOptimizer(torch.optim.Optimizer):
         stack = [p.grad.norm(p=2) for group in self.param_groups for p in group['params'] if p.grad is not None]
         grad_norm = torch.norm(torch.stack(stack), p=2) if len(stack) > 0 else torch.tensor(0.0)
         return grad_norm
+    
+
+def orthogonalize_only(grad, param):
+    # Flatten logic ensures this works for Conv2d (4D) or Linear (2D)
+    g = grad.view(-1)
+    w = param.view(-1)
+    # Calculate projection of g onto w
+    w_norm_sq = torch.dot(w, w).add(1e-30)
+    proj = torch.dot(w, g).div(w_norm_sq)
+    # Remove the parallel component (g_orth = g - proj * w)
+    g_orth = g.sub(proj * w)
+    # Return reshaped to original dims
+    return g_orth.view_as(grad)
+
+class Grms(torch.optim.AdamW):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                #grad = orthogonalize_only(grad, p) 
+                d2 = not (grad.ndim < 2)
+                nd = [-1,-2] if d2 else [-1]
+                rms = torch.rsqrt(grad.pow(2).mean(dim=nd, keepdim=True) + 1e-8)
+                grad = grad * rms
+                grad = utils.orthogonalize_gradients(grad, p).clone()
+                p.grad = grad
+                # 3. Standard Step
+        return super().step(closure)
+
+        

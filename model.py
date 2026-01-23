@@ -11,7 +11,6 @@ import math
 import inspect
 from dataclasses import dataclass
 
-from sympy import false
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -25,7 +24,8 @@ import quantizer
 #todo
 #prediction machine
 #Linear = optim.OptimizedLinear
-Linear = nn.Linear
+#Linear = nn.Linear
+Linear = modules.HungryLinear
 Orthlin = modules.OrthogonalLinear
 #settings :)
 
@@ -56,13 +56,14 @@ topoloss        = False
 acebtl          = False
 acl1            = False # unimplemented
 
+zeroinit        = False
 #ungraded
-fftmem          = True
+fftmem          = False
 qmem            = False
 mmnorm          = False
 normless        = False
-orthqkvc        = True
-orthHead        = True
+orthqkvc        = False
+orthHead        = False
 rmHead          = False
 
 nmix            = False
@@ -70,14 +71,20 @@ losspred        = False
 
 dynskip         = False
 k_atten         = False
-moe             = False
 sprs            = False
 wnll            = False
 
 csbr            = False
 
+posembdrop      = False
+
+exposemb        = False
+
 shenanigans     = False
 residless       = False
+
+residcomp       = False
+mhc_lr          = 0.01
 
 #known good
 ssmax           = True
@@ -115,19 +122,17 @@ class Attention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
+        self.q_attn = Linear(config.n_embd,  config.n_embd, bias=config.bias)
+        self.k_attn = Linear(config.n_embd,  config.n_embd, bias=config.bias)
+        self.v_attn = Linear(config.n_embd,  config.n_embd, bias=config.bias)
+        self.c_proj = Linear(config.n_embd,  config.n_embd, bias=config.bias)
+
         if orthqkvc:
             self.q_attn = Orthlin(config.n_embd,  config.n_embd, bias=config.bias)
             self.k_attn = Orthlin(config.n_embd,  config.n_embd, bias=config.bias)
             self.v_attn = Orthlin(config.n_embd,  config.n_embd, bias=config.bias)
             self.c_proj = Orthlin(config.n_embd,  config.n_embd, bias=config.bias)
-        
-        else:
-            self.q_attn = Linear(config.n_embd,  config.n_embd, bias=config.bias)
-            self.k_attn = Linear(config.n_embd,  config.n_embd, bias=config.bias)
-            self.v_attn = Linear(config.n_embd,  config.n_embd, bias=config.bias)
-        
-            # output projection
-            self.c_proj = Linear(config.n_embd,  config.n_embd, bias=config.bias)
+        #else:
         
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
@@ -216,65 +221,46 @@ class Kattention(nn.Module):
         return y
 
 
-class LearnableSpiral4D(nn.Module):
-    def __init__(self, init_freq=1.0, init_amp=1.0):
-        super().__init__()
-        
-        freqs = torch.ones(4) * init_freq + torch.randn(4) * 0.1
-        self.frequencies = nn.Parameter(freqs)
 
-        phases = torch.linspace(0, 2 * torch.pi, 5)[:-1] # 0, pi/2, pi, 3pi/2
-        self.phase_shifts = nn.Parameter(phases)
-
-        amps = torch.ones(4) * init_amp
-        self.amplitude_scales = nn.Parameter(amps)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.shape[-1] != 1:
-            b, t, c = x.shape
-            x = x.unsqueeze(-1)
-        sin_term = torch.sin(self.frequencies * x + self.phase_shifts)
-        
-        amp_term = self.amplitude_scales * x
-        
-        output = sin_term * amp_term
-        if x.shape[-1] != 1:
-            output = output.view(b,t,c*4)
-        return output
-
-def dtanh_bump(x):
-    # This is mathematically equivalent to sech^2(x)
-    # Peak is at 1.0, tails fall off cleaner than exp(-x^2)
-    t = torch.tanh(x)
-    return 1.0 - t.pow(2)
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.n_embd = config.n_embd
         up = 4
         if shenanigans:
-            self.sinner = modules.PerWeightActivationLayer(config.n_embd,config.n_embd,torch.sin,bias=False)
-            self.c_fc    = Linear(config.n_embd, up * config.n_embd, bias=config.bias)
-        
-            self.com = modules.FFTResampler(config.n_embd*up,config.n_embd,config.n_embd)
+            #self.sinner = modules.WonkyLinear(
+            #    config.n_embd, 
+            #    config.n_embd, 
+            #    activation=torch.sin, 
+            #    bias=False
+            #    )
+            self.sinner = quantizer.PadeKANLinear(
+                config.n_embd, 
+                config.n_embd, 
+            )
+           # self.base = nn.Linear(config.n_embd, config.n_embd, bias=False)
+            
+            #self.sinner2  = modules.WonkyLinear(up*config.n_embd, config.n_embd, activation=F.gelu, bias=False)
             return
         self.c_fc    = Linear(config.n_embd, up * config.n_embd, bias=config.bias)
-        self.c_fc2    = Linear(config.n_embd, up * config.n_embd, bias=config.bias)
+        self.gelu    = nn.GELU()
+        self.c_proj  = Linear( up * config.n_embd, config.n_embd, bias=config.bias)
         if(qrot):
             self.c_proj  = Linear( 2 * config.n_embd, config.n_embd, bias=config.bias)
-        else:
-            self.gelu    = nn.GELU()
-            self.c_proj  = Linear( up * config.n_embd, config.n_embd, bias=config.bias)
-            self.c_proj2  = Linear( up * config.n_embd, config.n_embd, bias=config.bias)
+        
 
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         if shenanigans:
-            return self.com(self.c_fc(x))
-            #return dtanh_bump(self.sinner(x))
-            #return self.sinner(x)
-        x = self.c_fc(x)
+            x = (self.sinner(x))
+            #x = self.base(x)
+            #x = F.gelu(x)
+            #x = self.sinner(x)
+            #x = self.sinner2(x)
+            return x# self.dropout(x)
+        else:
+            x = self.c_fc(x)
         if(qrot):
             x = self.qrot(x)
         else:
@@ -295,82 +281,37 @@ class MLP(nn.Module):
             #x_rotated = x_rotated*self.gaprelu(x_norm-2)#*torch.sigmoid(xm+ym)#
         return x_rotated.view(b, t, 2 * self.n_embd)
 
-class DynamicSparseMoE(nn.Module):
-    """A Sparse MoE layer using a dynamic, learnable Top-K."""
-    def __init__(self, config, num_experts):
-        super().__init__()
-        self.config = config
-        self.num_experts = num_experts
-        self.gate = nn.Linear(config.n_embd, num_experts)
-        config.n_embd = config.n_embd // num_experts
-        self.experts = nn.ModuleList([MLP(config) for _ in range(num_experts)])
-        config.n_embd = config.n_embd * num_experts
-
-
-    def forward(self, x):
-        gating_logits = self.gate(x) 
-        b, t, c = x.shape
-        flat_logits = gating_logits.view(-1, gating_logits.size(-1))
-        
-        gating_weights = quantizer.ThresHot.apply(flat_logits)
-       # gating_weights /= gating_weights.sum(dim=-1, keepdim=True).detach()
-        gating_weights = gating_weights.view(b, t, self.num_experts)
-        xchunked = x.view(b, t, self.config.n_embd // self.num_experts, self.num_experts)
-        expert_outputs = torch.stack([expert(xchunked[...,i]) for i, expert in enumerate(self.experts)], dim=2)
-        
-        return (gating_weights.unsqueeze(-1) * expert_outputs).view(b,t,c)
-        #return torch.sum(gating_weights.unsqueeze(-1) * expert_outputs, dim=2) 
-
-
-class Dynskip(nn.Module):
-    def __init__(self, config, n_layer):
-        super().__init__()
-        self.n_embd = config.n_embd
-        self.n_layer = n_layer
-        self.trunk = nn.ModuleList([
-            nn.Sequential(
-            nn.Linear(config.n_embd , config.n_embd),
-            nn.ReLU(),
-        ) for _ in range(n_layer)])
-        self.router = nn.Linear(config.n_embd*2, config.n_embd * n_layer)
-
-    def forward(self, x):
-        
-        intermediate_outputs = []
-        current_input = x
-        for layer in self.trunk:
-            current_input = layer(current_input)
-            intermediate_outputs.append(current_input)
-        
-        logits = self.router(torch.cat((x,current_input),dim=-1))
-        
-        logits = logits#.view(x.shape[0], x.shape[1], self.n_embd, self.n_layer)
-        #selection_mask = quantizer.TopKHot(logits, self.n_embd)
-
-        stacked_outputs = torch.stack(intermediate_outputs, dim=-1)
-        
-        return quantizer.GatherByGate(logits, stacked_outputs,2).sum(dim=-1)
-
         #masked_outputs = stacked_outputs * selection_mask
         #return torch.sum(masked_outputs, dim=-1)
         
-
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config)
+        self.attn = Attention(config)
+        self.attn2 = Attention(config)
         if(Qrotention):
             self.attn = modules.SSM(config.n_embd,config.dropout,config.bias)
         elif k_atten:
             self.attn = Kattention(config)
         
-        else:
-            self.attn = Attention(config)
+        self.shl = modules.SinkhornLinear(config.n_embd)#, config.n_embd)
+        self.shl2 = modules.SinkhornLinear(config.n_embd)#, config.n_embd)
+        with torch.no_grad():
+            self.shl.weight.data = (torch.eye(config.n_embd))
+            self.shl2.weight.data = (torch.eye(config.n_embd))
+            #self.shl.weight_param.data.add_(torch.randn(config.n_embd, config.n_embd) * 1e-5)
+            #self.shl2.weight_param.data.add_(torch.randn(config.n_embd, config.n_embd) * 1e-5)
+        #self.gate = Linear(config.n_embd,config.n_embd,config.bias)
+        #self.mod = Linear(config.n_embd,config.n_embd,config.bias)
+        #self.gate2 = Linear(config.n_embd,config.n_embd,config.bias)
+        #self.mod2 = Linear(config.n_embd,config.n_embd,config.bias)
+
+        self.ln_1 = LayerNorm(config)
         self.ln_2 = LayerNorm(config)
-        if moe:
-            self.mlp = DynamicSparseMoE(config, 10)
-        else:
-            self.mlp = MLP(config)
+        self.mlp = MLP(config)
+        self.ln_3 = LayerNorm(config)
+        self.ln_4 = LayerNorm(config)
+        self.mlp2 = MLP(config)
         self.register_buffer("block_input",torch.zeros([config.block_size, config.n_embd]))
         if fftmem:
             self.register_buffer("mem_input",torch.zeros([config.block_size, config.n_embd]))
@@ -380,14 +321,21 @@ class Block(nn.Module):
         
         if(Qrotention):
             x = x + self.attn(self.ln_1(x))[0]
-        else:
-            if residless:
-                x = self.attn(self.ln_1(x), causal)
-            else:
-                x = x + self.attn(self.ln_1(x), causal)
+            x = x + self.mlp(self.ln_2(x))
+            return x
+        
         if residless:
+            x = self.attn(self.ln_1(x), causal)
             x = self.mlp(self.ln_2(x))
+        elif residcomp:
+            #y = self.attn(self.ln_3(x), causal)
+            y = self.shl(x) 
+            x = y + self.attn(self.ln_1(x), causal)
+            #y = self.mlp(self.ln_4(x))
+            y = self.shl2(x) 
+            x = y + self.mlp(self.ln_2(x))
         else:
+            x = x + self.attn(self.ln_1(x), causal)
             x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -458,10 +406,15 @@ class GPT(nn.Module):
         config.mem_block_size = config.block_size #unfortunately uncoupling these proves difficult.
         blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         #blocks = nn.ModuleList([graphmodel.GraphFormerBlock(config) for _ in range(config.n_layer)])
+        if(exposemb):
+            wpe = nn.Embedding(config.internal_block_size//2, config.n_embd)
+        else:
+            wpe = nn.Embedding(config.internal_block_size, config.n_embd)
+
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             
-            wpe = nn.Embedding(config.internal_block_size, config.n_embd),
+            wpe = wpe,
             drop = nn.Dropout(config.dropout),
             h = blocks,
             ln_f = LayerNorm(config),
@@ -519,7 +472,7 @@ class GPT(nn.Module):
             else:
                 self.lm_head = Linear(config.n_embd, config.vocab_size, bias=False)
                 self.transformer.wte.weight = self.lm_head.weight 
-                # https://paperswithcode.com/method/weight-tying
+            # https://paperswithcode.com/method/weight-tying
             
             if rmHead:
                 nn.init.orthogonal_(self.lm_head.weight)
@@ -582,11 +535,15 @@ class GPT(nn.Module):
         self.gradsink = nn.Parameter(torch.randn(config.n_embd))
         self.predict_weight = 0.01
         # init all weights
-        self.apply(self._init_weights)
-        # apply special scaled init to the residual projections, per GPT-2 paper
-        for pn, module in self.named_parameters():
-            if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(module, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+        if zeroinit:
+            self.apply(self._zero_init_weights)
+            
+        else:
+            self.apply(self._init_weights)
+            # apply special scaled init to the residual projections, per GPT-2 paper
+            for pn, module in self.named_parameters():
+                if pn.endswith('c_proj.weight'):
+                    torch.nn.init.normal_(module, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
         self.laim = 0.1
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
@@ -595,7 +552,7 @@ class GPT(nn.Module):
         with torch.no_grad():
             self.gradsink.data = torch.randn(self.config.n_embd, device=self.gradsink.device)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, decaying = 0.0, get_emb = False):
         #self.config.step += 1.0
         #torch.compiler.cudagraph_mark_step_begin()
         device = idx.device
@@ -608,13 +565,29 @@ class GPT(nn.Module):
             )
         #end_tok=torch.as_tensor(self.end_patch_token_id, device=device, dtype=torch.long)
         #patch_max=torch.as_tensor(self.patch_max, device=device, dtype=torch.long)
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        if not exposemb:
+            assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         
         
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
         tok_emb = self.transformer.wte(idx)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (b, t, n_embd)
-        x = tok_emb + pos_emb
+        pos_emb = None
+        if exposemb:
+            pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+            pos = pos%(self.config.block_size//2)
+            pos_emb = self.transformer.wpe(pos) # position embeddings of shape (b, t, n_embd)
+        else:
+            pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+            pos_emb = self.transformer.wpe(pos) # position embeddings of shape (b, t, n_embd)
+        
+        if(posembdrop):
+            noiseramp = torch.randn_like(pos_emb) * (1-decaying)
+            demb = (pos_emb+noiseramp) * decaying
+            x = tok_emb + demb 
+        else:
+            x = tok_emb + pos_emb
+        if get_emb:
+            x.retain_grad()
+            f_emb =  x
         if qope:
             pos_emb = pos_emb.view(1, t, self.config.n_embd//4, 4)
             tok_emb = tok_emb.view(b, t, self.config.n_embd//4, 4)
@@ -716,6 +689,8 @@ class GPT(nn.Module):
             #TODO: wavelet loss
 
             if self.training:
+                #reg_loss = utils.surface_minimize(f_emb, x)
+                #loss = loss + reg_loss
                 if wnll:
                     loss = loss + self.wnl(x)
                 if losspred:
@@ -744,7 +719,9 @@ class GPT(nn.Module):
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
-
+        if get_emb:
+            return logits, loss, f_emb, x
+        
         return logits, loss
 
     def acebtl(self, x, tok_emb):
@@ -802,12 +779,24 @@ class GPT(nn.Module):
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        
+        mhc_params = []
+        decay_params = []
+        nodecay_params = []
+
+        for n, p in param_dict.items():
+            # Check for the Sinkhorn layer name from your Block definition (self.shl)
+            if 'shl' in n:
+                mhc_params.append(p)
+            elif p.dim() >= 2:
+                decay_params.append(p)
+            else:
+                nodecay_params.append(p)
         
         optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0},
+            {'params': decay_params,    'weight_decay': weight_decay},
+            {'params': nodecay_params,  'weight_decay': 0.0},
+            {'params': mhc_params,      'weight_decay': 0.0, 'lr_scale': mhc_lr},
             #{'params': self_lr, 'lr': 1.0},
         ]
         num_decay_params = sum(p.numel() for p in decay_params)
@@ -1241,6 +1230,14 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
         elif isinstance(module, nn.Conv1d):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    
+    def _zero_init_weights(self, module):
+        if isinstance(module, Linear):
+            torch.nn.init.zeros_(module.weight)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.zeros_(module.weight)
 
 
     def crop_block_size(self, block_size):

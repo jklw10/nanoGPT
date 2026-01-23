@@ -9,17 +9,18 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import tiktoken
 import modules
 import quantizer
 import utils
 
-dataset = "shakespeare_char"
+#dataset = "shakespeare_char"
+dataset = "openwebtext"
 data_dir = os.path.join('data', dataset)
 batch_size = 64
 block_size = 256
 
-DIM_L1 = 64
+DIM_L1 = 32
 DIM_L2 = 128
 DIM_L3 = 256
 
@@ -28,14 +29,17 @@ K_GATHER_L2 = 16
 
 mem_size = 48
 
-max_iters = 30000
+dropout = 0.1
+max_iters = 50000
+
 eval_interval = 1000
 learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 device_type = 'cuda'
 skiptok = 1
 warmup_iters = 200
-lr_decay_iters = 15000
+lr_decay_iters = 30000
+decay_iters = 5000
 min_lr = 1e-4
 
 idk_enabled = False
@@ -65,36 +69,27 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) 
     return min_lr + coeff * (learning_rate - min_lr)
 
-if not os.path.exists(data_dir):
-    os.makedirs(data_dir, exist_ok=True)
-    url = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
-    with open(os.path.join(data_dir, 'input.txt'), 'w', encoding='utf-8') as f: 
-        f.write(requests.get(url).text)
-    with open(os.path.join(data_dir, 'input.txt'), 'r') as f: 
-        data = f.read()
-    chars = sorted(list(set(data)))
-    vocab_size = len(chars)
-    stoi = { ch:i for i,ch in enumerate(chars) }
-    itos = { i:ch for i,ch in enumerate(chars) }
-    n = len(data)
-    train_data = data[:int(n*0.9)] 
-    val_data = data[int(n*0.9):]
-    train_ids = np.array([stoi[c] for c in train_data], dtype=np.uint16)
-    val_ids = np.array([stoi[c] for c in val_data], dtype=np.uint16)
-    train_ids.tofile(os.path.join(data_dir, 'train.bin'))
-    val_ids.tofile(os.path.join(data_dir, 'val.bin'))
-    meta = {'vocab_size': vocab_size, 'itos': itos, 'stoi': stoi}
-    with open(os.path.join(data_dir, 'meta.pkl'), 'wb') as f:
-        pickle.dump(meta, f)
-meta_path = os.path.join(data_dir, 'meta.pkl')
-with open(meta_path, 'rb') as f: 
-    meta = pickle.load(f)
-vocab_size = meta['vocab_size']
-if idk_enabled:
-    idk_token = vocab_size
-    vocab_size += 1
+if dataset == "openwebtext":
+    vocab_size = 256
+    if idk_enabled:
+        idk_token = vocab_size
+        vocab_size += 1
+else:
+    asdf = os.path.join('data', 'shakespeare_char')
+    meta_path = os.path.join(asdf, 'meta.pkl')
+
+    with open(meta_path, 'rb') as f: 
+        meta = pickle.load(f)
+    vocab_size = meta['vocab_size']
+    if idk_enabled:
+        idk_token = vocab_size
+        vocab_size += 1
+
 
 def get_batch(split):
+    if dataset == "openwebtext":
+        return get_batch_from_tokens(split, batch_size, block_size, device, data_dir)
+
     data = np.memmap(os.path.join(data_dir, f'{split}.bin'), dtype=np.uint16, mode='r')
     ix = torch.randint(len(data) - block_size-skiptok, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
@@ -105,6 +100,50 @@ def get_batch(split):
         x, y = x.to(device), y.to(device)
     return x, y
 
+if dataset == "openwebtext":
+    print("Building token-to-byte lookup table...")
+    enc = tiktoken.get_encoding("gpt2")
+    TOKEN_TO_BYTES = [torch.tensor(list(enc.decode_bytes([i])), dtype=torch.uint8) for i in range(enc.n_vocab)]
+
+def get_batch_from_tokens(split, batch_size, block_size, device, data_dir):
+    """
+    Reads compressed BPE tokens (uint16) from disk, 
+    converts to raw bytes (uint8) in memory, 
+    and returns a batch of byte-level data.
+    """
+    
+    data_path = os.path.join(data_dir, f'{split}.bin')
+    data_tokens = np.memmap(data_path, dtype=np.uint16, mode='r')
+    
+    fetch_len = max(block_size, 32) 
+    
+    ix = torch.randint(len(data_tokens) - fetch_len, (batch_size,))
+    
+    batch_bytes = []
+    
+    for i in ix:
+        token_chunk = data_tokens[i : i + fetch_len].astype(np.int64)
+        
+        byte_seq = torch.cat([TOKEN_TO_BYTES[t] for t in token_chunk])
+        
+        if len(byte_seq) < block_size + 1:
+            token_chunk = data_tokens[i : i + fetch_len * 2].astype(np.int64)
+            byte_seq = torch.cat([TOKEN_TO_BYTES[t] for t in token_chunk])
+            
+        batch_bytes.append(byte_seq[:block_size + 1])
+
+    data = torch.stack(batch_bytes).to(torch.int64)
+    
+    if device == 'cuda':
+        data = data.pin_memory().to(device, non_blocking=True)
+    else:
+        data = data.to(device)
+        
+    x = data[:, :block_size]
+    y = data[:, 1:block_size+1]
+    
+    return x, y
+wn = torch.nn.utils.parametrizations.weight_norm
 class Patcher(nn.Module):
     def __init__(self, outer_dim, inner_dim, outer_seq, inner_seq):
         super().__init__()
@@ -115,8 +154,8 @@ class Patcher(nn.Module):
         self.up_scan = modules.Block(outer_dim,4,0.0,False)
         self.up_proj = Linear(outer_dim,inner_dim)
         self.AE = quantizer.Autoencoder(inner_dim,inner_dim,inner_dim,inner_dim,quantizer.ThresHot)
-        self.resid_up = Linear(outer_dim, inner_dim)
-        
+        self.resid_up = wn(nn.Linear(outer_dim, inner_dim))
+        self.resid_drop = nn.Dropout(dropout)
         self.output_pos_emb = Linear(outer_seq, inner_dim)
         
         self.down_scatter = modules.CombineBlock(inner_dim, 4, 0.0,False)
@@ -139,9 +178,9 @@ class Patcher(nn.Module):
         )
 
 
+        self.res_norm = modules.LayerNorm(inner_dim, False)
         self.down_norm = modules.LayerNorm(inner_dim, False)
         self.gate_norm = modules.LayerNorm(outer_seq, False)
-        self.down_scan = modules.Block(outer_dim, 4, 0.0,False)
 
         self.up_norm = modules.LayerNorm(outer_dim, False)
         self.upgate_norm = modules.LayerNorm(outer_seq, False)
@@ -169,10 +208,14 @@ class Patcher(nn.Module):
         #compressed sensing says that random samples should suffice?
         
         #TODO
-        gathered = self.query_block(x, causal = False)#AE causality requires causality here
+        gathered = self.query_block(x, causal = False)
         gathered = gathered[:,-self.inner_seq:,:]#usefullness requires a real gather here.
         
+        #gate = self.up_gate(gathered).squeeze(-1)
         
+        #_,gidx = torch.topk(gate,self.inner_seq)
+        #eidx = gidx.unsqueeze(-1).expand(-1, -1, x.shape[-1])
+        #gathered = torch.gather(gathered,1,eidx)
         #_,idx = torch.topk(gate,self.inner_seq)
         ###idx = utils.bluenoise_indices(x.shape[0], self.outer_seq, self.inner_seq,device=x.device)
         ##
@@ -183,12 +226,13 @@ class Patcher(nn.Module):
         up = self.up_proj(gathered)
         ae_up, hot = self.AE(up)
         aux = F.mse_loss(up, ae_up)
-        return ae_up, [x,hot, None, aux]
+        return ae_up, [x, hot, None, aux]
     
-    def abstract_down(self, x, residual):
+    def abstract_down(self, x, residual, decaying =  None):
         #sg = self.down_gate(x[...,:self.sdim].reshape(x.shape[0], self.inner_seq*self.sdim))
         residual, hot, _, upaux = residual
         aux=0
+        x = self.down_norm(x)
         if ael:
             aux = F.binary_cross_entropy(self.AE.quant(x)[:,:-1,:], hot.detach()[:,1:,:])#ablate
         #pgd = p_down = self.down_proj(x)
@@ -202,13 +246,27 @@ class Patcher(nn.Module):
         pos_emb = self.output_pos_emb(phot).expand(x.shape[0],-1,-1)
         #query = scattered + pos_emb 
         query = pos_emb 
+        
         pds = self.down_scatter(x, query, causal=False)#maybe detach.
         pds = self.down_proj(pds)
-        
+            
+        aux3 = 0.0
         if resid:
-            query = query + self.resid_up(residual)
+            query = self.res_norm(query)
+            if decaying is not None:
+                
+                cosdec = torch.cos((1.0-decaying) * (math.pi / 2))
+
+                cosdec = torch.clamp(cosdec,0.0,1.0)
+                aux3 = F.mse_loss(pds,residual.detach())*cosdec
+                d = residual * cosdec#decaying#(1.0-decaying)
+                if self.training:
+                    noise = torch.randn_like(d) * (1-cosdec)
+                    d = d+noise
+                query = query + self.resid_up(d.detach())
+
+            
         #scattered = torch.zeros(x.shape[0], self.outer_seq, x.shape[2], dtype=x.dtype, device=x.device)
-        #
         #_,idx = torch.topk(gate,self.inner_seq)
         #eidx = idx.unsqueeze(-1).expand(-1, -1, x.shape[-1])
         #scattered.scatter_(1, eidx, x)
@@ -219,7 +277,7 @@ class Patcher(nn.Module):
         p_down = self.down_scatter2(pds, query, causal=True)#
         #pds = self.down_scatter(x, pos_emb)# self.resid_up(residual))
         #p_down=residual+p_down
-        aux = aux+upaux
+        aux = aux+upaux+aux3
         return self.down_scan(p_down), aux
     
     def forward(self, x, center):
@@ -240,10 +298,13 @@ class HNet(nn.Module):
             Patcher(DIM_L1,DIM_L2,block_size,K_GATHER_L1),
             Patcher(DIM_L2,DIM_L3,K_GATHER_L1,K_GATHER_L2),
         ])
-        self.innerb = modules.Block(DIM_L3,4,0.0,False)
-        self.innerb2 = modules.Block(DIM_L3,4,0.0,False)
+        
+        self.inner = nn.ModuleList([
+            modules.Block(DIM_L3,4,0.0,False) for _ in range(4)
+        ])
         
         if mem:
+            self.mem_block_size=mem_size
             memconf = {
                 'mem_block_size': mem_size,
                 'dropout': 0.0,
@@ -251,11 +312,10 @@ class HNet(nn.Module):
                 'n_head': 4,
                 'bias': False,
             }
-            self.mem_block_size=memconf['mem_block_size']
             self.register_buffer('memory', torch.randn(1, self.mem_block_size, DIM_L3)*1e-5)
             self.memory_frozen = False
             self.cmem= True
-            self.dreamer = modules.Dreamer(causal=self.cmem, **memconf)
+            self.dreamer = modules.Dreamer(**memconf)
             self.memory_selector = modules.Block(**memconf)
 
     def mem_form(self, x):
@@ -269,7 +329,7 @@ class HNet(nn.Module):
                 self.memory = (self.memory+update*malpha)
     
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, decaying = None):
         device = idx.device
         b, t = idx.shape
         
@@ -283,15 +343,16 @@ class HNet(nn.Module):
             
             x, res = layer.abstract_up(x)
             residuals.append(res)
+
         if mem:
             x = self.mem_center(x)
         else:
-            x = self.innerb(x)
-            x = self.innerb2(x)
+            for block in self.inner:
+                x = block(x)
         aux=0
         for i in reversed(range(len(self.sLayers))):
             layer = self.sLayers[i]
-            x, auxl = layer.abstract_down(x, residuals[i])
+            x, auxl = layer.abstract_down(x, residuals[i], decaying = decaying)
             aux = aux+auxl
         
         if targets is None: #during inference skip the losses
@@ -335,8 +396,8 @@ class HNet(nn.Module):
         cb,ct,cc = x.shape
         x1 = x
         x = torch.cat([self.memory.expand(cb,-1,-1), x],dim=1) #probably needs a batch swizzle to pervent cheating
-        x = self.innerb(x)
-        x = self.innerb2(x)
+        for block in self.inner:
+            x = block(x)
         
         if not self.training:
             return x[:,self.mem_block_size:,:].contiguous()
@@ -349,8 +410,8 @@ class HNet(nn.Module):
             mh2 = ((self.memory+self.mem_form(x[cb//2:,...])*malpha)).expand(cb//2,-1,-1)
             mem2 = torch.cat([mh2,mh1],dim=0)
         x = torch.cat([mem2, x1],dim=1) #try what memorization enhances the score
-        x = self.innerb(x)
-        x = self.innerb2(x)
+        for block in self.inner:
+            x = block(x)
         
         self.mem_update(self.mem_form(x),malpha)
         x = x[:,self.mem_block_size:,:].contiguous()
@@ -512,7 +573,9 @@ t0 = time.time()
 t2 = time.time()
 for iter in range(max_iters):
     lr = get_lr(iter)
-    
+    decaying = 1.0 - (iter / decay_iters)
+    decaying = torch.tensor(decaying, device=device, dtype=torch.float32)
+    decaying = torch.clamp(decaying, 0.0, 1.0)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     if iter % eval_interval == 0 or iter == max_iters - 1:
@@ -523,7 +586,7 @@ for iter in range(max_iters):
         for split in ['train', 'val']:
             X_val, Y_val = get_batch(split)
             with torch.no_grad():
-                _, loss, gloss = model(X_val, Y_val)
+                _, loss, gloss = model(X_val, Y_val, decaying= decaying)
             losses[split] = loss.detach().item()
             if genloss and split == 'val':
                 glosses[split] = gloss.detach().item()
@@ -535,7 +598,7 @@ for iter in range(max_iters):
         model.train()
         t0 = time.time()
     X, Y = get_batch('train')
-    logits, loss, gloss = model(X, Y)
+    logits, loss, gloss = model(X, Y, decaying= decaying)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     
@@ -550,23 +613,26 @@ for iter in range(max_iters):
             utils.softwnorm(model,1e-4)
     
 if gen:
-    meta_path = os.path.join('data', 'shakespeare_char/meta.pkl')
-
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    stoi, itos = meta['stoi'], meta['itos']
-    def encode(s): 
-        return [stoi[c] for c in s]
-    def decode(ll):
-        decoded = []
-        for i in ll:
-            if i in itos:
-                decoded.append(itos[i])
-            elif i == idk_token:
-                decoded.append('[IDK]')
-            else:
-                decoded.append(f'[UNK{i}]')  # Or another placeholder for unknown tokens
-        return ''.join(decoded)
+    if dataset== "openwebtext":
+        def decode(ll):
+            valid_bytes = [b for b in ll if b < 256] 
+            return bytes(valid_bytes).decode('utf-8', errors='replace')
+    else:
+        with open(meta_path, 'rb') as f:
+            meta = pickle.load(f)
+        stoi, itos = meta['stoi'], meta['itos']
+        def encode(s): 
+            return [stoi[c] for c in s]
+        def decode(ll):
+            decoded = []
+            for i in ll:
+                if i in itos:
+                    decoded.append(itos[i])
+                elif i == idk_token:
+                    decoded.append('[IDK]')
+                else:
+                    decoded.append(f'[UNK{i}]')  # Or another placeholder for unknown tokens
+            return ''.join(decoded)
 
     print("sanity check")
     X, Y = get_batch('train')

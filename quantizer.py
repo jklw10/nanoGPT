@@ -5,11 +5,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim.adamw
 import torchvision
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, random_split
 
 import modules
+import optim
 import utils
 
 class AsymmetricCausalGate(torch.autograd.Function):
@@ -322,9 +324,9 @@ class ThresHot(torch.autograd.Function):
         with torch.no_grad():
             g_mean = torch.mean(g, dim=-1, keepdim=True)
             
-            soft_target = torch.where(g < g_mean, 1.0, 0.0)
+            hard_target = torch.where(g < g_mean, 1.0, 0.0)
 
-        grad_x = F.sigmoid(x) - soft_target
+        grad_x = F.sigmoid(x) - hard_target
         return grad_x
 
 class ThresHot2(torch.autograd.Function):
@@ -417,6 +419,126 @@ def b_spline_basis(x, knots, degree):
 
     return b
 
+
+class PadeKANLinear(nn.Module):
+    def __init__(self, in_features, out_features, num_degree=3, den_degree=2):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.num_degree = num_degree
+        self.den_degree = den_degree
+        
+        # 1. Internal Normalization (CRITICAL for Polynomial stability)
+        # Keeps x in a range where x^N doesn't explode
+        self.norm = nn.LayerNorm(in_features)
+        
+        # 2. Base Linear Layer (The "Safe Path")
+        # This ensures the model learns at least as well as a standard Linear layer.
+        self.base_linear = nn.Linear(in_features, out_features)
+        
+        # 3. Pade Coefficients
+        # Numerator: Initialize with Xavier/Kaiming logic
+        # We want the Pade part to start small and grow, so we scale it down.
+        self.num_coefs = nn.Parameter(torch.empty(in_features, out_features, num_degree + 1))
+        nn.init.xavier_normal_(self.num_coefs, gain=0.01) # Start with small contribution
+        
+        # Denominator: Initialize to ZERO
+        # This means Q(x) = 1 + 0 = 1.
+        # The model starts as a purely Polynomial approximation.
+        self.den_coefs = nn.Parameter(torch.zeros(in_features, out_features, den_degree))
+
+    def forward(self, x):
+        # x shape: (Batch, Time, In)
+        
+        # --- Path A: Standard Linear (Stability) ---
+        base_out = self.base_linear(x)
+        
+        # --- Path B: Pade Non-Linearity ---
+        # 1. Normalize input for numerical stability of powers
+        x_norm = self.norm(x)
+        
+        # Flatten for computation
+        original_shape = x.shape
+        x_flat = x_norm.reshape(-1, self.in_features) # (Total, In)
+        
+        # 2. Precompute Powers
+        # x_flat: (Total, In, 1)
+        x_expanded = x_flat.unsqueeze(-1)
+        
+        n_pow = torch.arange(self.num_degree + 1, device=x.device).float()
+        d_pow = torch.arange(1, self.den_degree + 1, device=x.device).float()
+        
+        x_num_pow = torch.pow(x_expanded, n_pow) # (Total, In, P_n)
+        x_den_pow = torch.pow(x_expanded, d_pow) # (Total, In, P_d)
+        
+        # 3. Pade Math (Optimized permutes)
+        # Numerator
+        # (Total, In, P) @ (In, P, Out) -> (Total, In, Out) -> Sum(1) -> (Total, Out)
+        # We combine the aggregation step to save memory
+        
+        # Numerator: P(x)
+        # (Total, In, P_n) -> (In, Total, P_n)
+        xn_t = x_num_pow.permute(1, 0, 2)
+        wn_t = self.num_coefs.permute(0, 2, 1) 
+        P_x = (xn_t @ wn_t).permute(1, 0, 2) # (Total, In, Out)
+        
+        # Denominator: Q(x)
+        xd_t = x_den_pow.permute(1, 0, 2)
+        wd_t = self.den_coefs.permute(0, 2, 1)
+        Q_x = (xd_t @ wd_t).permute(1, 0, 2) # (Total, In, Out)
+        Q_x = 1.0 + Q_x # Add bias of 1
+        
+        # 4. Rational Calculation
+        epsilon = 1e-5 
+        # (Total, In, Out)
+        pade_out = P_x / (Q_x + epsilon) 
+        
+        # 5. Aggregate (Sum over Input features)
+        # This is the "KAN" magic step
+        pade_out = torch.sum(pade_out, dim=1) # (Total, Out)
+        
+        # Reshape
+        pade_out = pade_out.view(original_shape[:-1] + (self.out_features,))
+        
+        # --- Combine Paths ---
+        # Result is Linear + NonLinear correction
+        return base_out + pade_out
+class PadeActivation(nn.Module):
+    def __init__(self, in_features, out_features, num_degree=5, den_degree=4):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.num_degree = num_degree
+        self.den_degree = den_degree
+        
+        self.num_coefs = nn.Parameter(
+            torch.randn(in_features, out_features, num_degree + 1) * 0.01
+        )
+        
+        self.den_coefs = nn.Parameter(
+            torch.randn(in_features, out_features, den_degree) * 0.01
+        )
+        
+    def forward(self, x):
+        batch_size = x.shape[0]
+        
+        x_expanded = x.unsqueeze(-1) # (B, In, 1)
+        num_powers = torch.arange(self.num_degree + 1, device=x.device).float()
+        x_num_pow = torch.pow(x_expanded, num_powers) 
+        
+        den_powers = torch.arange(1, self.den_degree + 1, device=x.device).float()
+        x_den_pow = torch.pow(x_expanded, den_powers)
+        
+        P_x = torch.einsum('bip,iop->bio', x_num_pow, self.num_coefs)
+        
+        Q_x_poly = torch.einsum('bip,iop->bio', x_den_pow, self.den_coefs)
+        Q_x = 1.0 + Q_x_poly
+        
+        epsilon = 1e-7
+        phi_x = P_x / (Q_x + epsilon)
+        
+        y = torch.sum(phi_x, dim=1) 
+        return y
 
 class BSplineActivation(nn.Module):
     def __init__(self, in_features, n_basis=16, degree=8, grid_min=-2.0, grid_max=2.0):
@@ -905,32 +1027,18 @@ class debugAutoencoder(nn.Module):
         q = self.codebook(k_hot)
         return self.decoder(q)
 
+    
     def optimizer(self, LR):
-        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
-
-        ae_params = []
-        k_selector_params = []
-
-        for name, param in param_dict.items():
-            if name.startswith('k_predictor') or name.startswith('k_bias'):
-                k_selector_params.append(param)
-            else:
-                ae_params.append(param)
-        num_ae = sum(p.numel() for p in ae_params)
-        num_k_sel = sum(p.numel() for p in k_selector_params)
-        print(f"ae parameter tensors: {len(ae_params)}, with {num_ae:,} parameters")
-        print(f"k selector parameter tensors: {len(k_selector_params)}, with {num_k_sel:,} parameters")
-
-        optim_groups = [
-            {'params': ae_params, 'lr': LR},
-            {
-                'params': k_selector_params,
-                'lr': LR ,#* 0.01,
-                #'weight_decay': 0.0,  # CRITICAL: No decay for the bias
-                #'betas': (0.0, 0.999),
-            }
-        ]
-        return torch.optim.AdamW(optim_groups, lr=LEARNING_RATE) 
+        num_ae = sum(p.numel() for p in self.parameters())
+        print(f"ae parameters: {num_ae}")
+        return optim.Grms(params=self.parameters(), 
+            lr=LR, 
+            #nesterov    = True, 
+            #momentum    = 0.9,
+            fused       = True,
+            #weight_decay= 0.01
+            )
+        #return torch.optim.adamw(params=self.parameters(), lr=LR, fused=True)
     
 class Gumbell(nn.Module):
     def __init__(self,k):
@@ -993,9 +1101,6 @@ def calculate_perplexity(logits):
     entropy = -torch.sum(probs * torch.log(probs + 1e-10))
     perplexity = torch.exp(entropy)
     return perplexity.mean().detach().item()
-
-
-
 
 @torch.no_grad()
 def run_validation(model, val_loader, device, num_batches=10):
@@ -1095,7 +1200,8 @@ if __name__ == '__main__':
         #"CER k 1":    Autoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopOneHot,  1),
         #"CER2 k 1":   debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHot,    1),
         "thot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, ThresHot, nn.SiLU, 32),
-        "thot2":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, ThresHotV2, nn.SiLU, 32),
+        
+        #"thot2":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, ThresHotV2, nn.SiLU, 32),
         
         #"bspline":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHotBCE, BSplineActivation, 32),
         #"GatherByGate": GatherByGateAutoencoder(input_dim=INPUT_DIM,hidden_dim=HIDDEN_DIM,embed_dim=EMBED_DIM,quant_dim=QUANT_DIM, k=32),

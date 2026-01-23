@@ -4,14 +4,12 @@ import time
 
 #os.environ['CUDA_LAUNCH_BLOCKING'] = "0" 
 from cut_cross_entropy import linear_cross_entropy
-import cut_cross_entropy
-import requests
+
 import pickle
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass
 
 import modules
 import quantizer
@@ -38,7 +36,6 @@ min_lr = learning_rate/10
 
 torch._inductor.config.disable_cpp_codegen = True
 
-ccc         = True
 idk_enabled = False
 cl          = False
 mem         = False
@@ -66,61 +63,95 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) 
     return min_lr + coeff * (learning_rate - min_lr)
 
-if not os.path.exists(data_dir):
-    os.makedirs(data_dir, exist_ok=True)
-    url = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
-    with open(os.path.join(data_dir, 'input.txt'), 'w', encoding='utf-8') as f: 
-        f.write(requests.get(url).text)
-    with open(os.path.join(data_dir, 'input.txt'), 'r') as f: 
-        data = f.read()
-    chars = sorted(list(set(data)))
-    vocab_size = len(chars)
-    stoi = { ch:i for i,ch in enumerate(chars) }
-    itos = { i:ch for i,ch in enumerate(chars) }
-    n = len(data)
-    train_data = data[:int(n*0.9)] 
-    val_data = data[int(n*0.9):]
-    train_ids = np.array([stoi[c] for c in train_data], dtype=np.uint16)
-    val_ids = np.array([stoi[c] for c in val_data], dtype=np.uint16)
-    train_ids.tofile(os.path.join(data_dir, 'train.bin'))
-    val_ids.tofile(os.path.join(data_dir, 'val.bin'))
-    meta = {'vocab_size': vocab_size, 'itos': itos, 'stoi': stoi}
-    with open(os.path.join(data_dir, 'meta.pkl'), 'wb') as f:
-        pickle.dump(meta, f)
-if dataset == "shakespeare_char":
-    meta_path = os.path.join(data_dir, 'meta.pkl')
-    with open(meta_path, 'rb') as f: 
-        meta = pickle.load(f)
-    vocab_size = meta['vocab_size']
-    if idk_enabled:
-        idk_token = vocab_size
-        vocab_size += 1
-else:
-    vocab_size = 50304
+dataset = 'openwebtext'
+always_byte=True
+decode, vocab_size = utils.get_meta(dataset,always_byte)
+get_batch = utils.get_get_batch(block_size,batch_size,dataset,device,always_byte=always_byte,single=True)
+print(f"vocab: {vocab_size}")
 
-def get_batch(split):
-    data = np.memmap(os.path.join(data_dir, f'{split}.bin'), dtype=np.uint16, mode='r')
-    
-    # We grab block_size + 2 tokens total
-    ix = torch.randint(len(data) - (block_size + 2), (batch_size,))
-    
-    # One single tensor fetch
-    chunk = torch.stack([torch.from_numpy((data[i:i+block_size+2]).astype(np.int64)) for i in ix])
-    
-    if device_type == 'cuda': 
-        chunk = chunk.pin_memory().to(device, non_blocking=True)
-    else: 
-        chunk = chunk.to(device)
+
+class SSM(nn.Module):
+    def __init__(self, n_embd, dropout, bias):
+        super().__init__()
+        self.lanes=4
+        #n_embd=n_embd*self.lanes
+        self.q_attn =  nn.Linear(n_embd, n_embd, bias=bias)
+        self.v_attn =  nn.Linear(n_embd, n_embd, bias=bias)
         
-    return chunk
+        self.c_proj = nn.Linear(n_embd,  n_embd, bias=bias)
 
+        self.identity = nn.Parameter(torch.rand(n_embd))
+        
+        self.attn_dropout = nn.Dropout(dropout) #todo
+        self.resid_dropout = nn.Dropout(dropout) #todo
+        self.n_embd = n_embd
+        self.dropout = dropout
+        self.up =  nn.Linear(n_embd, n_embd, bias=bias)
+        self.scanner = modules.ProcrustesButterflyLinear(n_embd)
+    
+    def get_weight(self):
+        return self.scanner.compute_orthogonal_weights()
+    def get_scan(self,weight,dtype):
+        def scan(left, right):
+            left, right = torch.broadcast_tensors(left, right)
+            
+            B_curr, T_curr, C_curr = left.shape
+            
+            head_dim = C_curr // self.lanes
+
+            q = left.view(B_curr, T_curr, self.lanes, head_dim)
+            k = right.view(B_curr, T_curr, self.lanes, head_dim)
+            
+            v = self.scanner(left, right, weight)
+            v = v.view(B_curr, T_curr, self.lanes, head_dim)
+
+            z = F.scaled_dot_product_attention(q, k, v)
+
+            denom = (1.0 + torch.arange(0, self.lanes, device=left.device)).view(1, 1, self.lanes, 1)
+            
+            z = utils.rms(z,dim=-1) / denom
+            
+            z = z.reshape(B_curr, T_curr, C_curr)
+            
+            return (left + z).to(dtype)
+        return scan
+    def forward(self, x: torch.tensor, weight = None): #same signature to allow easy swapping.
+        B, T, C = x.size() 
+        #q = self.q_attn(x) 
+        q = self.up(x) 
+        v = self.v_attn(x)
+        if weight is None:
+            weight = self.scanner.compute_orthogonal_weights()
+        scan = self.get_scan(weight,x.dtype)
+        q = utils.pscan2(q, scan, self.identity)
+        
+        Y = q*v 
+        Y = self.c_proj(Y)
+        Y = self.resid_dropout(Y)
+        return Y, q
+    
+    def nexts(self, prev: torch.tensor, x: torch.tensor,  causal=False, weight = None): #same signature to allow easy swapping.
+        B, T, C = x.size() 
+        q = self.q_attn(x) 
+        v = self.v_attn(x)
+        if weight is None:
+            weight = self.scanner.compute_orthogonal_weights()
+        
+        scan = self.get_scan(weight,x.dtype)
+        q = scan(prev,q)
+        
+        Y = q*v 
+        Y = self.c_proj(Y)
+        Y = self.resid_dropout(Y)
+        return Y, q
+    
 class Block(nn.Module):
     def __init__(self, n_embed, dropout, bias):
         super().__init__()
         self.ln_1 = modules.LayerNorm(n_embed, bias)
-        self.attn = modules.SSM(n_embed, dropout, bias)
+        self.attn = SSM(n_embed, dropout, bias)
         self.ln_2 = modules.LayerNorm(n_embed, bias)
-        self.mlp = modules.MLP(n_embed, dropout, bias)
+        self.mlp  = modules.MLP(n_embed, dropout, bias)
     def get_weight(self):
         return self.attn.get_weight()
     def forward(self, x, prev=None, weights=None):
@@ -131,87 +162,7 @@ class Block(nn.Module):
         x = x + attn_output
         x = x + self.mlp(self.ln_2(x))
         return x, present_key_values
-def compute_discounted_return(rewards, gamma=0.95):
-    r_flipped = torch.flip(rewards, dims=[1])
-    
-    if gamma == 1.0:
-        returns = torch.cumsum(r_flipped, dim=1)
-    else:
-        B, T = rewards.shape
-        returns = torch.zeros_like(rewards)
-        running_add = torch.zeros(B, device=rewards.device)
-        
-        for t in range(T):
-            running_add = r_flipped[:, t] + gamma * running_add
-            returns[:, t] = running_add
-            
-    return torch.flip(returns, dims=[1])
 
-def CE_bkw(logits, target_indices):
-    #try sigmoid at some point
-    probs = F.softmax(logits, dim=-1)
-    
-    target_hot = torch.zeros_like(probs)
-    target_hot.scatter_(-1, target_indices.unsqueeze(-1), 1.0)
-    
-    return probs - target_hot
-
-class HypothesisLoss(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, g1, g2, g3, idx_data):
-        
-        ctx.save_for_backward(g1, g2, g3, idx_data)
-        
-        return F.cross_entropy(g1.reshape(-1, g1.size(-1)), idx_data[:, 1:-1].reshape(-1))
-        
-    @staticmethod
-    def backward(ctx, grad_output):
-        g1, g2, g3, idx_data = ctx.saved_tensors
-        
-        idx_data_flat = idx_data.view(-1, 1)
-        g1_flat = g1.view(-1, 1)
-        g2_flat = g2.view(-1, 1)
-        g3_flat = g3.view(-1, 1)
-        
-        grad_g3 = CE_bkw(g3, idx_data[:,2:])
-
-        grad_input = torch.zeros_like(g1)
-
-        return grad_input, None, None, None
-
-class AdaptiveDIEMLoss(nn.Module):
-    def __init__(self, momentum=0.01):
-        super().__init__()
-        self.momentum = momentum
-        
-        self.register_buffer('running_mean_dist', torch.tensor(1.0))
-        self.register_buffer('running_var_dist', torch.tensor(1.0))
-        
-    def forward(self, pred, target):
-        d_actual = torch.norm(pred - target, p=2, dim=-1)
-        
-        if self.training:
-            with torch.no_grad():
-                flat_target = target.view(-1, target.size(-1))
-                
-                perm = torch.randperm(flat_target.size(0), device=target.device)
-                shuffled_target = flat_target[perm]
-                flat_pred = pred.view(-1, pred.size(-1))
-                
-                d_random = torch.norm(flat_pred - shuffled_target, p=2, dim=-1)
-                
-                batch_mean = d_random.mean()
-                batch_var = d_random.var()
-                
-                self.running_mean_dist = (1 - self.momentum) * self.running_mean_dist + self.momentum * batch_mean
-                self.running_var_dist = (1 - self.momentum) * self.running_var_dist + self.momentum * batch_var
-
-        sigma = torch.sqrt(self.running_var_dist) + 1e-8
-        mu = self.running_mean_dist
-        
-        loss = (d_actual - mu) / sigma
-        
-        return loss.mean()
 def vicreg_loss(pred, target, sim_coeff=25.0, std_coeff=25.0, cov_coeff=1.0):
     # 1. Invariance (MSE)
     mse_loss = F.mse_loss(pred, target)
@@ -235,12 +186,32 @@ def off_diagonal(x):
     assert n == m
     return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
 
+class Dreamer(nn.Module):
+    def __init__(self, mem_block_size, **config):
+        super().__init__()
+        mbs = mem_block_size
+        self.block = modules.Block(**config)
+        self.comp = modules.FFTResampler(mbs*2, mbs, mbs+1)
+        self.ln = modules.LayerNorm(**config)
+        
+    def forward(self, x):
+        while x.shape[0] > 1:
+            b, t, c = x.size()
+            x = x.view(b // 2, 2, t, c)
+            
+            x = x.transpose(1, 2)
+            
+            x = x.reshape(b // 2, t * 2, c)
+            
+            x = self.comp(x, dim=1) 
+            x = self.block(x, causal = False)
+            x = self.ln(x)
+        return x 
     
 class Model(nn.Module):
     def __init__(self, vocab_size, k=5, lambda_thought=0.1, **kwargs):
         super().__init__()
         # ... your usual model initialization (embedding, transformer blocks, lm_head)
-        self.diem = AdaptiveDIEMLoss()
         if qkhwn:
             wte = (nn.Embedding(vocab_size, n_embed))
         else:
@@ -263,20 +234,54 @@ class Model(nn.Module):
         self.lambda_corrected = 0.0
         self.k = k 
         self.lambda_thought = lambda_thought 
+        
+        self.register_buffer('memory', torch.randn(1,1,n_embed))
+        memconf = {
+                'mem_block_size': 1,
+                'dropout': 0.0,
+                'n_embd': n_embed,
+                'n_head': 4,
+                'bias': False,
+            }
+        self.memorizer = Dreamer(**memconf)
+        
 
     def get_weights(self):
         return [block.get_weight() for block in self.transformer.h]
     
     def ssmfwd(self, x, prevs = None, weights =None):
-        
+        b,t,c = x.shape
+        if mem:
+            xf=torch.cat([self.memory.expand(b,1,c),x],dim=1)
+        else:
+            xf=x
         qs = []
         for i, block in enumerate(self.transformer.h):
             
             weight = weights[i] if weights is not None else None
             prev = prevs[i] if prevs is not None else None
             
-            x, q_out = block(x, prev, weight)
-            qs.append(q_out)
+            xf, q_out = block(xf, prev, weight)
+            if not mem:
+                qs.append(q_out)
+
+        if mem:
+            nm = self.memorizer(xf[:,-1,:].unsqueeze(1))
+            x=torch.cat([nm.expand(b,1,c),x],dim=1)
+            for i, block in enumerate(self.transformer.h):
+
+                weight = weights[i] if weights is not None else None
+                prev = prevs[i] if prevs is not None else None
+
+                x, q_out = block(x, prev, weight)
+                q_out=q_out[:,1:,:]
+                qs.append(q_out)
+            x=x[:,1:,:]
+            with torch.no_grad():
+                nm2 = self.memorizer(x[:,-1,:].unsqueeze(1))
+                self.memory.data = nm2
+        else:
+            x= xf
         return x, qs
 
     def forward(self, idx, Train=False, gumbel_temp=1.0, cl = 0.0):
@@ -301,14 +306,14 @@ class Model(nn.Module):
         
         full_x, _ = self.ssmfwd(tok_emb[:,:-1,:], weights=ws)
         
-        logits_full = self.lm_head(full_x)
-        logits_g1 = logits_full[:, :-1,:]
+        #logits_full = self.lm_head(full_x)
+        #logits_g1 = logits_full[:, :-1,:]
 
         #g1_pred_onehot = quantizer.TopKHot.apply(logits_g1, 3) / 3.0
-        g1_pred_onehot = torch.softmax(logits_g1, dim=-1)
+        #g1_pred_onehot = torch.softmax(logits_g1, dim=-1)
         #g1_pred_onehot = F.gumbel_softmax(logits_g1, tau=gumbel_temp, hard=True, dim=-1)
-        g1_guess_emb = g1_pred_onehot @ self.transformer.wte.weight
-        
+        #g1_guess_emb =  g1_pred_onehot @ self.transformer.wte.weight
+        g1_guess_emb = full_x[:, :-1,:]
         gen2_x, _ = self.ssmfwd(g1_guess_emb,  weights= ws)
         #logits_g2 = self.lm_head(gen2_x)
 
@@ -350,7 +355,7 @@ class Model(nn.Module):
         L_guess = L_guess.mean().detach()
         #L_guess = None
         gloss = None#torch.zeros(1).detach()
-        return logits_g1, loss, (gloss, L_guess)
+        return None, loss, (gloss, L_guess)
 
 
     def trust_loss2(self, L_standard, L_baseline, L_guess):
@@ -470,7 +475,7 @@ for iter in range(max_iters):
         model.eval()
         losses = {}
         for split in ['train', 'val']:
-            X_val = get_batch(split)
+            X_val = get_batch(split,block_size+2)
             with torch.no_grad():
                 _, loss, gloss = model(X_val, True, cl = current_lambda)
             losses[split] = loss.detach().item()
@@ -494,7 +499,7 @@ for iter in range(max_iters):
         model.train()
         t0 = time.time()
 
-    X = get_batch('train')
+    X = get_batch('train',block_size+2)
     logits, loss, _ = model(X, True, cl = current_lambda)
 
     loss.backward()
@@ -510,24 +515,6 @@ for iter in range(max_iters):
             utils.softwnorm(model,1e-4)
     
 if gen:
-    meta_path = os.path.join('data', 'shakespeare_char/meta.pkl')
-
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    stoi, itos = meta['stoi'], meta['itos']
-    def encode(s): 
-        return [stoi[c] for c in s]
-    def decode(ll):
-        decoded = []
-        for i in ll:
-            if i in itos:
-                decoded.append(itos[i])
-            elif i == idk_token:
-                decoded.append('[IDK]')
-            else:
-                decoded.append(f'[UNK{i}]')  # Or another placeholder for unknown tokens
-        return ''.join(decoded)
-
     print("sanity check")
     X = get_batch('train')
     with torch.no_grad():

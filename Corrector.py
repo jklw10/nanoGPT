@@ -43,13 +43,10 @@ cl          = False
 mem         = False
 gradlog     = False
 gen         = False
-memcheat    = False
 wnorm       = False
 genloss     = True
 
-lbc         = True
-
-qkhwn       = False
+qkhwn       = True
 #todo, wnorm, midreset, lr on memory, memswizzle,
 #ablate hierarchy, add innerblocks, make hierarchical output generation
 
@@ -185,7 +182,7 @@ class Model(nn.Module):
         g1_pred_onehot = F.gumbel_softmax(logits_g1, tau=gumbel_temp, hard=True, dim=-1)
         g1_guess_emb = g1_pred_onehot @ self.transformer.wte.weight
         
-        gen2_x = self.transformer_forward(g1_guess_emb+pos_emb[1:,:], causal=False)
+        gen2_x = self.transformer_forward(g1_guess_emb+pos_emb[1:,:],causal=True)
         
 
         bfw = self.lm_head.weight.to(torch.bfloat16)
@@ -206,15 +203,53 @@ class Model(nn.Module):
             impl='torch_compile', 
             reduction='none',
             ).view(idx[:, 1:].shape)
+        
         if self.training:
             gk = utils.gaussian_kernel(L_guess,1.0,dim=-1) #centered on the end of sequence
-            loss = L_all.mean() + (gk*L_guess).mean()
+            Q = g1_guess_emb
+            # Key: The context history [B, T, n_embed]
+            K = full_x[:, :-1, :] 
+            
+            scale = 1.0 / math.sqrt(n_embed)
+            attn_scores = (Q @ K.transpose(-2, -1)) * scale
+            
+            mask = torch.triu(torch.ones(T, T, device=device), diagonal=1).view(1, T, T)
+            
+            attn_scores = attn_scores.masked_fill(mask == 0, float('-inf'))
+            
+            attn_probs = F.softmax(attn_scores, dim=-1).detach() # [B, T, T]
+            
+            future_losses = L_guess.unsqueeze(1) 
+
+            # 2. Weight the future losses by how much the current token attended to them
+            # [B, T, T] * [B, 1, T] -> [B, T, T]
+            weighted_future_errors = attn_probs * future_losses
+            weighted_future_errors = torch.tanh(weighted_future_errors)
+            # 3. Sum over the future (last dimension) to get the total "Blame" for current token t
+            # Shape: [B, T]
+            
+            structure_penalty = weighted_future_errors.sum(dim=-1).to(torch.float32)
+            
+            # 5. Normalize by the window size
+            # Because early tokens have T futures and late tokens have 0 futures,
+            # we need to normalize so the loss isn't biased toward the start of the sentence.
+            valid_futures = torch.arange(T, 0, -1, device=device).view(1, -1)
+            structure_penalty = structure_penalty / (valid_futures + 1)
+            
+            # Add to total loss
+            weighted_guess_loss = structure_penalty.mean()
+            # 4. Final Loss Calculation
+            # You can now mean() this to get a scalar, or weight it further
+            #weighted_guess_loss = attributable_loss.mean()
+
+            loss = L_all.mean() + weighted_guess_loss
         else:
             loss = L_all.mean()
         L_guess = L_guess.mean().detach()
         gloss = None#torch.zeros(1).detach()
         return logits_g1, loss, (gloss, L_guess)
-
+    
+    
     
     def configure_optimizers(self, weight_decay=0.1, learning_rate=1e-3, betas=(0.9, 0.95)):
         # start with all of the candidate parameters

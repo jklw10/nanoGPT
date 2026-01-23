@@ -1,14 +1,11 @@
 
 import math
-from tabnanny import check
 
-from numpy import shape
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import utils
 import quantizer
-from torch.optim.optimizer import Optimizer
 
 class PerWeightActivationLayer(nn.Module):
     
@@ -40,7 +37,44 @@ class PerWeightActivationLayer(nn.Module):
             summed_output += self.linear.bias
             
         return summed_output * (self.in_features ** -0.5)
+
+
+class WonkyLinear(nn.Module):
+    def __init__(self, in_features: int, out_features: int, activation=F.relu, bias: bool = True):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.activation = activation
+      
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        self.bias = nn.Parameter(torch.randn_like(self.linear.weight))
+        
+        self.bias.data.uniform_(-0.01, 0.01) 
+        self.linear.weight.data.uniform_(-0.1, 0.1) 
+
+    def forward(self, x):
+        linear_term = ( self.linear(x))
+        
+        ac_in = self.activation(x)
+        ac_weight = (self.activation(self.linear.weight) + self.bias)
+        
+        ac_term = utils.gaussian_bump(F.linear(ac_in, ac_weight))
+        return utils.gaussian_bump(linear_term - ac_term) 
     
+class FakeSinLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        self.linear.weight.data.uniform_(-0.1, 0.1) 
+
+    def forward(self, x):
+        linear_term = self.linear(x)
+        
+        cubic_term = F.linear(x.pow(3), self.linear.weight.pow(3)) / 6.0
+        
+        return (linear_term - cubic_term) 
+    
+
 class SSM(nn.Module):
     def __init__(self, n_embd, dropout, bias):
         super().__init__()
@@ -57,6 +91,13 @@ class SSM(nn.Module):
         self.n_embd = n_embd
         self.dropout = dropout
         self.scanner = ProcrustesButterflyLinear(n_embd)
+        #self.shl_lh = SinkhornLinear(n_embd)
+        #self.shl_rh = SinkhornLinear(n_embd)
+        self.shl_lh = ProcrustesLinear(n_embd,n_embd)
+        self.shl_rh = ProcrustesLinear(n_embd,n_embd)
+        with torch.no_grad():
+            self.shl_lh.weight.data = (torch.eye(n_embd))
+            self.shl_rh.weight.data = (torch.eye(n_embd))
     
     def get_weight(self):
         return self.scanner.compute_orthogonal_weights()
@@ -67,9 +108,17 @@ class SSM(nn.Module):
         v = self.v_attn(x)
         if weight is None:
             weight = self.scanner.compute_orthogonal_weights()
+        #with torch.no_grad():
+        #    self.shl_lh.project()
+        #    self.shl_rh.project()
         def scan(left, right):
-            z = self.scanner(left,right,weight).to(x.dtype)
-            return utils.range_norm(z)
+            z = self.shl_lh(left) 
+            z = z + self.shl_rh(right)
+            z = utils.rms(z,dim=-1)
+
+            #z = self.scanner(left,right,weight).to(x.dtype)
+            #z = utils.range_norm(z)
+            return z
         q = utils.pscan2(q, scan, self.identity)
         
         Y = q*v 
@@ -92,6 +141,7 @@ class SSM(nn.Module):
         Y = self.c_proj(Y)
         Y = self.resid_dropout(Y)
         return Y, q
+
 
 class CombineAttention(nn.Module):
     def __init__(self, n_embd,n_head,dropout,bias):
@@ -251,8 +301,8 @@ class SSMBlock(nn.Module):
         self.ln_2 = LayerNorm(n_embd, bias)
         self.mlp = MLP(n_embd, dropout, bias)
 
-    def forward(self, x,  causal = True):
-        x = x + self.attn(self.ln_1(x),causal)
+    def forward(self, x, w=None):
+        x = x + self.attn(self.ln_1(x), w)[0]
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -267,7 +317,7 @@ class FFTResampler(nn.Module):
         self.max_freq = input_dim // 2
         self.min_freq = 1.0
 
-        initial_gaps = (self.max_freq - self.min_freq) / num_filters
+        initial_gaps = (self.max_freq - self.min_freq) / (num_filters)
         initial_logits = torch.log(torch.exp(torch.tensor(initial_gaps)) - 1).expand(num_filters)
         self.gap_logits = nn.Parameter(initial_logits)
 
@@ -314,11 +364,12 @@ class FFTResampler(nn.Module):
         return output
 
 class Dreamer(nn.Module):
-    def __init__(self, config):
+    def __init__(self, mem_block_size, **config):
         super().__init__()
-        self.block = Block(config.n_embd, config.n_head, config.dropout, config.bias)
-        self.comp = FFTResampler(config.mem_block_size, config.mem_block_size//2, 64)
-        self.ln = LayerNorm(config.n_embd, config.bias)
+        mbs = mem_block_size
+        self.block = Block(**config)
+        self.comp = FFTResampler(mbs*2, mbs, mbs+1)
+        self.ln = LayerNorm(**config)
         
     def forward(self, x):
         while x.shape[0] > 1:
@@ -377,21 +428,21 @@ class OrthogonalLinear(nn.Linear):
         return OrthogonalLinearFunction.apply(input, self.weight, self.bias)
 
 class ProcrustesLinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int):
+    def __init__(self, in_features: int, out_features: int, bias = None):
         
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         
-        self.weight_param = nn.Parameter(torch.empty(out_features, in_features))
-        nn.init.orthogonal_(self.weight_param)
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        nn.init.orthogonal_(self.weight)
     
     def compute_orthogonal_weight(self):
-        return utils.fast_polar_decomposition(self.weight_param.to(torch.float32))
+        return utils.fast_polar_decomposition(self.weight.to(torch.float32))
         
     def forward(self, x: torch.Tensor, weight_ortho: torch.Tensor =None) -> torch.Tensor:
         if weight_ortho is None:
-            weight_ortho = self.compute_orthogonal_weight().to(self.weight_param.dtype)
+            weight_ortho = self.compute_orthogonal_weight().to(self.weight.dtype)
         else:
             weight_ortho = weight_ortho
         
@@ -418,127 +469,306 @@ class ProcrustesButterflyLinear(nn.Module):
 
         return y_out
 
-class GradientPredictor(nn.Module):
-    def __init__(self, input_dim, output_dim):
+
+class SinkhornLinear(nn.Module):
+    def __init__(self, size, n_iter=10, eps=1e-6, project=True):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, output_dim)
-        )
-
-    def forward(self, grad_output, original_input, weight):
-        flat_input = original_input.flatten(1)
-        flat_weight = weight.flatten(1)
-        flat_grad_output = grad_output.flatten(1)
-
-        if original_input.shape[0] > 1:
-            flat_input = flat_input.mean(dim=0, keepdim=True)
-            flat_grad_output = flat_grad_output.mean(dim=0, keepdim=True)
-
-        x = torch.cat([flat_grad_output, flat_input, flat_weight], dim=-1)
-        return self.net(x)
-
-class GradientLearnerOptimizer(Optimizer):
-    def __init__(self, params, defaultOptim, lr=1e-3, meta_lr=1e-4):
-        defaults = dict(lr=lr)
-        super().__init__(params, defaults)
+        self.size = size
+        self.n_iter = n_iter
+        self.eps = eps
+        self.project_on_run = project
+        self.weight = nn.Parameter(torch.eye(size))
         
-        self.meta_lr = meta_lr
-        self.gradient_predictors = {}
-        self.predictor_params = []
-        # --- Initialization Step ---
-        # Find all parameters that will need a learned gradient and build a predictor for each.
-        for group in self.param_groups:
-            for i, p in enumerate(group['params']):
-                # We need a way to identify these special layers.
-                # Let's assume we add a flag during model creation.
-                if hasattr(p, '_is_learnable_gradient'):
-                    # The dimensions are tricky and need to be defined carefully
-                    input_dim = ... 
-                    output_dim = p.numel()
-                    
-                    predictor = GradientPredictor(input_dim, output_dim)
-                    self.gradient_predictors[id(p)] = predictor
-                    self.predictor_params.append(predictor.parameters())
+        with torch.no_grad():
+            self.weight.add_(torch.randn(size, size) * 1e-5)
+            
+    def forward(self, x):
+        if self.project_on_run:
+            with torch.no_grad():
+                self.project()
+          
+        #W = self.project(self.weight_logits, self.n_iter)
         
-        self.defaultOptim= defaultOptim()
-
-
+        return F.linear(x, self.weight)
     @torch.no_grad()
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
+    def project(self):
+        W = self.weight.clamp(min=1e-8)
+        for _ in range(self.n_iter):
+            W = W / W.sum(dim=1, keepdim=True)
+            W = W / W.sum(dim=0, keepdim=True)
+        self.weight.copy_(W)
 
-        for group in self.param_groups:
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-
-                if hasattr(p.grad, '_gradient_context'):
-                    ctx = p.grad._gradient_context
-                    predictor = self.gradient_predictors[id(p)]
-                    predictor_optim = self.predictor_optimizers[id(p)]
-                    
-                    with torch.enable_grad():
-                        predicted_grad = predictor(ctx['grad_output'], ctx['input'], ctx['weight'])
-                        predicted_grad = predicted_grad.view_as(p)
-
-                    with torch.enable_grad():
-                        temp_p = p.detach().clone()
-                        updated_p = temp_p - group['lr'] * predicted_grad
-
-                        output_after_update = F.linear(ctx['input'], updated_p, ctx['bias'])
-                        output_after_update = ctx['func'](output_after_update)
-                        
-                        target_output = F.linear(ctx['input'], p, ctx['bias']) - ctx['grad_output']
-                        predictor_loss = F.mse_loss(output_after_update, target_output.detach())
-
-                        predictor_optim.zero_grad()
-                        predictor_loss.backward() # This computes grads for the predictor's params
-                        predictor_optim.step()
-
-                    p.add_(predicted_grad.detach(), alpha=-group['lr'])
-
-                else:
-                    p.add_(p.grad, alpha=-group['lr'])
-        
-        return loss
-class GradientContext(torch.autograd.Function):
+class GdiffLinearfunc(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input_tensor, weight, bias, func):
-        # We need the inputs to the linear layer for the backward pass
-        linear_input = input_tensor.clone()
-        ctx.save_for_backward(linear_input, weight, bias)
-        ctx.func = func
-        
-        output = F.linear(input_tensor, weight, bias)
-        return func(output)
+    def forward(ctx, input, weight, weight_ema, bias, config):
+        w_eff = utils.VotedGeometricMean(weight, weight_ema)
+        ctx.save_for_backward(input, weight, weight_ema, w_eff)
+        ctx.config = config
+        return F.linear(input,w_eff,bias) 
 
     @staticmethod
     def backward(ctx, grad_output):
-        input_tensor, weight, bias = ctx.saved_tensors
+        input, weight, weight_ema, w_eff = ctx.saved_tensors
+        conf = ctx.config
         
-        dummy_grad_w = torch.zeros_like(weight)
-        dummy_grad_b = torch.zeros_like(bias) if bias is not None else None
-        
-        dummy_grad_w._gradient_context = {
-            "input": input_tensor,
-            "weight": weight,
-            "bias": bias,
-            "grad_output": grad_output,
-            "func": ctx.func
-        }
-        return None, dummy_grad_w, dummy_grad_b, None   
+        grad_input = None
+        grad_weight = None
+        grad_bias = None
+
+        if ctx.needs_input_grad[0]:
+            grad_input = grad_output.matmul(weight)
+
+        # --- 2. Gradient w.r.t Weight ---
+        if ctx.needs_input_grad[1]:
+            input_flat = input.reshape(-1, input.shape[-1])
+            grad_flat = grad_output.reshape(-1, grad_output.shape[-1])
+            
+            raw_grad = grad_flat.t().mm(input_flat)
+            
+            g_norm = utils.rms(raw_grad)
+
+            # C. Regularization
+            wreg = weight
+            reg = conf['lambda'] * wreg.sign() * (wreg.abs().pow(conf['reg_dim'] - 1))
+            g_final = g_norm + reg
+            
+            # D. The "gdiff" Scheduler
+            aw_diff = weight_ema - w_eff
+            denom = weight_ema.abs()*0.5 + (g_final - aw_diff).abs()
+            g_diff = 1.0 / (denom + 1e-9)
+            
+            # E. Final Gradient
+            grad_weight = g_final * g_diff
+            #grad_weight += torch.randn_like(grad_weight) * 1e-5 * (g_final - aw_diff).abs()
+            smoothing = conf['smoothing']
+
+            if 'grow' in conf and conf['grow'] < 1.0:
+                rows = grad_weight.shape[0]
+                neuron_idx = torch.arange(rows, device=grad_weight.device).unsqueeze(1)
+                limit = rows * conf['grow']
+                gkernel = torch.where(neuron_idx < limit, 1.0, 0.0)
+
+                grad_weight *= gkernel
+                # --- SIDE EFFECT: Update EMA ---
+                smoothing *= gkernel
+            
+            weight_ema.add_(smoothing * (weight - weight_ema))
+
+        # --- 3. Gradient w.r.t Bias ---
+        if ctx.needs_input_grad[3] and grad_output is not None:
+            # Collapse Batch and Time dimensions
+            grad_bias = grad_output.reshape(-1, grad_output.shape[-1]).sum(0)
+
+
+        return grad_input, grad_weight, None, grad_bias, None
+phi = (1+math.sqrt(5))/2
+def flattening_kernel(x, y, power=2.0, sensitivity=1.0):
+
+    y = torch.as_tensor(y).clamp(min=1e-6, max=1.0)
     
-class LNLinear(nn.Linear):
-    def __init__(self, in_features, out_features, func):
-        super().__init__(in_features, out_features, bias=True)
-        self.func = func
+    inv_width = sensitivity * (1.0 - y) / y
+    
+    kernel = torch.exp( - (x.abs() * inv_width).pow(power) )
+    
+    return kernel
+class GdiffLinear(nn.Module):
+    def __init__(self, in_features, out_features, 
+                 smoothing=0.01, lambda_reg=0.0, reg_dim=2.0):
+        super().__init__()
+        self.in_features = in_features
         
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        nn.init.kaiming_normal_(self.weight)
+        
+        self.register_buffer('weight_ema', self.weight.clone().detach())
+        
+        self.weight.data.zero_()
+        self.bias = nn.Parameter(torch.zeros(out_features))
+        
+        self.config = {
+            'smoothing': smoothing,
+            'lambda': lambda_reg,
+            'reg_dim': reg_dim,
+            'grow': 0,
+        }
+        self.num = 10000.0
+        
+    def forward(self, x):
+        with torch.no_grad():
+            self.num += 1.0
+            self.config['grow'] = self.num / 10000
+        return GdiffLinearfunc.apply(
+            x, self.weight, self.weight_ema, self.bias, self.config
+        )
+class GdiffEmbedding(nn.Module):
+    def __init__(self, num, dim, smoothing=0.01):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(num, dim))
+        nn.init.normal_(self.weight)
+        self.register_buffer('weight_ema', self.weight.clone().detach())
+        self.smoothing = smoothing
+
     def forward(self, input):
-        return GradientContext.apply(input, self.weight, self.bias, self.func)
+        # Sparse EMA Update
+        if self.training:
+            with torch.no_grad():
+                idx = input.unique()
+                self.weight_ema[idx].lerp_(self.weight[idx], self.smoothing)
+
+        w = F.embedding(input, self.weight)
+        w_ema = F.embedding(input, self.weight_ema)
+
+        mag = (w * w_ema).abs().sqrt()
+        sign = (w + w_ema).sign()
+        
+        return sign * mag
+
+class HungryLinearFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, weight, bias, config):
+        ctx.save_for_backward(input, weight, bias)
+        ctx.config = config
+        return F.linear(input, weight, bias)
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, weight, bias = ctx.saved_tensors
+        conf = ctx.config
+        noise = torch.randn_like(input) / ( 1e-5 + input.sum())
+        #noise *= grad_output.std()
+        input = input + noise
+        #grad_output = utils.rms(grad_output)
+        input_flat = input.reshape(-1, input.shape[-1])
+        grad_flat = grad_output.reshape(-1, grad_output.shape[-1])
+        
+        grad_weight = grad_flat.t().matmul(input_flat)
+        
+        alpha = conf.get('lookahead_alpha', 0.1)
+        
+        future_weight = weight - (grad_weight * alpha)
+        
+        grad_input = grad_output.matmul(future_weight)
+        
+        grad_bias = None
+        if bias is not None:
+            grad_bias = grad_flat.sum(0) if grad_output is not None else None
+        #grad_input = utils.rms(grad_input)
+        #grad_weight = utils.rms(grad_weight)
+        return grad_input, grad_weight, grad_bias, None
+
+class HungryLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias = False):
+        super().__init__()
+        self.in_features = in_features
+        
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        #nn.init.kaiming_normal_(self.weight)
+        
+        self.weight.data.zero_()
+        self.bias = None
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features))
+        
+        self.config = {
+            'lookahead_alpha' : 1e-4,
+        }
+        
+    def forward(self, x):
+        return HungryLinearFunc.apply(
+            x, self.weight, self.bias, self.config, 
+        )    
+
+class HungryGdiffLinearfunc(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, weight, weight_ema, bias, config):
+        w_eff = utils.VotedGeometricMean(weight, weight_ema)
+        ctx.save_for_backward(input, weight, weight_ema, w_eff)
+        ctx.config = config
+        
+        return F.linear(input,w_eff,bias) 
+
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, weight, weight_ema, w_eff = ctx.saved_tensors
+        conf = ctx.config
+        
+        grad_input = None
+        grad_weight = None
+        grad_bias = None
+
+        
+        # --- 2. Gradient w.r.t Weight ---
+        
+        noise = torch.randn_like(input) / ( 1e-5 + input.sum())
+        input = input + noise
+        input_flat = input.reshape(-1, input.shape[-1])
+        grad_flat = grad_output.reshape(-1, grad_output.shape[-1])
+        
+        raw_grad = grad_flat.t().mm(input_flat)
+        
+        g_norm = utils.rms(raw_grad)
+        # C. Regularization
+        wreg = weight
+        reg = conf['lambda'] * wreg.sign() * (wreg.abs().pow(conf['reg_dim'] - 1))
+        g_final = g_norm + reg
+        
+        # D. The "gdiff" Scheduler
+        aw_diff = weight_ema - w_eff
+        denom = weight_ema.abs()*0.5 + (g_final - aw_diff).abs()
+        g_diff = 1.0 / (denom + 1e-9)
+        
+        # E. Final Gradient
+        grad_weight = g_final * g_diff
+        smoothing = conf['smoothing']
+        weight_ema.add_(smoothing * (weight - weight_ema))
+
+
+        if ctx.needs_input_grad[0]:
+            
+            #gw2 = raw_grad
+            gw2 = grad_weight
+            alpha = conf.get('lookahead_alpha', 0.1)
+
+            future_weight = weight - (gw2 * alpha)
+            future_weight = utils.VotedGeometricMean(future_weight, weight_ema)
+            
+            grad_input = grad_output.matmul(future_weight)
+        
+            #grad_input = grad_output.matmul(weight)
+
+        if ctx.needs_input_grad[3] and grad_output is not None:
+            grad_bias = grad_output.reshape(-1, grad_output.shape[-1]).sum(0)
+
+
+        return grad_input, grad_weight, None, grad_bias, None
+    
+class HungryGdiffLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias = False,
+                 smoothing=0.01, lambda_reg=0.0, reg_dim=2.0, lookahead= 1e-4):
+        super().__init__()
+        self.in_features = in_features
+        
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        nn.init.kaiming_normal_(self.weight)
+        
+        self.register_buffer('weight_ema', self.weight.clone().detach())
+        
+        self.weight.data.zero_()
+        self.bias = None
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features))
+        
+        
+        self.config = {
+            'smoothing': smoothing,
+            'lambda': lambda_reg,
+            'reg_dim': reg_dim,
+            'grow': 0,
+            'lookahead_alpha': lookahead,
+        }
+        
+    def forward(self, x):
+        return HungryGdiffLinearfunc.apply(
+            x, self.weight, self.weight_ema, self.bias, self.config
+        ) 
+

@@ -4,6 +4,7 @@ import model
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import quantizer
 import utils
 
 from torch.optim import Optimizer
@@ -85,6 +86,87 @@ def orthograd_tangent(W: torch.Tensor, G: torch.Tensor):
     p_flat  = g - proj * w
     return p_flat.view_as(G)
 
+class DynamicSparseMoE(nn.Module):
+    """A Sparse MoE layer using a dynamic, learnable Top-K."""
+    def __init__(self, config, num_experts):
+        super().__init__()
+        self.config = config
+        self.num_experts = num_experts
+        self.gate = nn.Linear(config.n_embd, num_experts)
+        config.n_embd = config.n_embd // num_experts
+        self.experts = nn.ModuleList([MLP(config) for _ in range(num_experts)])
+        config.n_embd = config.n_embd * num_experts
+
+
+    def forward(self, x):
+        gating_logits = self.gate(x) 
+        b, t, c = x.shape
+        flat_logits = gating_logits.view(-1, gating_logits.size(-1))
+        
+        gating_weights = quantizer.ThresHot.apply(flat_logits)
+       # gating_weights /= gating_weights.sum(dim=-1, keepdim=True).detach()
+        gating_weights = gating_weights.view(b, t, self.num_experts)
+        xchunked = x.view(b, t, self.config.n_embd // self.num_experts, self.num_experts)
+        expert_outputs = torch.stack([expert(xchunked[...,i]) for i, expert in enumerate(self.experts)], dim=2)
+        
+        return (gating_weights.unsqueeze(-1) * expert_outputs).view(b,t,c)
+        #return torch.sum(gating_weights.unsqueeze(-1) * expert_outputs, dim=2) 
+
+
+class Dynskip(nn.Module):
+    def __init__(self, config, n_layer):
+        super().__init__()
+        self.n_embd = config.n_embd
+        self.n_layer = n_layer
+        self.trunk = nn.ModuleList([
+            nn.Sequential(
+            nn.Linear(config.n_embd , config.n_embd),
+            nn.ReLU(),
+        ) for _ in range(n_layer)])
+        self.router = nn.Linear(config.n_embd*2, config.n_embd * n_layer)
+
+    def forward(self, x):
+        
+        intermediate_outputs = []
+        current_input = x
+        for layer in self.trunk:
+            current_input = layer(current_input)
+            intermediate_outputs.append(current_input)
+        
+        logits = self.router(torch.cat((x,current_input),dim=-1))
+        
+        logits = logits#.view(x.shape[0], x.shape[1], self.n_embd, self.n_layer)
+        #selection_mask = quantizer.TopKHot(logits, self.n_embd)
+
+        stacked_outputs = torch.stack(intermediate_outputs, dim=-1)
+        
+        return quantizer.GatherByGate(logits, stacked_outputs,2).sum(dim=-1)
+
+class LearnableSpiral4D(nn.Module):
+    def __init__(self, init_freq=1.0, init_amp=1.0):
+        super().__init__()
+        
+        freqs = torch.ones(4) * init_freq + torch.randn(4) * 0.1
+        self.frequencies = nn.Parameter(freqs)
+
+        phases = torch.linspace(0, 2 * torch.pi, 5)[:-1] # 0, pi/2, pi, 3pi/2
+        self.phase_shifts = nn.Parameter(phases)
+
+        amps = torch.ones(4) * init_amp
+        self.amplitude_scales = nn.Parameter(amps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[-1] != 1:
+            b, t, c = x.shape
+            x = x.unsqueeze(-1)
+        sin_term = torch.sin(self.frequencies * x + self.phase_shifts)
+        
+        amp_term = self.amplitude_scales * x
+        
+        output = sin_term * amp_term
+        if x.shape[-1] != 1:
+            output = output.view(b,t,c*4)
+        return output
 class Phi2Optimizer(Optimizer):
     """
     Full Phi2 optimizer:

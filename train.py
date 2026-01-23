@@ -40,6 +40,9 @@ from torch.utils.data import Dataset, DataLoader
 
 import seaborn as sns
 import matplotlib.pyplot as plt
+
+import torch._functorch.config
+torch._functorch.config.donated_buffer = False
 torch._dynamo.optimize()
 #torch._inductor.config.force_disable_caches = True
 torch._inductor.config.disable_cpp_codegen = True
@@ -137,7 +140,9 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 data_dir = os.path.join('data', dataset)
-def get_batch(split, sequential = False):
+def get_batch(split, sequential = False, size = None):
+    if size is None:
+        size = block_size
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     if split == 'train':
@@ -145,14 +150,15 @@ def get_batch(split, sequential = False):
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
     #print(f"datalen {len(data)}")
+    ix = torch.randint(len(data) - size, (batch_size,))
+
     if(sequential):
-        max_start_index = len(data) - block_size - batch_size
+        max_start_index = len(data) - size - batch_size
         start_ix = torch.randint(max_start_index, (1,)).item()
         ix = range(start_ix, start_ix + batch_size)
-    else:
-        ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    
+    x = torch.stack([torch.from_numpy((data[i:i+size]).astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy((data[i+1:i+1+size]).astype(np.int64)) for i in ix])
     
     #outp = model.generate(X, 100, temperature=0.01, top_k=200)
     
@@ -274,6 +280,8 @@ gsphere             = False
 ggauss              = False #or best
 gchaos              = False #or best
 
+sizejump            = False
+
 grefl               = False
 
 wstep               = False
@@ -291,7 +299,7 @@ plot                = False
 muon                = False
 #for fftmem owt: 1e-5 #beta2 dependent
 #for fftmem skspr: 5e-5 #beta2 dependent
-wfunc               = utils.fast_polar_decomposition3
+wfunc               = utils.fast_polar_decomposition
 #wfunc = utils.range_norm
 #no clue why this way of passing is needed here but not for the bools. love python
 config["swfa"]      = 1e-5 if dataset == "openwebtext" else 1e-3
@@ -375,6 +383,7 @@ def custom_gradient_adjustment(grad, param):
     if grms:
         rms = torch.rsqrt(adjusted_grad.pow(2).mean(dim=nd, keepdim=True) + 1e-8)
         adjusted_grad = adjusted_grad * rms
+        
     if gstd:
         adjusted_grad = utils.soft_sigma_clip_norm(adjusted_grad)
     #if(gd4sphere ): 
@@ -474,7 +483,9 @@ if ddp:
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
-def estimate_loss():
+def estimate_loss(decay = 1.0, size =None):
+    if size is None:
+        size = block_size
     #torch.compiler.cudagraph_mark_step_begin()
     out = {}
     model.eval()
@@ -483,9 +494,9 @@ def estimate_loss():
         for k in range(eval_iters):
             
             torch.compiler.cudagraph_mark_step_begin()
-            X, Y = get_batch(split)
+            X, Y = get_batch(split, size=size)
             with ctx:
-                logits, loss = model(X, Y)
+                logits, loss = model(X, Y, decay)
             losses[k] = loss.item()
         out[split] = losses.detach().mean()
     model.train()
@@ -496,22 +507,16 @@ def estimate_loss():
     optimizer.zero_grad(set_to_none=True)
     return out
 
-lr_sin = False
-
-# learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
     
-    # 1) linear warmup for warmup_iters steps
     if it < warmup_iters:
         return learning_rate * (it + 1) / (warmup_iters + 1)
     
     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-    if(lr_sin):
-        return min_lr + (math.cos(decay_ratio*math.pi*5)*learning_rate -min_lr)
-    # 2) if it > lr_decay_iters, return min learning rate
+    
     if it > lr_decay_iters:
         return min_lr
-    # 3) in between, use cosine decay down to min learning rate
+    
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
@@ -580,7 +585,31 @@ if plot:
 
 def model_step(iter_num, tl, best_val_loss, config):
     # determine and set the learning rate for this iteration
-    lr = get_lr(iter_num) if decay_lr else learning_rate
+    lr = learning_rate
+    if decay_lr:
+        lr = get_lr(iter_num)
+        #lr = utils.ramp(iter_num, learning_rate, warmup_iters) 
+        #lr = utils.cosine_decay(iter_num, lr, min_lr, warmup_iters, lr_decay_iters)
+    
+    dec_start = 35000
+    dec_time = 1
+    decaying = utils.cosine_decay(iter_num, 1.0, 0.0, dec_time, dec_start)
+
+    size = block_size
+    if sizejump:
+        if(iter_num == 25000):
+            checkpoint = {
+                'model':            raw_model.state_dict(),
+                'optimizer':        optimizer.state_dict(),
+                'model_args':       model_args,
+                'iter_num':         iter_num,
+                'best_val_loss':    best_val_loss,
+                'config':           config,
+            }
+            torch.save(checkpoint, os.path.join(out_dir, '25k.pt'))
+        if(iter_num > 25000):
+
+            size = block_size*2
     
     #itrage = (iter_num // itresetage) % 2 
     #if itrage == 0:
@@ -598,7 +627,8 @@ def model_step(iter_num, tl, best_val_loss, config):
             plot_spectra(s_ortho, iter_num, fig, axes)
     
     for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+        scale = param_group.get('lr_scale', 1.0)
+        param_group['lr'] = lr*scale
     if iter_num % eval_interval == 0 and master_process: 
         if(iter_num > 0):
             
@@ -607,7 +637,7 @@ def model_step(iter_num, tl, best_val_loss, config):
                 torch.cuda.empty_cache()
             
             t1 = time.time()
-            losses = estimate_loss()
+            losses = estimate_loss(decaying, size)
             t2 = time.time()
             
             if plot:
@@ -650,11 +680,12 @@ def model_step(iter_num, tl, best_val_loss, config):
     
     
    
-    X, Y = get_batch('train',seqbatch)
+    X, Y = get_batch('train', seqbatch, size)
     #@torch.compile()
     def closure():
         torch.compiler.cudagraph_mark_step_begin()
-        logits, loss = model(X, Y)
+        _, loss = model(X, Y, decaying)
+        #loss= loss + utils.surface_minimize(emb,x_out)*0.0001
         loss = loss.mean()
         loss.backward()
         return loss
@@ -705,6 +736,15 @@ while run:
     if iter_num % eval_interval == 3:
         tl= time.time()
     iter_num, run, best_val_loss = model_step(iter_num, tl, best_val_loss, config)
+
+checkpoint = {
+    'model': raw_model.state_dict(),
+    'optimizer': optimizer.state_dict(),
+    'model_args': model_args,
+    'iter_num': iter_num,
+    'best_val_loss': best_val_loss,
+    'config': config,
+}
 torch.save(checkpoint, os.path.join(out_dir, 'fckpt.pt'))
 
 if ddp:

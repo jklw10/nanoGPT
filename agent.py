@@ -1,3 +1,9 @@
+import os
+
+from scipy import optimize
+
+import optim
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 import time
 import torch
 import torch.nn as nn
@@ -8,9 +14,11 @@ from matplotlib.animation import FuncAnimation
 
 import modules
 import quantizer
-
-torch.backends.cudnn.benchmark = True
+import utils
+#torch.autograd.set_detect_anomaly(True)
+#torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision('medium')
+
 # --- Configuration ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -20,201 +28,155 @@ AGENTS_PER_WORLD = 16
 TOTAL_BATCH = BATCH_SIZE * AGENTS_PER_WORLD 
 WIDTH, HEIGHT = 96, 96
 VIEW_DIST = 4
-VIEW_SIZE = (2 * VIEW_DIST + 1) # 9
-PIXELS = VIEW_SIZE * VIEW_SIZE # 81
+VIEW_SIZE = (2 * VIEW_DIST + 1) 
+PIXELS = VIEW_SIZE * VIEW_SIZE 
 
-# Dimensions
 DIM_L1 = 64   
-DIM_L2 = 128  
-DIM_L3 = 256  
-VOCAB_SIZE = 64 
-
-# --- Helper Modules ---
-
-class Block(nn.Module):
-    def __init__(self, dim, heads=4, dropout=0.0, causal=False):
-        super().__init__()
-        self.ln1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True, dropout=dropout)
-        self.ln2 = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * 4),
-            nn.GELU(),
-            nn.Linear(dim * 4, dim),
-            nn.Dropout(dropout)
-        )
-        self.causal = causal
-
-    def forward(self, x, context=None):
-        kv = context if context is not None else x
-        x_norm = self.ln1(x)
-        kv_norm = self.ln1(kv)
-        attn_out, _ = self.attn(x_norm, kv_norm, kv_norm)
-        x = x + attn_out
-        x = x + self.mlp(self.ln2(x))
-        return x
-
-class SpatialPatcher(nn.Module):
-    def __init__(self, dim_in, dim_out, size_in):
-        super().__init__()
-        self.size_in = size_in 
-        stride = 2 if size_in > 3 else 1
-        self.compressor = nn.Sequential(
-            nn.Conv2d(dim_in, dim_out, kernel_size=3, stride=stride, padding=1),
-            nn.GELU(),
-            nn.Conv2d(dim_out, dim_out, kernel_size=3, stride=1, padding=1)
-        )
-        dummy = torch.zeros(1, dim_in, size_in, size_in)
-        with torch.no_grad():
-            out_shape = self.compressor(dummy).shape
-            self.size_out = out_shape[2]
-            
-        self.expander = nn.Linear(dim_out, dim_in)
-
-    def abstract_up(self, x):
-        b, seq, c = x.shape
-        h = w = int(np.sqrt(seq))
-        img = x.transpose(1, 2).view(b, c, h, w)
-        compressed = self.compressor(img) 
-        flat = compressed.flatten(2).transpose(1, 2)
-        return flat, x
-
-    def abstract_down(self, x, residual):
-        # Interpolate back to residual size
-        # x: [B, Seq_small, Dim]
-        x_p = x.transpose(1, 2) # [B, Dim, Seq]
-        target_len = residual.shape[1]
-        
-        up = F.interpolate(x_p, size=target_len, mode='linear', align_corners=False)
-        up = up.transpose(1, 2)
-        
-        return self.expander(up) + residual
 
 class Quantizer(nn.Module):
     def __init__(self, dim_in, dim_out):
         super().__init__()
         # Project raw input (e.g. 81 pixels) to Latent Dim
         self.to_emb = nn.Linear(dim_in, dim_out)
+        self.cb = nn.Linear(dim_out, dim_out)
+        self.max_k = dim_out
     
     def forward(self, x):
         z_e = self.to_emb(x)
         
-        # Apply the custom autograd function
-        z_q = quantizer.ThresHot.apply(z_e)
-        
-        # Activity penalty (Sparsity regularization)
-        # Encourages the representation to be sparse (zeros are cheap)
-        loss = torch.mean(z_q) * 0.1 
-        
-        return z_q, loss
+        hot = quantizer.ThresHot.apply(z_e)
+        k = utils.k_from_hot(hot,self.max_k)
+        z_q = self.cb(hot / k.detach())
+        return z_q
 
-# --- The Brain ---
-class HNet(nn.Module):
-    def __init__(self, vocab_size): # vocab_size is kept for compatibility but effectively unused/replaced
+class AgentBrain(nn.Module):
+    def __init__(self): 
         super().__init__()
         
         self.mem_block_size = 16
-        mem_dim = DIM_L3
+        self.mem_dim = DIM_L1
         
         # --- EDITED ---
         # Input: PIXELS (81) -> Latent: DIM_L1 (64)
         self.vq = Quantizer(PIXELS, DIM_L1)
         
-        # Removed self.token_embedder (z_q is already the embedding)
-        
-        self.pos_embedder = nn.Parameter(torch.randn(1, PIXELS, DIM_L1) * 0.02)
-        
-        self.sLayers = nn.ModuleList([
-            SpatialPatcher(DIM_L1, DIM_L2, 9), 
-            SpatialPatcher(DIM_L2, DIM_L3, 5), 
-        ])
-        
-        self.innerb = Block(DIM_L3, 4)
-        self.innerb2 = Block(DIM_L3, 4)
-        
-        self.register_buffer('memory', torch.randn(1, self.mem_block_size, mem_dim)*0.02)
+        #self.to_emb = nn.Linear(PIXELS, DIM_L1)
+        #self.ae = quantizer.Autoencoder(PIXELS,128,64,32,quantizer.ThresHot)
+
+        #TODO:hierarchy as futurepredictor.
+
+        self.register_buffer('memory', torch.randn(TOTAL_BATCH, self.mem_block_size, self.mem_dim)*0.02)
         self.memory_frozen = False
         self.cmem = True
         
-        memconf = {'n_embd': DIM_L3, 'n_head': 4, 'dropout': 0.0, 'bias':False }
-        self.dreamer = modules.Dreamer(mem_dim, causal=self.cmem, **memconf)
-        self.memory_selector = Block(DIM_L3, 4)
+        #memconf = {'n_embd': DIM_L1, 'n_head': 4, 'dropout': 0.0, 'bias':False }
+        #self.dreamer = modules.Dreamer(self.mem_dim, causal=self.cmem, **memconf)
+        self.memory_selector = modules.Block(DIM_L1, 4 ,0.0, False)
         
-        # --- EDITED ---
-        # Predict the sparse vector (DIM_L1) instead of logits (vocab_size)
+        self.memory_handler = nn.ModuleList(
+            [modules.Block(DIM_L1, 4 ,0.0, False) for _ in range(4)]
+        )
+        
         self.head_recon = nn.Linear(DIM_L1, DIM_L1) 
         
-        self.head_actor = nn.Linear(DIM_L3, 5) 
-        self.head_mod = nn.Linear(DIM_L3, 9)   
-        self.head_critic = nn.Linear(DIM_L3, 1)
-        self.head_social = nn.Linear(DIM_L3, 1) 
+        self.head_actor = nn.Linear(DIM_L1, 5) 
+        self.head_mod = nn.Linear(DIM_L1, 1)   
+        self.head_social = nn.Linear(DIM_L1, 1) 
 
-    def mem_form(self, x):
-        mem = self.memory_selector(x)[:, :self.mem_block_size, :]
-        return self.dreamer(mem)
+        #self.head_pred = nn.Linear(DIM_L1, PIXELS) 
+        fsteps = 3
+        self.heads_pred = nn.ModuleList(
+            [nn.Sequential(
+                nn.Linear(DIM_L1, PIXELS),
+                nn.Sigmoid()
+            ) for _ in range(fsteps)]
+        )
+        
+        self.register_buffer('memory_history', torch.zeros(TOTAL_BATCH, self.mem_block_size, self.mem_dim, fsteps))
+        
+        self.register_buffer('history', torch.zeros(TOTAL_BATCH, PIXELS, fsteps))
+   
+
+    def forward(self, world):
+
+        
+        preds = []
+        for i, head in enumerate(self.heads_pred):
+            mem = self.memory_history[...,i]
+            history = self.history[...,i]
+            xh = self.vq(history).unsqueeze(1)
+            xh = self.mem_center(xh, memory = mem, memup=False)
+            xh = xh[:,-1,:]
+            preds.append(head(xh).unsqueeze(1))
+        preds = torch.cat(preds,dim=1)
+
+        futures = []
+        x = self.vq(world).unsqueeze(1)
+        xh = self.mem_center(x, memory = self.memory, memup=False)
+        xh = xh[:,-1,:]
+        for i, head in enumerate(self.heads_pred):
+            futures.append(self.vq(head(xh)).unsqueeze(1))
+        futures = torch.cat(futures,dim=1)
+        x, newmem = self.mem_center(x, memory = self.memory, predictions=futures)
+        x = x[:,-1,:]
+        #recon_logits = self.head_recon(x)
+
+
+        actor_logits = self.head_actor(x)
+        mod_logits = self.head_mod(x)
+        social_pred = self.head_social(x)
+        
+        return {
+            'predictions': preds,
+            'actor_logits': actor_logits,
+            'mod_logits': mod_logits,
+            'social_pred': social_pred,
+            'new_memory': newmem,
+        }
     
+    def update_history_buffers(self, world):
+        with torch.no_grad():
+            new_history = torch.cat([self.history[:, :, 1:], world.detach().unsqueeze(-1)], dim=-1)
+            self.history = new_history
+            
+            oldmem = self.memory.clone().detach()
+            new_memory_history = torch.cat([self.memory_history[:, :, :, 1:], oldmem.unsqueeze(-1)], dim=-1)
+            self.memory_history = new_memory_history
+
     def mem_update(self, update, malpha=0.01):
         if self.training and not self.memory_frozen:
             with torch.no_grad():
-                self.memory = (self.memory+update*malpha)
+                oldmem = self.memory.detach().clone()
+                self.memory = utils.range_norm(oldmem * (1 - malpha) + update* malpha).clone()
 
-    
-    def mem_center(self, x):
-        cb,ct,cc = x.shape
-        x1 = x
-        x = torch.cat([self.memory.expand(cb,-1,-1), x],dim=1)
-        x = self.innerb(x)
-        x = self.innerb2(x)
+    def mem_center(self, x, memory =None, predictions=None, memup = True):
+        #cb,ct,cc = x.shape
+        if predictions is not None:
+            xmix = torch.cat([memory, x, predictions],dim=1)
+        else:
+            xmix = torch.cat([memory, x],dim=1)
+
+        for b in self.memory_handler:
+            xmix=b(xmix)
         
-        if not self.training:
-            return x[:,self.mem_block_size:,:].contiguous()
+        if not self.training or not memup:
+            return xmix[:, self.mem_block_size:, :].contiguous()
         
         malpha = 1.0
-        mh1 = ((self.memory+self.mem_form(x[:cb//2,...])*malpha)).expand(cb//2,-1,-1)
-        mh2 = ((self.memory+self.mem_form(x[cb//2:,...])*malpha)).expand(cb//2,-1,-1)
-        mem2 = torch.cat([mh2,mh1],dim=0)
-        x = torch.cat([mem2, x1],dim=1) 
-        x = self.innerb(x)
-        x = self.innerb2(x)
-        
-        self.mem_update(self.mem_form(x),malpha)
-        x = x[:,self.mem_block_size:,:].contiguous()
-        return x   
+        newmem = self.memory_selector(xmix)[:, :self.mem_block_size, :]
+        mem = utils.range_norm(memory + newmem*malpha)
+        if predictions is not None:
+            xmix = torch.cat([mem, x, predictions],dim=1)
+        else:
+            xmix = torch.cat([mem, x],dim=1)
 
-    def forward(self, x_continuous):
-        # --- EDITED ---
-        # x_continuous shape: [Batch, Seq_Len, PIXELS] or [Batch, PIXELS]
-        z_q, vq_loss = self.vq(x_continuous)
+        for b in self.memory_handler:
+            xmix=b(xmix)
         
-        # Directly use the sparse latent + pos embedding
-        x = z_q + self.pos_embedder
+        newmem = self.memory_selector(xmix)[:, :self.mem_block_size, :]
         
-        residuals = []
-        for layer in self.sLayers:
-            residuals.append(x)
-            x, _ = layer.abstract_up(x)
-            
-        x = self.mem_center(x)
-        latent_state = x.mean(dim=1) 
-        
-        for i in reversed(range(len(self.sLayers))):
-            x = self.sLayers[i].abstract_down(x, residuals[i])
-            
-        recon_logits = self.head_recon(x)
-        actor_logits = self.head_actor(latent_state)
-        mod_logits = self.head_mod(latent_state)
-        value_pred = self.head_critic(latent_state)
-        social_pred = self.head_social(latent_state)
-        
-        return {
-            'recon_logits': recon_logits,
-            'actor_logits': actor_logits,
-            'mod_logits': mod_logits,
-            'value_pred': value_pred,
-            'social_pred': social_pred,
-            'vq_loss': vq_loss,
-            'target_sparse': z_q # Return the sparse vector as target
-        }
+        xmix = xmix[:, self.mem_block_size:, :].contiguous()
+        return xmix, newmem
 
 class ParallelWorlds:
     def __init__(self, batch_size, w, h):
@@ -294,116 +256,88 @@ class ParallelWorlds:
 class BatchManager:
     def __init__(self):
         self.worlds = ParallelWorlds(BATCH_SIZE, WIDTH, HEIGHT)
-        self.brain = HNet(VOCAB_SIZE).to(DEVICE)
-        self.brain = torch.compile(self.brain, mode="reduce-overhead")
+        self.brain = AgentBrain().to(DEVICE)
+        # Compile can sometimes delay startup, optional depending on setup
+        #self.brain = torch.compile(self.brain)
+        self.optimizer = optim.Grms(
+            params=self.brain.parameters(),
+            lr=2e-4, 
+            nesterov = True, 
+            momentum=0.9,
+            fused=True)
         
-        self.optimizer = torch.optim.AdamW(self.brain.parameters(), lr=2e-4, fused=True)
-        self.scaler = torch.amp.GradScaler('cuda')
+        #self.optimizer = torch.optim.AdamW(self.brain.parameters(), lr=2e-4, fused=True)
+        self.scaler = None# torch.amp.GradScaler('cuda')
 
         self.positions = torch.randint(VIEW_DIST, WIDTH-VIEW_DIST, 
                                      (BATCH_SIZE, AGENTS_PER_WORLD, 2), device=DEVICE)
         
         self.moves_tensor = torch.tensor([(0,0), (-1,0), (1,0), (0,-1), (0,1)], device=DEVICE)
 
-    def generate_time_scape(self, start_state, agents_pos):
-        # The "Scanner": Simulate future trajectory
-        trajectory = []
-        curr_state = start_state
-        
-        # We assume agents stay still during forecast (or we could model momentum)
-        # This gives the "Inertial" prediction
-        for _ in range(10):
-            curr_state = self.worlds.step(curr_state)
-            views = self.worlds.get_views(curr_state, agents_pos)
-            trajectory.append(views)
-            
-        # Stack: [SIM_STEPS, Total, 81] -> [Total, SIM_STEPS, 81]
-        return torch.stack(trajectory).transpose(0, 1)
     def train_step(self):
-        views = self.worlds.get_views(self.positions)
+        torch.compiler.cudagraph_mark_step_begin()
+        # 1. Observe current state
+        views = self.worlds.get_views(self.worlds.state, self.positions)
         
         with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            # 2. Forward pass
             out = self.brain(views)
-            
-            move_probs = F.softmax(out['actor_logits'], dim=-1)
+
+            move_logits = out['actor_logits'] # [B*N, 5]
+            #move_logits = torch.nan_to_num(move_logits, nan=0.0, posinf=10.0, neginf=-10.0)
+            move_probs = F.softmax(move_logits.float(), dim=-1)
+
             moves_idx = torch.multinomial(move_probs, 1).squeeze()
-            
+
             moves = self.moves_tensor[moves_idx]
+
             flat_pos = self.positions.view(-1, 2) + moves
             flat_pos[:, 0] %= WIDTH
             flat_pos[:, 1] %= HEIGHT
             self.positions = flat_pos.view(BATCH_SIZE, AGENTS_PER_WORLD, 2)
-            
-            self.worlds.modify_worlds(self.positions, out['mod_logits'].float())
-            self.worlds.step()
-            
-            future_views = self.worlds.get_views(self.positions)
-            
-            with torch.no_grad():
-                future_out = self.brain(future_views) 
-                
-                # --- EDITED ---
-                # Get the sparse representation of the future
-                future_sparse, _ = self.brain.vq(future_views)
-                
-                # Calculate reconstruction error (BCE on the sparse vector)
-                # out['recon_logits'] shape: [B, 1, DIM_L1], future_sparse shape: [B, 1, DIM_L1]
-                # We want prediction error per sample
-                pred_error = F.binary_cross_entropy_with_logits(
-                    out['recon_logits'], 
-                    future_sparse, 
-                    reduction='none'
-                ).mean(dim=-1).mean(dim=-1) # Mean over features and sequence
-                
-                r_oracle = torch.exp(-pred_error)
-                
-                r_chaotic = torch.tanh(future_views.std(dim=1).squeeze() * 10.0)
-                r_complainer = torch.exp(-future_out['vq_loss'])
 
-                all_agents_happiness = future_out['social_pred'].detach().squeeze()
-                
-                P = self.positions.float()
-                diff = torch.abs(P.unsqueeze(2) - P.unsqueeze(1))
-                diff = torch.min(diff, torch.tensor([WIDTH, HEIGHT], device=DEVICE) - diff)
-                dist_sq = (diff ** 2).sum(dim=-1)
-                mask = (dist_sq < (VIEW_DIST * 2)**2) & (dist_sq > 0.1)
-                
-                neighbor_happiness = all_agents_happiness.view(BATCH_SIZE, 1, AGENTS_PER_WORLD).expand(-1, AGENTS_PER_WORLD, -1)
-                r_helper_raw = (neighbor_happiness * mask.float()).sum(dim=2).flatten()
-                r_helper = torch.sigmoid(r_helper_raw) + 0.5
+            self.worlds.modify_worlds(self.worlds.state, self.positions, out['mod_logits'].float())
 
-                r_base = r_oracle * r_chaotic * r_complainer
-                reward = r_base * r_helper
-            
-            # --- LEARNING ---
-            
-            # --- EDITED ---
-            # A. Reconstruction Loss (BCEWithLogits against the sparse target)
-            # Re-calculate future_sparse with gradients if we want to drag gradients through (usually not for VQ/Sparse targets)
-            # Here we treat the future sparse state as a fixed target.
-            target_sparse = future_sparse.detach()
-            loss_recon = F.binary_cross_entropy_with_logits(out['recon_logits'], target_sparse)
-            
-            val_pred = out['value_pred'].squeeze()
-            loss_critic = F.mse_loss(val_pred, reward)
-            
-            advantage = reward - val_pred.detach()
+            self.worlds.state = self.worlds.step(self.worlds.state)
+
+            next_views = self.worlds.get_views(self.worlds.state, self.positions)
+
+            pred_pixels = out['predictions'][:, :PIXELS] 
+
+            loss_mse_per_sample = F.mse_loss(pred_pixels, next_views.unsqueeze(1).expand(pred_pixels.shape), reduction='none').mean(dim=1).mean(dim=-1)
+            #loss_mse_per_sample = loss_mse_per_sample.clamp(max=10.0)
+
+            loss_pred = loss_mse_per_sample.mean()
+            predicted_self_loss = out['social_pred'].squeeze()
+            #predicted_self_loss = torch.nan_to_num(predicted_self_loss, nan=0.0, posinf=10.0, neginf=-10.0)
+
+            target_loss = loss_mse_per_sample.detach()
+
+            loss_social = F.mse_loss(predicted_self_loss, target_loss)
+
+            reward = -loss_mse_per_sample.detach()
+
             log_probs = torch.log(move_probs.gather(1, moves_idx.unsqueeze(1)).squeeze() + 1e-8)
-            loss_actor = -(log_probs * advantage).mean()
-            
-            my_predicted_happiness = out['social_pred'].squeeze()
-            loss_social = F.mse_loss(my_predicted_happiness, reward)
-            
-            total_loss = loss_recon + loss_critic + loss_actor + out['vq_loss'] + loss_social
+            loss_actor = -(log_probs * reward).mean()
+            total_loss = loss_pred + loss_social + loss_actor
 
-        self.optimizer.zero_grad(set_to_none=True)
-        self.scaler.scale(total_loss).backward()
-        self.scaler.unscale_(self.optimizer)
-        torch.nn.utils.clip_grad_norm_(self.brain.parameters(), 1.0)
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
+            # 6. Backward Pass
+            total_loss.backward()
+            if self.scaler is None:
+                self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
+            else:
+                self.scaler.scale(total_loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                #torch.nn.utils.clip_grad_norm_(self.brain.parameters(), 1.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            if self.brain.training:
+                self.brain.update_history_buffers(views.detach())
+                self.brain.mem_update(out['new_memory'].detach().clone())
+            self.optimizer.zero_grad(set_to_none=True)
 
-        return self.worlds.state, loss_recon.item()
+        return self.worlds.state, loss_pred.detach()
 
 
 sim = BatchManager()
