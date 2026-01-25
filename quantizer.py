@@ -90,9 +90,9 @@ class GumbelGatherByGate(torch.autograd.Function):
         with torch.no_grad():
             #ideal_targets = y - g#scale gradient somehow. normalize both, hyper param, rangenorm
             
-            ideal_targets = y + g
-            Q = ideal_targets #B, K, C
-            K = candidate_pool #B, P, C
+            ideal_targets = y - g
+            Q = F.normalize(ideal_targets)#B, K, C
+            K = F.normalize(candidate_pool) #B, P, C
           
             # b,k,c dot b, c, p ->  b, k, p
             #A has shape (..., M, N)
@@ -128,6 +128,96 @@ class GumbelGatherByGate(torch.autograd.Function):
         
         
         return grad_gate_logits, grad_candidate_pool, None
+
+
+class HungryGatherFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, gate_logits, candidate_pool, k, tau=1.0, training=False):
+        # Forward is standard Gumbel Top-K
+        if training:
+            gumbels = -torch.log(-torch.log(torch.rand_like(gate_logits) + 1e-10) + 1e-10)
+            gate_logits = (gate_logits + gumbels) / tau
+            
+        b, ct, c = candidate_pool.shape
+        _, top_indices = torch.topk(gate_logits, k=k, dim=-1) # b, k
+        
+        # Save indices for standard backprop path
+        ctx.save_for_backward(gate_logits, candidate_pool, top_indices)
+        ctx.k = k
+        
+        # Gather the actual output
+        expanded_indices = top_indices.unsqueeze(-1).expand(b, k, c)
+        output = torch.gather(candidate_pool, 1, expanded_indices) 
+        
+        return output
+
+    @staticmethod
+    def backward(ctx, g):
+        gate_logits, candidate_pool, top_indices = ctx.saved_tensors
+        k = ctx.k
+        b, p, c = candidate_pool.shape
+        
+        grad_gate = torch.zeros_like(gate_logits)
+        grad_pool = torch.zeros_like(candidate_pool)
+        
+        # --- 1. The Standard Path (Actual Selection) ---
+        # The gradient 'g' flows back to the candidates we ACTUALLY picked.
+        # This creates the "Repulsion" (don't be there next time if loss was high)
+        expanded_indices = top_indices.unsqueeze(-1).expand(b, k, c)
+        grad_pool.scatter_add_(1, expanded_indices, g)
+
+        # --- 2. The Hungry Path (The "Better" Selection) ---
+        with torch.no_grad():
+            # Retrieve the output vector y again
+            y = torch.gather(candidate_pool, 1, expanded_indices)
+            
+            # Calculate the Ideal Vector (Where we SHOULD have been)
+            # FIX: Use subtraction! (Steepest Descent)
+            # Normalize to prevent exploding targets
+            ideal_target = y - g 
+
+            # --- The Search ---
+            # Find which candidate in the pool was CLOSEST to this ideal target.
+            # We use Cosine Similarity for robust matching.
+            
+            # Normalize for search
+            Q = F.normalize(ideal_target, dim=-1)     # b, k, c
+            K = F.normalize(candidate_pool, dim=-1)   # b, p, c
+            
+            # Search: b,k,c @ b,c,p -> b,k,p
+            sim_scores = torch.bmm(Q, K.transpose(1, 2))
+            
+            # For each of the k heads, find the best match in pool
+            _, best_match_indices = torch.max(sim_scores, dim=-1) # b, k
+        
+        # --- 3. The Magnetic Update ---
+        # We want to tell the Gate: "You should have picked best_match_indices"
+        # We want to tell the Pool: "best_match_indices should move closer to ideal_target"
+        
+        # A. Gate Update (Target Prop)
+        # Create a hard target (1.0) at the best index
+        target_gate = torch.zeros_like(gate_logits)
+        target_gate.scatter_(1, best_match_indices, 1.0)
+        
+        # Softmax gradient approximation: (Prob - Target)
+        # If Prob was low but Target is 1, Grad is negative -> Boost Logit
+        probs = F.softmax(gate_logits, dim=-1)
+        grad_gate = probs - target_gate
+        
+        # B. Pool Magnetic Update (Gradient Injection)
+        # We construct a synthetic gradient for the 'best match' 
+        # that pulls it towards 'ideal_target'.
+        
+        # Get the vector of the best match
+        expanded_best = best_match_indices.unsqueeze(-1).expand(b, k, c)
+        best_vectors = torch.gather(candidate_pool, 1, expanded_best)
+        
+        magnetic_force = (best_vectors - ideal_target)
+        
+        magnet_strength = 0.5 
+        grad_pool.scatter_add_(1, expanded_best, magnetic_force * magnet_strength)
+
+        return grad_gate, grad_pool, None, None, None
 
 class ScatterByGate(torch.autograd.Function):
     @staticmethod
@@ -309,6 +399,7 @@ class HardTopKHotBCE(torch.autograd.Function):
         grad_x = F.sigmoid(x) - hard_target
         return grad_x,  None
     
+
 class ThresHot(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
@@ -1095,6 +1186,7 @@ class StochasticHotMod(nn.Module):
         if self._needs_k:
             return self.hotfunc.apply(x_mod, self.k)
         return self.hotfunc.apply(x_mod)   
+
 def calculate_perplexity(logits):
     # Calculates the perplexity of the codebook usage for a batch
     probs = F.softmax(logits, dim=-1).mean(dim=0)

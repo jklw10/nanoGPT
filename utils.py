@@ -232,6 +232,46 @@ def modified_sin_gelu_leaky(x, leaky=0.01):
      return base + sine_mod
 
 
+
+class TrapdoorReLU(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return F.relu(x)
+        #return x.clamp(min=0)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, = ctx.saved_tensors
+        active_mask = (x > 0).float()
+        dead_mask = (x <= 0).float()
+        
+        scale_out = 0.01 
+        scale_in = 0.001
+        #hmm yes i wouldn't make an extremely cursed "derivative"
+        trapdoor_scale = torch.where(grad_output < 0, scale_out, scale_in)
+        
+        final_grad = grad_output * (active_mask + dead_mask * trapdoor_scale)
+        
+        return final_grad
+
+class SyntheticReluGrad(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return F.relu(x)
+
+    @staticmethod
+    def backward(ctx, g):
+        x, = ctx.saved_tensors
+        #ns = F.softplus(-(x))
+        surrogate_grad = F.sigmoid(x)
+        grad_x = g * surrogate_grad
+        return grad_x
+
+def synthrelu(x):
+     return SyntheticReluGrad.apply(x)
+
 def idk_loss(ce_loss, logits, targets, idk_token_id, idk_weight=0.1):
     log_probs = F.log_softmax(logits, dim=-1)
 
@@ -1239,6 +1279,11 @@ def quaternionize(x):
 def rms(x, dim=-1):
     return x * torch.rsqrt(x.pow(2).mean(dim=dim, keepdim=True) + 1e-8)
 
+def perplexity(logits, dim = -1):
+    probs = F.softmax(logits, dim=dim).mean(dim=0)
+    entropy = -torch.sum(probs * torch.log(probs + 1e-10))
+    perplexity = torch.exp(entropy)
+    return perplexity.mean()
 
 def surface_minimize(emb, hidden):
     target_vec = hidden
@@ -1352,6 +1397,7 @@ def get_meta(dataset, always_byte=False):
                 decoded.append(f'[UNK{i}]') 
         return ''.join(decoded)
     return decode, len(itos)
+
 class PreloadedLoader(nn.Module):
     """
     Loads the entire file into GPU VRAM. 

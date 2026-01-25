@@ -623,6 +623,56 @@ class GdiffEmbedding(nn.Module):
         
         return sign * mag
 
+class MLayer(nn.Module):
+    def __init__(self, 
+                 input_dim, 
+                 dim_m, 
+                 bias=False, 
+                 matrix_squarings_exp=None):
+        super(MLayer, self).__init__()
+        self.input_dim = input_dim
+        self.dim_m = dim_m
+        self.with_bias = bias
+        self.matrix_squarings_exp = matrix_squarings_exp
+
+        self.rep_to_exp_tensor = nn.Parameter(
+            torch.empty(input_dim, dim_m, dim_m)
+        )
+
+        if self.with_bias:
+            self.matrix_bias = nn.Parameter(torch.empty(1, dim_m, dim_m))
+        else:
+            self.register_parameter('matrix_bias', None)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.rep_to_exp_tensor)
+        if self.with_bias:
+            nn.init.uniform_(self.matrix_bias, -0.05, 0.05)
+
+    def forward(self, x):
+        weight_flat = self.rep_to_exp_tensor.view(self.input_dim, -1)
+        
+        flat_output = torch.matmul(x, weight_flat)
+        
+        mat = flat_output.view(-1, self.dim_m, self.dim_m)
+
+        if self.with_bias:
+            mat = mat + self.matrix_bias
+
+        if self.matrix_squarings_exp is None:
+            return torch.matrix_exp(mat)
+
+        scale_factor = 0.5 ** self.matrix_squarings_exp
+        identity = torch.eye(self.dim_m, device=mat.device, dtype=mat.dtype)
+        
+        mat = mat * scale_factor + identity
+
+        for _ in range(self.matrix_squarings_exp):
+            mat = torch.matmul(mat, mat)
+            
+        return mat
 class HungryLinearFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input, weight, bias, config):
@@ -633,8 +683,9 @@ class HungryLinearFunc(torch.autograd.Function):
     def backward(ctx, grad_output):
         input, weight, bias = ctx.saved_tensors
         conf = ctx.config
-        noise = torch.randn_like(input) / ( 1e-5 + input.sum())
-        #noise *= grad_output.std()
+        
+        noise = torch.randn_like(input) / ( 1e-5 + utils.perplexity(input))
+        
         input = input + noise
         #grad_output = utils.rms(grad_output)
         input_flat = input.reshape(-1, input.shape[-1])
@@ -644,6 +695,7 @@ class HungryLinearFunc(torch.autograd.Function):
         
         alpha = conf.get('lookahead_alpha', 0.1)
         
+        #grad_weight = utils.rms(grad_weight)
         future_weight = weight - (grad_weight * alpha)
         
         grad_input = grad_output.matmul(future_weight)
@@ -652,7 +704,6 @@ class HungryLinearFunc(torch.autograd.Function):
         if bias is not None:
             grad_bias = grad_flat.sum(0) if grad_output is not None else None
         #grad_input = utils.rms(grad_input)
-        #grad_weight = utils.rms(grad_weight)
         return grad_input, grad_weight, grad_bias, None
 
 class HungryLinear(nn.Module):
@@ -706,32 +757,33 @@ class HungryGdiffLinearfunc(torch.autograd.Function):
         
         raw_grad = grad_flat.t().mm(input_flat)
         
-        g_norm = utils.rms(raw_grad)
-        # C. Regularization
-        wreg = weight
-        reg = conf['lambda'] * wreg.sign() * (wreg.abs().pow(conf['reg_dim'] - 1))
-        g_final = g_norm + reg
+        adjusted_grad = raw_grad
         
+        smoothing = conf['smoothing']
         # D. The "gdiff" Scheduler
         aw_diff = weight_ema - w_eff
-        denom = weight_ema.abs()*0.5 + (g_final - aw_diff).abs()
-        g_diff = 1.0 / (denom + 1e-9)
-        
+        denom = weight_ema.abs() + (adjusted_grad - aw_diff).abs()  #joy a hyper param.
+        g_diff = 1.0 / torch.sqrt(denom + 1e-9)
+
+        adjusted_grad = adjusted_grad * g_diff
+        gw2 = adjusted_grad
+        adjusted_grad = utils.rms(adjusted_grad)
         # E. Final Gradient
-        grad_weight = g_final * g_diff
-        smoothing = conf['smoothing']
+        grad_weight = adjusted_grad 
         weight_ema.add_(smoothing * (weight - weight_ema))
 
 
         if ctx.needs_input_grad[0]:
             
+            #gw2 = gfi
             #gw2 = raw_grad
-            gw2 = grad_weight
+            #gw2 = grad_weight
             alpha = conf.get('lookahead_alpha', 0.1)
 
             future_weight = weight - (gw2 * alpha)
             future_weight = utils.VotedGeometricMean(future_weight, weight_ema)
             
+            #future_weight = weight_ema - (gw2 * alpha)
             grad_input = grad_output.matmul(future_weight)
         
             #grad_input = grad_output.matmul(weight)
@@ -772,3 +824,81 @@ class HungryGdiffLinear(nn.Module):
             x, self.weight, self.weight_ema, self.bias, self.config
         ) 
 
+
+class HungryVGMLinearFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, weight, weight_ema, bias, config):
+        w_eff = utils.VotedGeometricMean(weight, weight_ema)
+        ctx.save_for_backward(input, weight, weight_ema, w_eff)
+        ctx.config = config
+        
+        return F.linear(input,w_eff,bias) 
+
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, weight, weight_ema, w_eff = ctx.saved_tensors
+        conf = ctx.config
+        
+        grad_input = None
+        grad_weight = None
+        grad_bias = None
+
+        noise = torch.randn_like(input) / ( 1e-5 + input.sum())
+        input = input + noise
+        input_flat = input.reshape(-1, input.shape[-1])
+        grad_flat = grad_output.reshape(-1, grad_output.shape[-1])
+        
+        raw_grad = grad_flat.t().mm(input_flat)
+        
+        grad_weight = raw_grad
+        #grad_weight = utils.rms(grad_weight)
+        
+        smoothing = conf['smoothing']
+        weight_ema.add_(smoothing * (weight - weight_ema))
+
+        if ctx.needs_input_grad[0]:
+            
+            #gw2 = raw_grad
+            gw2 = grad_weight
+            alpha = conf.get('lookahead_alpha', 0.1)
+
+            future_weight = weight - (gw2 * alpha)
+            future_weight = utils.VotedGeometricMean(future_weight, weight_ema)
+            
+            #future_weight = weight_ema - (gw2 * alpha)
+            grad_input = grad_output.matmul(future_weight)
+        
+            #grad_input = grad_output.matmul(weight)
+
+        if ctx.needs_input_grad[3] and grad_output is not None:
+            grad_bias = grad_output.reshape(-1, grad_output.shape[-1]).sum(0)
+
+
+        return grad_input, grad_weight, None, grad_bias, None
+    
+class HungryVGMLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias = False,
+                smoothing = 0.01, lookahead= 1e-4):
+        super().__init__()
+        self.in_features = in_features
+        
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        nn.init.kaiming_normal_(self.weight)
+        
+        self.register_buffer('weight_ema', self.weight.clone().detach())
+        
+        self.weight.data.zero_()
+        self.bias = None
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features))
+        
+        self.config = {
+            'lookahead_alpha': lookahead,
+            'smoothing': smoothing,
+        }
+        
+    def forward(self, x):
+        return HungryVGMLinearFunc.apply(
+            x, self.weight, self.weight_ema, self.bias, self.config
+        ) 

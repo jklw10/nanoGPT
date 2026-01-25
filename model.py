@@ -24,8 +24,10 @@ import quantizer
 #todo
 #prediction machine
 #Linear = optim.OptimizedLinear
-#Linear = nn.Linear
-Linear = modules.HungryLinear
+Linear = nn.Linear
+#Linear = modules.HungryGdiffLinear
+#Linear = modules.HungryVGMLinear
+#Linear = modules.HungryLinear
 Orthlin = modules.OrthogonalLinear
 #settings :)
 
@@ -221,7 +223,6 @@ class Kattention(nn.Module):
         return y
 
 
-
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -234,10 +235,26 @@ class MLP(nn.Module):
             #    activation=torch.sin, 
             #    bias=False
             #    )
-            self.sinner = quantizer.PadeKANLinear(
-                config.n_embd, 
-                config.n_embd, 
+            #self.sinner = quantizer.PadeKANLinear(
+            #    config.n_embd, 
+            #    config.n_embd, 
+            #)
+            
+            #self.m_layer    = modules.MLayer(
+            #    config.n_embd,
+            #    config.n_embd,
+            #    bias=config.bias
+            #)
+            self.thing = Linear(
+                config.n_embd,
+                3*config.n_embd,
+                bias=config.bias
             )
+            #self.thing2 = Linear(
+            #    config.n_embd,
+            #    3*config.n_embd,
+            #    bias=config.bias
+            #)
            # self.base = nn.Linear(config.n_embd, config.n_embd, bias=False)
             
             #self.sinner2  = modules.WonkyLinear(up*config.n_embd, config.n_embd, activation=F.gelu, bias=False)
@@ -253,18 +270,16 @@ class MLP(nn.Module):
 
     def forward(self, x):
         if shenanigans:
-            x = (self.sinner(x))
-            #x = self.base(x)
-            #x = F.gelu(x)
-            #x = self.sinner(x)
-            #x = self.sinner2(x)
-            return x# self.dropout(x)
+            a,b,c = self.thing(x).chunk(3,dim=-1)
+            x=a*b+x
+            return x
         else:
             x = self.c_fc(x)
         if(qrot):
             x = self.qrot(x)
         else:
-            x = self.gelu(x)
+            #x= self.gelu()
+            x = utils.SyntheticReluGrad.apply(x)
         #x = x * quantizer.TopKHot.apply(x2, self.n_embd*2)
         x = self.c_proj(x)
         x = self.dropout(x)
@@ -754,9 +769,7 @@ class GPT(nn.Module):
             h = torch.nn.functional.gelu(h)
             pred = torch.nn.functional.linear(h, updated_params[2], updated_params[3])
             L1 = torch.nn.functional.mse_loss(pred[:,:-1,:], auxtarget)
-                    
-                    #if not self.training:
-                    #    self.aux_mlp.zero_grad(set_to_none=True) #ensure no cheating probably not needed
+                   
             acl = L1 #added to loss
                 #else:
         if(self.auxmlpout != self.config.n_embd):
@@ -1237,7 +1250,9 @@ class GPT(nn.Module):
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.zeros_(module.weight)
+            #torch.nn.init.zeros_(module.weight)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        
 
 
     def crop_block_size(self, block_size):
