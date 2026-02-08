@@ -15,6 +15,7 @@ from matplotlib.animation import FuncAnimation
 import modules
 import quantizer
 import utils
+torch._inductor.config.disable_cpp_codegen = True
 #torch.autograd.set_detect_anomaly(True)
 #torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision('medium')
@@ -50,19 +51,15 @@ class Quantizer(nn.Module):
         return z_q
 
 class AgentBrain(nn.Module):
-    def __init__(self): 
+    def __init__(self, action_count=5): 
         super().__init__()
         
         self.mem_block_size = 16
         self.mem_dim = DIM_L1
         
-        # --- EDITED ---
-        # Input: PIXELS (81) -> Latent: DIM_L1 (64)
         self.vq = Quantizer(PIXELS, DIM_L1)
         
-        #self.to_emb = nn.Linear(PIXELS, DIM_L1)
-        #self.ae = quantizer.Autoencoder(PIXELS,128,64,32,quantizer.ThresHot)
-
+        self.action_emb = nn.Linear(action_count, DIM_L1)
         #TODO:hierarchy as futurepredictor.
 
         self.register_buffer('memory', torch.randn(TOTAL_BATCH, self.mem_block_size, self.mem_dim)*0.02)
@@ -79,11 +76,10 @@ class AgentBrain(nn.Module):
         
         self.head_recon = nn.Linear(DIM_L1, DIM_L1) 
         
-        self.head_actor = nn.Linear(DIM_L1, 5) 
+        self.head_actor = nn.Linear(DIM_L1, action_count) 
         self.head_mod = nn.Linear(DIM_L1, 1)   
         self.head_social = nn.Linear(DIM_L1, 1) 
 
-        #self.head_pred = nn.Linear(DIM_L1, PIXELS) 
         fsteps = 3
         self.heads_pred = nn.ModuleList(
             [nn.Sequential(
@@ -95,50 +91,64 @@ class AgentBrain(nn.Module):
         self.register_buffer('memory_history', torch.zeros(TOTAL_BATCH, self.mem_block_size, self.mem_dim, fsteps))
         
         self.register_buffer('history', torch.zeros(TOTAL_BATCH, PIXELS, fsteps))
-   
+        
+        self.register_buffer('action_history', torch.zeros(TOTAL_BATCH, action_count, fsteps))
 
     def forward(self, world):
 
         
-        preds = []
-        for i, head in enumerate(self.heads_pred):
-            mem = self.memory_history[...,i]
-            history = self.history[...,i]
-            xh = self.vq(history).unsqueeze(1)
-            xh = self.mem_center(xh, memory = mem, memup=False)
-            xh = xh[:,-1,:]
-            preds.append(head(xh).unsqueeze(1))
-        preds = torch.cat(preds,dim=1)
 
         futures = []
         x = self.vq(world).unsqueeze(1)
         xh = self.mem_center(x, memory = self.memory, memup=False)
+        
         xh = xh[:,-1,:]
+        actor_logits = self.head_actor(xh)
+        action_hot = quantizer.HardTopKHotBCE.apply(actor_logits, 1)
+        z_act = self.action_emb(action_hot)
+
         for i, head in enumerate(self.heads_pred):
-            futures.append(self.vq(head(xh)).unsqueeze(1))
+            futures.append(self.vq(head(xh+z_act)).unsqueeze(1))
         futures = torch.cat(futures,dim=1)
-        x, newmem = self.mem_center(x, memory = self.memory, predictions=futures)
+        x, newmem = self.mem_center(x+z_act, memory = self.memory, predictions=futures)
         x = x[:,-1,:]
         #recon_logits = self.head_recon(x)
 
 
-        actor_logits = self.head_actor(x)
+        #actor_logits = self.head_actor(x)
         mod_logits = self.head_mod(x)
         social_pred = self.head_social(x)
         
+        #predict current moment.
+        preds = []
+        for i, head in enumerate(self.heads_pred):
+            mem = self.memory_history[...,i]
+            history = self.history[...,i]
+            past_action = self.action_history[...,i]
+            z_act = self.action_emb(past_action)
+            xh = (self.vq(history)+z_act).unsqueeze(1)
+            xh = self.mem_center(xh, memory = mem, memup=False)
+            xh = xh[:,-1,:]
+            preds.append(head(xh).unsqueeze(1))
+        preds = torch.cat(preds,dim=1)
         return {
             'predictions': preds,
             'actor_logits': actor_logits,
+            'action_hot': action_hot, 
             'mod_logits': mod_logits,
             'social_pred': social_pred,
             'new_memory': newmem,
         }
     
-    def update_history_buffers(self, world):
+    def update_history_buffers(self, world, actions_idx):
         with torch.no_grad():
             new_history = torch.cat([self.history[:, :, 1:], world.detach().unsqueeze(-1)], dim=-1)
             self.history = new_history
             
+            action_one_hot = F.one_hot(actions_idx, num_classes=5).float()
+            new_action_hist = torch.cat([self.action_history[:, :, 1:], action_one_hot.unsqueeze(-1)], dim=-1)
+            self.action_history = new_action_hist
+
             oldmem = self.memory.clone().detach()
             new_memory_history = torch.cat([self.memory_history[:, :, :, 1:], oldmem.unsqueeze(-1)], dim=-1)
             self.memory_history = new_memory_history
@@ -258,12 +268,11 @@ class BatchManager:
         self.worlds = ParallelWorlds(BATCH_SIZE, WIDTH, HEIGHT)
         self.brain = AgentBrain().to(DEVICE)
         # Compile can sometimes delay startup, optional depending on setup
-        #self.brain = torch.compile(self.brain)
-        self.optimizer = optim.Grms(
+        self.brain = torch.compile(self.brain)
+        self.optimizer = torch.optim.AdamW(
             params=self.brain.parameters(),
-            lr=2e-4, 
-            nesterov = True, 
-            momentum=0.9,
+            lr=1e-3, 
+            weight_decay=0.1,
             fused=True)
         
         #self.optimizer = torch.optim.AdamW(self.brain.parameters(), lr=2e-4, fused=True)
@@ -283,11 +292,10 @@ class BatchManager:
             # 2. Forward pass
             out = self.brain(views)
 
-            move_logits = out['actor_logits'] # [B*N, 5]
-            #move_logits = torch.nan_to_num(move_logits, nan=0.0, posinf=10.0, neginf=-10.0)
-            move_probs = F.softmax(move_logits.float(), dim=-1)
-
-            moves_idx = torch.multinomial(move_probs, 1).squeeze()
+            action_hot = out['action_hot']
+            moves_idx = torch.argmax(action_hot, dim=-1) # Differentiability ends here for the Env, but persists in 'out'
+            
+            moves = self.moves_tensor[moves_idx]
 
             moves = self.moves_tensor[moves_idx]
 
@@ -306,7 +314,7 @@ class BatchManager:
 
             loss_mse_per_sample = F.mse_loss(pred_pixels, next_views.unsqueeze(1).expand(pred_pixels.shape), reduction='none').mean(dim=1).mean(dim=-1)
             #loss_mse_per_sample = loss_mse_per_sample.clamp(max=10.0)
-
+            #make the world look happy.
             loss_pred = loss_mse_per_sample.mean()
             predicted_self_loss = out['social_pred'].squeeze()
             #predicted_self_loss = torch.nan_to_num(predicted_self_loss, nan=0.0, posinf=10.0, neginf=-10.0)
@@ -315,11 +323,11 @@ class BatchManager:
 
             loss_social = F.mse_loss(predicted_self_loss, target_loss)
 
-            reward = -loss_mse_per_sample.detach()
+            #reward = -loss_mse_per_sample.detach()
 
-            log_probs = torch.log(move_probs.gather(1, moves_idx.unsqueeze(1)).squeeze() + 1e-8)
-            loss_actor = -(log_probs * reward).mean()
-            total_loss = loss_pred + loss_social + loss_actor
+            #log_probs = torch.log(move_probs.gather(1, moves_idx.unsqueeze(1)).squeeze() + 1e-8)
+            #loss_actor = -(log_probs * reward).mean()
+            total_loss = loss_pred + loss_social# + loss_actor
 
             # 6. Backward Pass
             total_loss.backward()
@@ -333,7 +341,7 @@ class BatchManager:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             if self.brain.training:
-                self.brain.update_history_buffers(views.detach())
+                self.brain.update_history_buffers(views.detach(),moves_idx.detach())
                 self.brain.mem_update(out['new_memory'].detach().clone())
             self.optimizer.zero_grad(set_to_none=True)
 

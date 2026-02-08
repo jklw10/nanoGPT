@@ -3,29 +3,28 @@ import os
 import time
 
 #os.environ['CUDA_LAUNCH_BLOCKING'] = "0" 
-import requests
 import pickle
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import tiktoken
 import modules
 import quantizer
 import utils
 
+torch._inductor.config.disable_cpp_codegen = True
 #dataset = "shakespeare_char"
 dataset = "openwebtext"
 data_dir = os.path.join('data', dataset)
 batch_size = 64
 block_size = 256
 
-DIM_L1 = 32
-DIM_L2 = 128
-DIM_L3 = 256
+#you'd think, you really would, but you would be wrong.
+DIM_L1 = 64
+DIM_L2 = DIM_L1
+DIM_L3 = DIM_L2
 
-K_GATHER_L1 = 64
-K_GATHER_L2 = 16
+K_GATHER_L1 = block_size // 2
+K_GATHER_L2 = K_GATHER_L1 // 8
 
 mem_size = 48
 
@@ -44,18 +43,20 @@ min_lr = 1e-4
 
 idk_enabled = False
 cl          = False
-mem         = True
+mem         = False
 gradlog     = False
 gen         = True
 memcheat    = False
 wnorm       = False
-genloss     = False
-resid       = True
+genloss     = True
+resid       = False
 ael         = False
 #todo, wnorm, midreset, lr on memory, memswizzle,
 #ablate hierarchy, add innerblocks, make hierarchical output generation
 
-Linear = modules.OrthogonalLinear# nn.Linear
+#Linear = modules.OrthogonalLinear
+#Linear = nn.Linear
+Linear = modules.HungryLinear
 
 def get_lr(it):
     
@@ -69,81 +70,14 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) 
     return min_lr + coeff * (learning_rate - min_lr)
 
-if dataset == "openwebtext":
-    vocab_size = 256
-    if idk_enabled:
-        idk_token = vocab_size
-        vocab_size += 1
-else:
-    asdf = os.path.join('data', 'shakespeare_char')
-    meta_path = os.path.join(asdf, 'meta.pkl')
+decode, vocab_size = utils.get_meta(dataset,always_byte=True)
+get_batch = utils.get_get_batch(block_size,batch_size,dataset,device,always_byte=True)
 
-    with open(meta_path, 'rb') as f: 
-        meta = pickle.load(f)
-    vocab_size = meta['vocab_size']
-    if idk_enabled:
-        idk_token = vocab_size
-        vocab_size += 1
-
-
-def get_batch(split):
-    if dataset == "openwebtext":
-        return get_batch_from_tokens(split, batch_size, block_size, device, data_dir)
-
-    data = np.memmap(os.path.join(data_dir, f'{split}.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size-skiptok, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+skiptok:i+skiptok+block_size]).astype(np.int64)) for i in ix])
-    if device_type == 'cuda': 
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    else: 
-        x, y = x.to(device), y.to(device)
-    return x, y
-
-if dataset == "openwebtext":
-    print("Building token-to-byte lookup table...")
-    enc = tiktoken.get_encoding("gpt2")
-    TOKEN_TO_BYTES = [torch.tensor(list(enc.decode_bytes([i])), dtype=torch.uint8) for i in range(enc.n_vocab)]
-
-def get_batch_from_tokens(split, batch_size, block_size, device, data_dir):
-    """
-    Reads compressed BPE tokens (uint16) from disk, 
-    converts to raw bytes (uint8) in memory, 
-    and returns a batch of byte-level data.
-    """
-    
-    data_path = os.path.join(data_dir, f'{split}.bin')
-    data_tokens = np.memmap(data_path, dtype=np.uint16, mode='r')
-    
-    fetch_len = max(block_size, 32) 
-    
-    ix = torch.randint(len(data_tokens) - fetch_len, (batch_size,))
-    
-    batch_bytes = []
-    
-    for i in ix:
-        token_chunk = data_tokens[i : i + fetch_len].astype(np.int64)
-        
-        byte_seq = torch.cat([TOKEN_TO_BYTES[t] for t in token_chunk])
-        
-        if len(byte_seq) < block_size + 1:
-            token_chunk = data_tokens[i : i + fetch_len * 2].astype(np.int64)
-            byte_seq = torch.cat([TOKEN_TO_BYTES[t] for t in token_chunk])
-            
-        batch_bytes.append(byte_seq[:block_size + 1])
-
-    data = torch.stack(batch_bytes).to(torch.int64)
-    
-    if device == 'cuda':
-        data = data.pin_memory().to(device, non_blocking=True)
-    else:
-        data = data.to(device)
-        
-    x = data[:, :block_size]
-    y = data[:, 1:block_size+1]
-    
-    return x, y
 wn = torch.nn.utils.parametrizations.weight_norm
+
+
+
+
 class Patcher(nn.Module):
     def __init__(self, outer_dim, inner_dim, outer_seq, inner_seq):
         super().__init__()
@@ -152,138 +86,114 @@ class Patcher(nn.Module):
         self.sdim = 10
 
         self.up_scan = modules.Block(outer_dim,4,0.0,False)
-        self.up_proj = Linear(outer_dim,inner_dim)
-        self.AE = quantizer.Autoencoder(inner_dim,inner_dim,inner_dim,inner_dim,quantizer.ThresHot)
-        self.resid_up = wn(nn.Linear(outer_dim, inner_dim))
-        self.resid_drop = nn.Dropout(dropout)
-        self.output_pos_emb = Linear(outer_seq, inner_dim)
+        self.up_proj = Linear(outer_dim,inner_dim,bias=False)
+        #self.up_proj = modules.Pattention(outer_dim,inner_dim,256)
+        self.AE = quantizer.Autoencoder(
+            inner_dim,inner_dim,inner_dim,inner_dim,
+            quantizer.ThresHot
+            )
         
+        self.resid_up = Linear(outer_dim, inner_dim,bias=False)
+       # self.resid_up = modules.Pattention(outer_dim,inner_dim,256)
+        self.resid_drop = nn.Dropout(0.5)
+        self.down_drop = nn.Dropout(0.1)
+        self.output_pos_emb = nn.Embedding(outer_seq, inner_dim)
+        
+        self.down_block = modules.Block(inner_dim, 4, 0.0,False)
         self.down_scatter = modules.CombineBlock(inner_dim, 4, 0.0,False)
         self.down_scatter2 = modules.CombineBlock(outer_dim, 4, 0.0,False)
-        self.down_proj = Linear(inner_dim,outer_dim)
+        self.down_proj = Linear(inner_dim,outer_dim,bias=False)
+        #self.down_proj = modules.Pattention(inner_dim,outer_dim,256)
         self.down_scan = modules.Block(outer_dim,4,0.0,False)
         
-        #self.up_gate = nn.Linear(self.sdim*outer_seq, outer_seq)
         self.up_gate = nn.Sequential(
-            Linear(outer_dim, outer_dim // 4),
-            nn.ReLU(),
+            Linear(outer_dim, outer_dim // 4,bias=False),
+            nn.GELU(),
             Linear(outer_dim // 4, 1)
         )
 
-        #self.down_gate = nn.Linear(self.sdim*inner_seq, outer_seq)
         self.down_gate = nn.Sequential(
-            Linear(outer_dim, outer_dim // 4),
-            nn.ReLU(),
+            Linear(outer_dim, outer_dim // 4,bias=False),
+            nn.GELU(),
             Linear(outer_dim // 4, outer_seq)
         )
 
-
-        self.res_norm = modules.LayerNorm(inner_dim, False)
+        self.res_norm = modules.LayerNorm(outer_dim, False)
         self.down_norm = modules.LayerNorm(inner_dim, False)
         self.gate_norm = modules.LayerNorm(outer_seq, False)
 
         self.up_norm = modules.LayerNorm(outer_dim, False)
         self.upgate_norm = modules.LayerNorm(outer_seq, False)
         self.up_drain = nn.Parameter(torch.ones(outer_dim))
-
         
-        #self.query_block = modules.SSMBlock(outer_dim, 0.0, False)
+        
         self.query_block = modules.Block(outer_dim, 4, 0.0, False)
         self.gather_block = modules.CombineBlock(outer_dim, 4, 0.0,False)
+        self.proj_block = modules.Block(inner_dim, 4, 0.0,False)
+        
+        if not resid:
+            torch.nn.init.normal_(self.down_proj.weight, std=0.02) 
+            #torch.nn.init.normal_(self.down_proj.weight, std=0.02) 
+        
     
-    def abstract_up(self, x):
-        #scan = self.up_scan(x, causal = False)
-        #scan = F.softmax(scan, dim=-1)
-        #scan = self.up_norm(scan)
-        #gate = self.up_gate(scan).squeeze(-1)
-        #scan = self.query_block(x, causal = True)
-        ##gate = F.softmax(gate, dim=-1)
-        #gate = self.up_gate(x).squeeze(-1)
-        #
-        ##losses = F.mse_loss(x[:,1:,:],scan[:,:-1,:],reduction="none")
-        ##gate = losses.sum(dim=-1)
-        ##gate = F.pad(gate, (1, 0), "constant", 0)#.detach()
-        #
-        #gathered = quantizer.GatherByGate.apply(gate, scan, self.inner_seq)
-        #compressed sensing says that random samples should suffice?
+    def abstract_up(self, x, conf=None):
+        gathered = self.query_block(x, conf=conf)
+        gate = self.up_gate(gathered).squeeze(-1)
+        gate = self.gate_norm(gate)
+        gathered = quantizer.GatherByGate.apply(
+            gate, 
+            gathered, 
+            self.inner_seq,
+            )
+        #gathered = quantizer.HungryGatherFunc2.apply(
+        #    gate, 
+        #    gathered, 
+        #    self.inner_seq,
+        #    0.01,   # tau
+        #    self.training,  # training
+        #    0.0,   #magnet
+        #    )
         
-        #TODO
-        gathered = self.query_block(x, causal = False)
-        gathered = gathered[:,-self.inner_seq:,:]#usefullness requires a real gather here.
-        
-        #gate = self.up_gate(gathered).squeeze(-1)
-        
-        #_,gidx = torch.topk(gate,self.inner_seq)
-        #eidx = gidx.unsqueeze(-1).expand(-1, -1, x.shape[-1])
-        #gathered = torch.gather(gathered,1,eidx)
-        #_,idx = torch.topk(gate,self.inner_seq)
-        ###idx = utils.bluenoise_indices(x.shape[0], self.outer_seq, self.inner_seq,device=x.device)
-        ##
-        #eidx = idx.unsqueeze(-1).expand(-1, -1, x.shape[-1])
-        #gathered = torch.gather(gathered,1,eidx)
-        #gathered = quantizer.GatherByGate.apply(gate, gathered, self.inner_seq)
-        gathered = self.gather_block( x,gathered, causal = False)
         up = self.up_proj(gathered)
-        ae_up, hot = self.AE(up)
-        aux = F.mse_loss(up, ae_up)
-        return ae_up, [x, hot, None, aux]
+        up = self.proj_block(up, conf=conf)
+        hot= None
+        aux= 0.0
+        #ae_up, hot = self.AE(up)
+        #aux = F.mse_loss(up, ae_up)
+        #up = ae_up
+        return up, [x, hot, gate, aux]
     
-    def abstract_down(self, x, residual, decaying =  None):
-        #sg = self.down_gate(x[...,:self.sdim].reshape(x.shape[0], self.inner_seq*self.sdim))
-        residual, hot, _, upaux = residual
+    def abstract_down(self, x, residual, decaying =  None, conf=None):
+        residual, hot, gate, upaux = residual
         aux=0
         x = self.down_norm(x)
         if ael:
             aux = F.binary_cross_entropy(self.AE.quant(x)[:,:-1,:], hot.detach()[:,1:,:])#ablate
-        #pgd = p_down = self.down_proj(x)
-        #pgd = self.down_scan(pgd)[:,-1,:]
-        #sg = self.down_gate(pgd)
-        ##sg = F.softmax(sg, dim=-1) 
-        #sg = self.gate_norm(sg)
         
         pos = torch.arange(0, self.outer_seq, dtype=torch.long, device=device) 
-        phot = F.one_hot(pos, self.outer_seq).to(x.dtype).detach()
-        pos_emb = self.output_pos_emb(phot).expand(x.shape[0],-1,-1)
-        #query = scattered + pos_emb 
-        query = pos_emb 
-        
-        pds = self.down_scatter(x, query, causal=False)#maybe detach.
+       
+        scattered = quantizer.ScatterByGate.apply(gate, x, self.outer_seq)
+        pos_emb = self.output_pos_emb(pos).expand(scattered.shape)
+        scattered = scattered + pos_emb 
+        pds = self.down_block(scattered, conf=conf)
         pds = self.down_proj(pds)
             
-        aux3 = 0.0
         if resid:
+            query = residual
             query = self.res_norm(query)
-            if decaying is not None:
-                
-                cosdec = torch.cos((1.0-decaying) * (math.pi / 2))
-
-                cosdec = torch.clamp(cosdec,0.0,1.0)
-                aux3 = F.mse_loss(pds,residual.detach())*cosdec
-                d = residual * cosdec#decaying#(1.0-decaying)
-                if self.training:
-                    noise = torch.randn_like(d) * (1-cosdec)
-                    d = d+noise
-                query = query + self.resid_up(d.detach())
-
+        else:
+            query = self.down_proj(pos_emb)
+            query = self.res_norm(query)
             
-        #scattered = torch.zeros(x.shape[0], self.outer_seq, x.shape[2], dtype=x.dtype, device=x.device)
-        #_,idx = torch.topk(gate,self.inner_seq)
-        #eidx = idx.unsqueeze(-1).expand(-1, -1, x.shape[-1])
-        #scattered.scatter_(1, eidx, x)
-        #scattered = torch.scatter(1,x,idx)
-        #scattered = quantizer.ScatterByGate.apply(gate, x, self.outer_seq)# technically causal leak
-        #print(query.shape)
-        query = self.down_proj(query)#+residual#ablate
-        p_down = self.down_scatter2(pds, query, causal=True)#
-        #pds = self.down_scatter(x, pos_emb)# self.resid_up(residual))
-        #p_down=residual+p_down
-        aux = aux+upaux+aux3
-        return self.down_scan(p_down), aux
+        xout = self.down_scatter2(pds, query, causal=True, conf=conf)
+        xout = self.down_scan(xout, conf=conf)
+        aux = aux+upaux
+        return xout, aux
     
-    def forward(self, x, center):
-        p_up, residual = self.abstract_up(x)
+    def forward(self, x, center, conf=None):
+        p_up, residual = self.abstract_up(x, conf=conf)
         passed, aux = center(p_up)
-        p_down, aux2 = self.abstract_down(passed, residual)
+        p_down, aux2 = self.abstract_down(passed, residual, conf=conf)
         return p_down, aux+aux2
     
 
@@ -292,8 +202,9 @@ class HNet(nn.Module):
         super().__init__()
         self.token_embedder = nn.Embedding(vocab_size, DIM_L1)
         self.pos_embedder = nn.Embedding(block_size, DIM_L1)
-        self.head = Linear(DIM_L1, vocab_size)
+        self.head = Linear(DIM_L1, vocab_size,bias=False)
         self.n_layer = 2
+        self.h_ln = modules.LayerNorm(DIM_L1,bias=False)
         self.sLayers = nn.ModuleList([
             Patcher(DIM_L1,DIM_L2,block_size,K_GATHER_L1),
             Patcher(DIM_L2,DIM_L3,K_GATHER_L1,K_GATHER_L2),
@@ -317,7 +228,15 @@ class HNet(nn.Module):
             self.cmem= True
             self.dreamer = modules.Dreamer(**memconf)
             self.memory_selector = modules.Block(**memconf)
-
+   #    self.apply(self._init_weights)
+   #
+   #def _init_weights(self, module):
+        #if isinstance(module, Linear):
+        #    torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        #    if module.bias is not None:
+        #        torch.nn.init.zeros_(module.bias)
+        #if isinstance(module, nn.Embedding):
+        #    torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     def mem_form(self, x):
         mem         = self.memory_selector(x, causal=self.cmem)[:,:self.mem_block_size,:] #(b, m, c)
         #check_nan(mem, "selector")
@@ -329,7 +248,7 @@ class HNet(nn.Module):
                 self.memory = (self.memory+update*malpha)
     
 
-    def forward(self, idx, targets=None, decaying = None):
+    def forward(self, idx, targets=None, decaying = None, conf=None):
         device = idx.device
         b, t = idx.shape
         
@@ -341,20 +260,20 @@ class HNet(nn.Module):
         residuals = []
         for i, layer in enumerate(self.sLayers):
             
-            x, res = layer.abstract_up(x)
+            x, res = layer.abstract_up(x, conf=conf)
             residuals.append(res)
 
         if mem:
-            x = self.mem_center(x)
+            x = self.mem_center(x, conf=conf)
         else:
             for block in self.inner:
-                x = block(x)
+                x = block(x, conf=conf)
         aux=0
         for i in reversed(range(len(self.sLayers))):
             layer = self.sLayers[i]
-            x, auxl = layer.abstract_down(x, residuals[i], decaying = decaying)
+            x, auxl = layer.abstract_down(x, residuals[i], decaying = decaying, conf=conf)
             aux = aux+auxl
-        
+        x = self.h_ln(x)
         if targets is None: #during inference skip the losses
             logits = self.head(x[:, -skiptok:, :])
             return logits
@@ -375,13 +294,14 @@ class HNet(nn.Module):
                 current_output_rep = encoded_output
         
         
-        logits = self.head(x)
+        logits = self.head(x,conf)
         B, T_out, C = logits.shape
         targets_aligned = targets[:, :T_out]
         
         loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets_aligned.reshape(-1))
         gloss = 0.0
-        #gloss = F.cross_entropy(logits[:,:-1,:].reshape(-1, C), targets_aligned[:,:-1,:].reshape(-1))
+        if genloss:
+            gloss = F.cross_entropy(logits[:,-1,:].reshape(-1, C), targets_aligned[:,-1].reshape(-1)).detach()
         if self.training:
             if idk_enabled:
                 loss = utils.idk_loss(loss, logits, targets, idk_token) 
@@ -452,9 +372,9 @@ class FeedForward(nn.Module):
     def __init__(self, n_in, n_out, dropout):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_in, 4 * n_out),
+            Linear(n_in, 4 * n_out,bias=False),
             nn.GELU(),
-            nn.Linear(4 * n_out, n_out),
+            Linear(4 * n_out, n_out,bias=False),
             nn.Dropout(dropout),
         )
 
@@ -486,7 +406,7 @@ class cascadenet(nn.Module):
         self.ln_out = nn.LayerNorm(n_embd)
 
         # Final output layer
-        self.lm_head = Linear(n_embd, vocab_size)
+        self.lm_head = Linear(n_embd, vocab_size,bias=False)
 
         self.apply(self._init_weights)
 
@@ -571,8 +491,10 @@ if gradlog:
             
 t0 = time.time()
 t2 = time.time()
+conf={}
 for iter in range(max_iters):
     lr = get_lr(iter)
+    conf['lr'] = 5e-5
     decaying = 1.0 - (iter / decay_iters)
     decaying = torch.tensor(decaying, device=device, dtype=torch.float32)
     decaying = torch.clamp(decaying, 0.0, 1.0)
@@ -589,16 +511,18 @@ for iter in range(max_iters):
                 _, loss, gloss = model(X_val, Y_val, decaying= decaying)
             losses[split] = loss.detach().item()
             if genloss and split == 'val':
-                glosses[split] = gloss.detach().item()
+                glosses[split] = gloss
         optimizer.zero_grad(set_to_none=True)
         t1 = time.time()
+        print(f"step {iter:{len(str(max_iters))}d}: ",end="")
+        print(f"train loss: {losses['train']:.4f}, val loss: {losses['val']:.4f}, ",end="")
         if genloss:
-            print(f"gen loss{glosses['val']:.4f}",end="")
-        print(f"step {iter}: train loss: {losses['train']:.4f}, val loss: {losses['val']:.4f}, time: {(t2-t0)*1000:.0f} ms, Tval: {(t1-t2)*1000:.0f} ms ")
+            print(f"gen loss: {glosses['val']:.4f}, ",end="")
+        print(f"time: {(t2-t0)*1000:.0f} ms, Tval: {(t1-t2)*1000:.0f} ms")
         model.train()
         t0 = time.time()
     X, Y = get_batch('train')
-    logits, loss, gloss = model(X, Y, decaying= decaying)
+    logits, loss, gloss = model(X, Y, decaying= decaying,conf= conf)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     
@@ -613,27 +537,7 @@ for iter in range(max_iters):
             utils.softwnorm(model,1e-4)
     
 if gen:
-    if dataset== "openwebtext":
-        def decode(ll):
-            valid_bytes = [b for b in ll if b < 256] 
-            return bytes(valid_bytes).decode('utf-8', errors='replace')
-    else:
-        with open(meta_path, 'rb') as f:
-            meta = pickle.load(f)
-        stoi, itos = meta['stoi'], meta['itos']
-        def encode(s): 
-            return [stoi[c] for c in s]
-        def decode(ll):
-            decoded = []
-            for i in ll:
-                if i in itos:
-                    decoded.append(itos[i])
-                elif i == idk_token:
-                    decoded.append('[IDK]')
-                else:
-                    decoded.append(f'[UNK{i}]')  # Or another placeholder for unknown tokens
-            return ''.join(decoded)
-
+    
     print("sanity check")
     X, Y = get_batch('train')
     with torch.no_grad():

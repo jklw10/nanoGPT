@@ -17,6 +17,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 """
 import gc
 import os
+from re import A
 import time
 import math
 import pickle
@@ -33,16 +34,11 @@ from model import MLP, GPTConfig, GPT
 import optim
 import utils
 
-
-from torch.func import functional_call, vmap
-
-from torch.utils.data import Dataset, DataLoader
-
 import seaborn as sns
 import matplotlib.pyplot as plt
 
-import torch._functorch.config
-torch._functorch.config.donated_buffer = False
+#import torch._functorch.config
+#torch._functorch.config.donated_buffer = False
 torch._dynamo.optimize()
 #torch._inductor.config.force_disable_caches = True
 torch._inductor.config.disable_cpp_codegen = True
@@ -91,6 +87,7 @@ lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
+always_byte = False # use bytes instead of tokens
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
@@ -139,65 +136,12 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-data_dir = os.path.join('data', dataset)
-def get_batch(split, sequential = False, size = None):
-    if size is None:
-        size = block_size
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-    else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    #print(f"datalen {len(data)}")
-    ix = torch.randint(len(data) - size, (batch_size,))
+#data_dir = os.path.join('data', dataset)
+get_batch = utils.get_get_batch(block_size,batch_size,dataset,device,always_byte=always_byte)
 
-    if(sequential):
-        max_start_index = len(data) - size - batch_size
-        start_ix = torch.randint(max_start_index, (1,)).item()
-        ix = range(start_ix, start_ix + batch_size)
-    
-    x = torch.stack([torch.from_numpy((data[i:i+size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+size]).astype(np.int64)) for i in ix])
-    
-    #outp = model.generate(X, 100, temperature=0.01, top_k=200)
-    
-    if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y = x.to(device), y.to(device)
-    
-    return x, y
-
-meta_path = os.path.join('data', 'shakespeare_char/meta.pkl')
-    
-with open(meta_path, 'rb') as f:
-    meta = pickle.load(f)
-stoi, itos = meta['stoi'], meta['itos']
-def encode(s): [stoi[c] for c in s]
-def decode(ll):
-    decoded = []
-    for i in ll:
-        if i in itos:
-            decoded.append(itos[i])
-        else:
-            decoded.append('[UNK]')  # Or another placeholder for unknown tokens
-    return ''.join(decoded)
-
-# init these up here, can override if init_from='resume' (i.e. from a checkpoint)
+decode, meta_vocab_size = utils.get_meta(dataset,always_byte=always_byte)
 iter_num = 0
-best_val_loss = 1e9
-
-# attempt to derive vocab_size from the dataset
-meta_path = os.path.join(data_dir, 'meta.pkl')
-meta_vocab_size = None
-if os.path.exists(meta_path):
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    meta_vocab_size = meta['vocab_size']
-    print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
-
+best_val_loss = 3409349034 # good number for sure
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
@@ -295,8 +239,9 @@ gzca_enabled        = False #or best
 swnorm_enabled      = False or best
 
 plot                = False
-
 muon                = False
+
+endgen              = True
 #for fftmem owt: 1e-5 #beta2 dependent
 #for fftmem skspr: 5e-5 #beta2 dependent
 wfunc               = utils.fast_polar_decomposition
@@ -463,7 +408,7 @@ scaler = torch.amp.GradScaler(device_type, enabled=(dtype == 'float16'))
 
 
 # optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+optimizer, optimizer2 = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
@@ -505,6 +450,8 @@ def estimate_loss(decay = 1.0, size =None):
     del Y
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
+    if optimizer2 is not None:
+        optimizer2.zero_grad(set_to_none=True)
     return out
 
 def get_lr(it):
@@ -581,7 +528,17 @@ if plot:
                torch.linalg.svdvals(porth).detach().cpu())
 
     plot_spectra(s_ortho, iter_num, fig, axes)
-  
+
+def get_cpt():
+    return {
+                'model':            raw_model.state_dict(),
+                'optimizer':        optimizer.state_dict(),
+                #'optimizer2':       optimizer2.state_dict(),
+                'model_args':       model_args,
+                'iter_num':         iter_num,
+                'best_val_loss':    best_val_loss,
+                'config':           config,
+            }
 
 def model_step(iter_num, tl, best_val_loss, config):
     # determine and set the learning rate for this iteration
@@ -598,14 +555,7 @@ def model_step(iter_num, tl, best_val_loss, config):
     size = block_size
     if sizejump:
         if(iter_num == 25000):
-            checkpoint = {
-                'model':            raw_model.state_dict(),
-                'optimizer':        optimizer.state_dict(),
-                'model_args':       model_args,
-                'iter_num':         iter_num,
-                'best_val_loss':    best_val_loss,
-                'config':           config,
-            }
+            checkpoint = get_cpt()
             torch.save(checkpoint, os.path.join(out_dir, '25k.pt'))
         if(iter_num > 25000):
 
@@ -629,6 +579,10 @@ def model_step(iter_num, tl, best_val_loss, config):
     for param_group in optimizer.param_groups:
         scale = param_group.get('lr_scale', 1.0)
         param_group['lr'] = lr*scale
+    if optimizer2 is not None:
+        for param_group in optimizer2.param_groups:
+            scale = param_group.get('lr_scale', 1.0)
+            param_group['lr'] = lr*scale
     if iter_num % eval_interval == 0 and master_process: 
         if(iter_num > 0):
             
@@ -659,14 +613,7 @@ def model_step(iter_num, tl, best_val_loss, config):
             if losses['val'] < best_val_loss or always_save_checkpoint:
                 best_val_loss = losses['val'].detach()
                 if iter_num > 0:
-                    checkpoint = {
-                        'model': raw_model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'model_args': model_args,
-                        'iter_num': iter_num,
-                        'best_val_loss': best_val_loss,
-                        'config': config,
-                    }
+                    checkpoint = get_cpt()
                 saved = True
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
             
@@ -680,7 +627,7 @@ def model_step(iter_num, tl, best_val_loss, config):
     
     
    
-    X, Y = get_batch('train', seqbatch, size)
+    X, Y = get_batch('train', size)
     #@torch.compile()
     def closure():
         torch.compiler.cudagraph_mark_step_begin()
@@ -709,6 +656,8 @@ def model_step(iter_num, tl, best_val_loss, config):
     #                p.grad += p.gema * 2
     #                p.grad /= 3
     optimizer.step()
+    if optimizer2 is not None:
+        optimizer2.step()
     
     for mod in model.modules():
         if isinstance(mod, optim.OptimizedLinear):
@@ -727,6 +676,8 @@ def model_step(iter_num, tl, best_val_loss, config):
         model.resetsink()
 
     optimizer.zero_grad(set_to_none=True)
+    if optimizer2 is not None:
+        optimizer2.zero_grad(set_to_none=True)
     if iter_num > max_iters:
         return 0, False, best_val_loss
     return iter_num + 1, True, best_val_loss
@@ -734,17 +685,20 @@ run = True
 tl = time.time()
 while run:
     if iter_num % eval_interval == 3:
+        
         tl= time.time()
     iter_num, run, best_val_loss = model_step(iter_num, tl, best_val_loss, config)
 
-checkpoint = {
-    'model': raw_model.state_dict(),
-    'optimizer': optimizer.state_dict(),
-    'model_args': model_args,
-    'iter_num': iter_num,
-    'best_val_loss': best_val_loss,
-    'config': config,
-}
+if endgen:
+    print("sanity check")
+    X, Y = get_batch('train')
+    with torch.no_grad():
+        model.eval()
+        outp = model.generate(X[0].unsqueeze(0), 100, temperature=1.0, top_k=1)
+        model.train()
+    print(decode(outp[0,-100:].detach().cpu().numpy().tolist()))
+    print("Training finished.")
+checkpoint = get_cpt()
 torch.save(checkpoint, os.path.join(out_dir, 'fckpt.pt'))
 
 if ddp:

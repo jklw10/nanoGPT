@@ -25,12 +25,14 @@ import quantizer
 #prediction machine
 #Linear = optim.OptimizedLinear
 Linear = nn.Linear
+#Linear = modules.TensionLinear
+Plin = modules.ProbingLinear
 #Linear = modules.HungryGdiffLinear
 #Linear = modules.HungryVGMLinear
 #Linear = modules.HungryLinear
 Orthlin = modules.OrthogonalLinear
 #settings :)
-
+plin            = False
 #good in owt
 qnorm           = False
 #good in shkspr
@@ -66,13 +68,14 @@ mmnorm          = False
 normless        = False
 orthqkvc        = False
 orthHead        = False
-rmHead          = False
+wnHead          = False
 
 nmix            = False
 losspred        = False
 
 dynskip         = False
 k_atten         = False
+p_atten         = False
 sprs            = False
 wnll            = False
 
@@ -82,8 +85,12 @@ posembdrop      = False
 
 exposemb        = False
 
-shenanigans     = False
 residless       = False
+
+pattmlp         = False
+qksink          = False
+v_patt          = False
+qkwn            = False
 
 residcomp       = False
 mhc_lr          = 0.01
@@ -91,7 +98,7 @@ mhc_lr          = 0.01
 #known good
 ssmax           = True
 mtp             = False
-CCE             = True and not orthHead
+CCE             = True and not orthHead and not wnHead
 
 auxmod          = acl1 or acebtl #or topoloss
 
@@ -118,15 +125,37 @@ class LayerNorm(nn.Module):
            # return utils.acwrap(input*self.weight, torch.tanh, self.bias)
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+def get_dct_matrix(N):
+    dct_m = torch.zeros(N, N)
+    for k in range(N):
+        for n in range(N):
+            weight = math.cos((math.pi / N) * (n + 0.5) * k)
+            if k == 0:
+                weight *= math.sqrt(1 / N)
+            else:
+                weight *= math.sqrt(2 / N)
+            dct_m[k, n] = weight
+    return dct_m
 
 class Attention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.q_attn = Linear(config.n_embd,  config.n_embd, bias=config.bias)
-        self.k_attn = Linear(config.n_embd,  config.n_embd, bias=config.bias)
-        self.v_attn = Linear(config.n_embd,  config.n_embd, bias=config.bias)
+        if qkwn:
+            self.q_attn = wn(Linear(config.n_embd,  config.n_embd, bias=config.bias))
+            self.k_attn = wn(Linear(config.n_embd,  config.n_embd, bias=config.bias))
+        else:
+            self.q_attn = (Linear(config.n_embd,  config.n_embd, bias=config.bias))
+            self.k_attn = (Linear(config.n_embd,  config.n_embd, bias=config.bias))
+        
+        
+        if v_patt:
+            self.v_attn = modules.MHKPattLayer(config.n_embd,  config.n_embd, 256, heads=1)# bias=config.bias)
+        else:
+            self.v_attn = Linear(config.n_embd,  config.n_embd, bias=config.bias)
+        
+
         self.c_proj = Linear(config.n_embd,  config.n_embd, bias=config.bias)
 
         if orthqkvc:
@@ -134,7 +163,24 @@ class Attention(nn.Module):
             self.k_attn = Orthlin(config.n_embd,  config.n_embd, bias=config.bias)
             self.v_attn = Orthlin(config.n_embd,  config.n_embd, bias=config.bias)
             self.c_proj = Orthlin(config.n_embd,  config.n_embd, bias=config.bias)
+        
+        if plin:
+            self.q_attn = Plin(config.n_embd,  config.n_embd, bias=config.bias)
+            self.k_attn = Plin(config.n_embd,  config.n_embd, bias=config.bias)
+            self.v_attn = Plin(config.n_embd,  config.n_embd, bias=config.bias)
+            self.c_proj = Plin(config.n_embd,  config.n_embd, bias=config.bias)
+        
         #else:
+        if qksink:
+            self.energy_bind1 = modules.SinkhornLinear(config.n_embd)
+            self.energy_bind2 = modules.SinkhornLinear(config.n_embd)
+        
+        #self.fft_dim = config.n_embd // 2 + 1
+        #self.fft_energy_bind1 = modules.SinkhornLinear(self.fft_dim)
+        #self.fft_energy_bind2 = modules.SinkhornLinear(self.fft_dim)
+        
+        #self.fft_proj_energy_bind1 = modules.LearnableSpectralSinkhorn(config.n_embd)
+        #self.fft_proj_energy_bind2 = modules.LearnableSpectralSinkhorn(config.n_embd)
         
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
@@ -145,12 +191,62 @@ class Attention(nn.Module):
         self.head_dim =  self.n_embd //  self.n_head 
         
         self.qm = nn.Parameter(torch.ones(self.head_dim).normal_(mean=1, std=0.1))
+    
+    def apply_spectral_sinkhorn(self, x, sinkhorn_layer):
+        x_f = torch.fft.rfft(x.float(), n=x.shape[-1], dim=-1)
         
+        real_part = x_f.real
+        imag_part = x_f.imag
+        
+        mixed_real = sinkhorn_layer(real_part).float()
+        mixed_imag = sinkhorn_layer(imag_part).float()
+        
+        x_f_mixed = torch.complex(mixed_real, mixed_imag)
+        x_out = torch.fft.irfft(x_f_mixed, n=x.shape[-1], dim=-1)
+        
+        return x_out.to(x.dtype)
+    
+    def apply_fft_processing(self, x, sinkhorn_layer):
+        x_f = torch.fft.rfft(x.float(), n=x.shape[-1], dim=-1, norm='ortho')
+        
+        mag = x_f.abs() + 1e-8
+        phase = x_f.angle()
+        
+        norm_mag= utils.rms(mag,dim=-1)
+        #norm_mag = torch.log1p(mag)
+
+        processed_mag = sinkhorn_layer(norm_mag)
+        #torch.complex(0.0,phase)
+        processed_complex = processed_mag * torch.exp(torch.complex(torch.zeros_like(phase),phase))
+
+        return torch.fft.irfft(processed_complex, n=x.shape[-1], dim=-1, norm='ortho')
     def forward(self, x, causal=True):
         B, T, C = x.size() 
-        q = self.q_attn(x)
-        k = self.k_attn(x)
-        v = self.v_attn(x)
+        #fftx = torch.fft.rfft(x,self.fft_dim,dim=-1)
+        #q = self.q_attn(torch.fft.irfft(self.fft_energy_bind1(fftx),self.n_embd,dim=-1))#self.q_attn
+        #k = self.k_attn(torch.fft.irfft(self.fft_energy_bind2(fftx),self.n_embd,dim=-1))#self.k_attn
+        #x_mag = torch.fft.fft(x.float(), dim=-1).abs()
+      
+       # x_mag = torch.log1p(x_mag)
+        #x_mag = x_mag / (x_mag.max(dim=-1, keepdim=True)[0] + 1e-6)
+        #x_mag= utils.rms(x_mag,dim=-1)
+        #q = self.q_attn(self.energy_bind1(x_mag))
+        #k = self.k_attn(self.energy_bind2(x_mag))
+        #q = (self.energy_bind1(x_mag))
+        #k = (self.energy_bind2(x_mag))
+        #q = self.fft_proj_energy_bind1(x)
+        #k = self.fft_proj_energy_bind2(x)
+        #q = self.q_attn(x)#can be combined?
+        #q = self.apply_fft_processing(q, self.fft_energy_bind1)
+        #k = self.k_attn(x)
+        #k = self.apply_fft_processing(k, self.fft_energy_bind2)
+        if qksink:
+            q = self.q_attn(self.energy_bind1(x))
+            k = self.k_attn(self.energy_bind2(x))
+        else:
+            q = self.q_attn(x)
+            k = self.k_attn(x)
+        v = (self.v_attn(x))
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
@@ -160,67 +256,11 @@ class Attention(nn.Module):
         else:
             y = torch.nn.functional.scaled_dot_product_attention(q,k,  v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal= causal)
         
-        y = y.transpose(1, 2).contiguous().view(B, T, self.n_head * self.head_dim) 
+        y = y.transpose(1, 2).contiguous().view(B, T, C) 
         y = self.resid_dropout(self.c_proj(y))
 
         return y
 
-class Kattention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        if orthqkvc:
-            self.q_attn = (Orthlin(config.n_embd,  config.n_embd, bias=config.bias))
-            self.k_attn = (Orthlin(config.n_embd,  config.n_embd, bias=config.bias))
-        else:
-            self.q_attn = (Linear(config.n_embd,  config.n_embd, bias=config.bias))
-            self.k_attn = (Linear(config.n_embd,  config.n_embd, bias=config.bias))
-        self.v_attn = Linear(config.n_embd,  config.n_embd, bias=config.bias)
-        
-        
-        # output projection
-        self.c_proj = Linear(config.n_embd,  config.n_embd, bias=config.bias)
-        
-        #attention mod modifier
-        self.attmod = Linear(config.n_embd,  config.n_embd, bias=config.bias)
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head 
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-        self.head_dim =  self.n_embd //  self.n_head 
-
-        self.k_sparse=4
-
-        self.qm = nn.Parameter(torch.ones(self.head_dim).normal_(mean=1, std=0.1))
-        
-    def forward(self, x, causal=True):
-        B, T, C = x.size() 
-        q = self.q_attn(x)
-        k = self.k_attn(x)
-        v = self.v_attn(x)
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-
-        k_val = min(self.k_sparse, T)
-
-        att = (q*(math.log(T)*self.qm) @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-    
-        causal_mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, T, T)
-        att = att.masked_fill(causal_mask == 0, float('-inf'))
-        k_hot_mask = quantizer.TopKHot.apply(att, k_val)
-        att = att.masked_fill(k_hot_mask == 0, float('-inf'))
-        att = torch.softmax(att,dim=-1) 
-        #att = F.gumbel_softmax(att,tau= 1.0, hard=True, dim =-1)
-        y = att@v
-
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.resid_dropout(self.c_proj(y))
-        
-        return y
 
 
 class MLP(nn.Module):
@@ -228,59 +268,42 @@ class MLP(nn.Module):
         super().__init__()
         self.n_embd = config.n_embd
         up = 4
-        if shenanigans:
-            #self.sinner = modules.WonkyLinear(
-            #    config.n_embd, 
-            #    config.n_embd, 
-            #    activation=torch.sin, 
-            #    bias=False
-            #    )
-            #self.sinner = quantizer.PadeKANLinear(
-            #    config.n_embd, 
-            #    config.n_embd, 
-            #)
+        if pattmlp:
             
-            #self.m_layer    = modules.MLayer(
-            #    config.n_embd,
-            #    config.n_embd,
-            #    bias=config.bias
-            #)
-            self.thing = Linear(
+            self.thing = modules.PattLayer(
                 config.n_embd,
-                3*config.n_embd,
-                bias=config.bias
+                config.n_embd,
+                256,
+                #heads=6
             )
-            #self.thing2 = Linear(
-            #    config.n_embd,
-            #    3*config.n_embd,
-            #    bias=config.bias
-            #)
-           # self.base = nn.Linear(config.n_embd, config.n_embd, bias=False)
-            
-            #self.sinner2  = modules.WonkyLinear(up*config.n_embd, config.n_embd, activation=F.gelu, bias=False)
+           
             return
+        
+
         self.c_fc    = Linear(config.n_embd, up * config.n_embd, bias=config.bias)
         self.gelu    = nn.GELU()
         self.c_proj  = Linear( up * config.n_embd, config.n_embd, bias=config.bias)
         if(qrot):
             self.c_proj  = Linear( 2 * config.n_embd, config.n_embd, bias=config.bias)
         
-
+        if plin:
+            self.gelu    = nn.GELU()
+            self.c_fc    = Plin(config.n_embd, up * config.n_embd, bias=config.bias,activation=self.gelu)
+            self.c_proj  = Plin( up * config.n_embd, config.n_embd, bias=config.bias)
+            if(qrot):
+                self.c_proj  = Plin( 2 * config.n_embd, config.n_embd, bias=config.bias)
+        
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        if shenanigans:
-            a,b,c = self.thing(x).chunk(3,dim=-1)
-            x=a*b+x
-            return x
-        else:
-            x = self.c_fc(x)
+        if pattmlp:
+            return self.thing(x)
+        
+        x = self.c_fc(x)
         if(qrot):
             x = self.qrot(x)
         else:
-            #x= self.gelu()
-            x = utils.SyntheticReluGrad.apply(x)
-        #x = x * quantizer.TopKHot.apply(x2, self.n_embd*2)
+            x = self.gelu(x)
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
@@ -303,17 +326,18 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.attn = Attention(config)
-        self.attn2 = Attention(config)
         if(Qrotention):
             self.attn = modules.SSM(config.n_embd,config.dropout,config.bias)
         elif k_atten:
-            self.attn = Kattention(config)
-        
-        self.shl = modules.SinkhornLinear(config.n_embd)#, config.n_embd)
-        self.shl2 = modules.SinkhornLinear(config.n_embd)#, config.n_embd)
-        with torch.no_grad():
-            self.shl.weight.data = (torch.eye(config.n_embd))
-            self.shl2.weight.data = (torch.eye(config.n_embd))
+            self.attn = modules.Kattention(config)
+        elif p_atten:
+            self.attn = modules.Pattention(config,64)
+        if residcomp:
+            self.shl = modules.SinkhornLinear(config.n_embd)#, config.n_embd)
+            self.shl2 = modules.SinkhornLinear(config.n_embd)#, config.n_embd)
+            with torch.no_grad():
+                self.shl.weight.data = (torch.eye(config.n_embd))
+                self.shl2.weight.data = (torch.eye(config.n_embd))
             #self.shl.weight_param.data.add_(torch.randn(config.n_embd, config.n_embd) * 1e-5)
             #self.shl2.weight_param.data.add_(torch.randn(config.n_embd, config.n_embd) * 1e-5)
         #self.gate = Linear(config.n_embd,config.n_embd,config.bias)
@@ -324,16 +348,20 @@ class Block(nn.Module):
         self.ln_1 = LayerNorm(config)
         self.ln_2 = LayerNorm(config)
         self.mlp = MLP(config)
-        self.ln_3 = LayerNorm(config)
-        self.ln_4 = LayerNorm(config)
-        self.mlp2 = MLP(config)
+        #self.ln_3 = LayerNorm(config)
+        #self.ln_4 = LayerNorm(config)
+        #self.mlp2 = MLP(config)
+        #self.attn2 = Attention(config)
         self.register_buffer("block_input",torch.zeros([config.block_size, config.n_embd]))
         if fftmem:
             self.register_buffer("mem_input",torch.zeros([config.block_size, config.n_embd]))
 
     def forward(self, x,  causal = True):
         self.block_input = x
-        
+        if p_atten:
+            x = x + self.attn(self.ln_1(x))
+            x = x + self.mlp(self.ln_2(x))
+            return x
         if(Qrotention):
             x = x + self.attn(self.ln_1(x))[0]
             x = x + self.mlp(self.ln_2(x))
@@ -400,7 +428,7 @@ class wnormlearnloss(nn.Module):
             )
 
     def forward(self, x):
-        loss =  utils.minmaxnorm(self.head(x)).mean()
+        loss =  utils.minmaxnorm(self.head(x),dim=None).mean()
         return loss
     
 class GPT(nn.Module):
@@ -487,10 +515,14 @@ class GPT(nn.Module):
             else:
                 self.lm_head = Linear(config.n_embd, config.vocab_size, bias=False)
                 self.transformer.wte.weight = self.lm_head.weight 
+            
+
             # https://paperswithcode.com/method/weight-tying
             
-            if rmHead:
-                nn.init.orthogonal_(self.lm_head.weight)
+            if wnHead:
+                self.lm_head = wn(Linear(config.n_embd, config.vocab_size, bias=False))
+                
+                #nn.init.orthogonal_(self.lm_head.weight)
 
 
         if(auxmod):
@@ -798,20 +830,29 @@ class GPT(nn.Module):
         nodecay_params = []
 
         for n, p in param_dict.items():
-            # Check for the Sinkhorn layer name from your Block definition (self.shl)
+            # shl named modules have slower lr
             if 'shl' in n:
                 mhc_params.append(p)
             elif p.dim() >= 2:
                 decay_params.append(p)
             else:
                 nodecay_params.append(p)
-        
-        optim_groups = [
-            {'params': decay_params,    'weight_decay': weight_decay},
-            {'params': nodecay_params,  'weight_decay': 0.0},
-            {'params': mhc_params,      'weight_decay': 0.0, 'lr_scale': mhc_lr},
-            #{'params': self_lr, 'lr': 1.0},
-        ]
+        if 'muon' in self.config.optimizer:
+            other_groups = [
+                {'params': nodecay_params,  'weight_decay': 0.0},
+            ]
+            muon_groups = [
+                {'params': decay_params,    'weight_decay': weight_decay},
+                {'params': mhc_params,      'weight_decay': 0.0, 'lr_scale': mhc_lr},
+                #{'params': self_lr, 'lr': 1.0},
+            ]
+        else:
+            optim_groups = [
+                {'params': nodecay_params,  'weight_decay': 0.0},
+                {'params': decay_params,    'weight_decay': weight_decay},
+                {'params': mhc_params,      'weight_decay': 0.0, 'lr_scale': mhc_lr},
+                #{'params': self_lr, 'lr': 1.0},
+            ]
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
         print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
@@ -821,6 +862,7 @@ class GPT(nn.Module):
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
         match self.config.optimizer:
+
             case "adam":
                 optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
             case "sgd":
@@ -830,10 +872,14 @@ class GPT(nn.Module):
             case "bubbles":
                 base = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
                 optimizer = optim.ChaosRollbackOptimizer(self, base_optimizer=base)
+            case "muon":
+                optimizer = torch.optim.Muon(muon_groups, lr=learning_rate)
+                optimizer2 = torch.optim.AdamW(other_groups, lr=learning_rate, betas=betas, **extra_args)
+                return optimizer,optimizer2
             #optimizer =torch.optim.Adadelta(optim_groups)#, **extra_args)# lr=learning_rate, **extra_args)
         print(f"using fused AdamW: {use_fused}")
                         
-        return optimizer
+        return optimizer, None
 
     def self_grad_fwd(self, targets, x):
         device = x.device
@@ -1235,6 +1281,11 @@ class GPT(nn.Module):
         return n_params
 
     def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        
         if isinstance(module, Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:

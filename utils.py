@@ -269,6 +269,8 @@ class SyntheticReluGrad(torch.autograd.Function):
         grad_x = g * surrogate_grad
         return grad_x
 
+def trap_relu(x):
+     return TrapdoorReLU.apply(x)
 def synthrelu(x):
      return SyntheticReluGrad.apply(x)
 
@@ -1023,7 +1025,7 @@ BETA = 5.75
 def dissonance_curve(ratio):
     x = torch.abs(ratio - 1.0)
     diss = torch.exp(-ALPHA * x) - torch.exp(-BETA * x)
-    return F.relu(diss)
+    return F.relu(diss) #todo: better relu choices available
 
 def pairwise_dissonance_from_partials(frequencies, amplitudes):
     """A helper to compute dissonance given a refined list of partials."""
@@ -1373,6 +1375,7 @@ def cursed_polar_decomposition_smart(A, polar_iter=2):
         )
 
 def get_meta(dataset, always_byte=False):
+    """returns encoder and vocab size"""
     if dataset == "openwebtext":
         if always_byte:
             vocab_size = 256

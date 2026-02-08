@@ -186,28 +186,6 @@ def off_diagonal(x):
     assert n == m
     return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
 
-class Dreamer(nn.Module):
-    def __init__(self, mem_block_size, **config):
-        super().__init__()
-        mbs = mem_block_size
-        self.block = modules.Block(**config)
-        self.comp = modules.FFTResampler(mbs*2, mbs, mbs+1)
-        self.ln = modules.LayerNorm(**config)
-        
-    def forward(self, x):
-        while x.shape[0] > 1:
-            b, t, c = x.size()
-            x = x.view(b // 2, 2, t, c)
-            
-            x = x.transpose(1, 2)
-            
-            x = x.reshape(b // 2, t * 2, c)
-            
-            x = self.comp(x, dim=1) 
-            x = self.block(x, causal = False)
-            x = self.ln(x)
-        return x 
-    
 class Model(nn.Module):
     def __init__(self, vocab_size, k=5, lambda_thought=0.1, **kwargs):
         super().__init__()
@@ -243,7 +221,7 @@ class Model(nn.Module):
                 'n_head': 4,
                 'bias': False,
             }
-        self.memorizer = Dreamer(**memconf)
+        self.memorizer = modules.Dreamer(**memconf)
         
 
     def get_weights(self):
