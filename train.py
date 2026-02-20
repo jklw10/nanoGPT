@@ -58,21 +58,26 @@ eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
+
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
+always_byte = False # use bytes instead of tokens
+
 # model
 n_layer = 12
 n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -80,27 +85,28 @@ weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
 lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
-always_byte = False # use bytes instead of tokens
+
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+
+
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 train_logging = False
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
-
-
-
 #torch._dynamo.reset() #in case of cache corruption throw it off a bridge.
 
 # various inits, derived attributes, I/O setup
@@ -264,13 +270,16 @@ lrfinder            = False
 
 
 if(ghook):
-    if(gdiff_enabled or dfw_enabled or muon or grokfast):
+    if(gdiff_enabled or dfw_enabled or muon or grokfast or ggauss):
         for p in model.parameters():
             if p.requires_grad:
                 if gdiff_enabled or dfw_enabled or muon:
                     p.wema = torch.clone(p)
                 if grokfast:
                     p.gema = torch.zeros_like(p)
+                
+                if ggauss:
+                    p.center = torch.ones(1,device=p.device)
 
     for i, p in enumerate(model.parameters()):
         if p.requires_grad:
@@ -352,7 +361,7 @@ def custom_gradient_adjustment(grad, param):
         adjusted_grad = torch.where(escaped_mask, reflected_grad, adjusted_grad)
     
     
-    center = torch.tensor(0.5,device=device)
+    center = torch.tensor(1,device=device)
     width = torch.tensor(3,device=device)
     if(gfft):
         adjusted_grad = utils.fft_gauss(adjusted_grad,center,width)
@@ -370,7 +379,7 @@ def custom_gradient_adjustment(grad, param):
     
     
     if(gdiff_enabled or dfw_enabled):
-        wema += 0.99 * (param - wema)
+        param.wema.add_(0.99 * (param - wema))
 
     #if(gdiff_enabled ):
     #    awdiff = weight_ema - adjusted_grad 
@@ -391,12 +400,53 @@ def custom_gradient_adjustment(grad, param):
         adjusted_grad *= gdiff 
     
     if(grokfast):
-        gema += 0.99 * (adjusted_grad - gema)
+        param.gema.add_(0.99 * (adjusted_grad - gema))
         adjusted_grad += gema * 2
         adjusted_grad /= 3
+    if hasattr(param, "center"): 
+        
+        slope = 1e-4 
+        t = (param.center-warmup_iters) * slope
+        t_w = param.center * slope
+        gcenter = (t_w) % 1.0
+        #width = gcenter# torch.tensor(0.25, device=device) 
+        #width = 1.1-torch.abs((param.center * slope) % 2.0 - 1.0) #+ 0.1
+        #width = (1.0 - torch.cos(param.center * slope*torch.pi))/2.0
+        #rise = torch.clamp((param.center >9999).float(), 0.0, 0.3)
+        #width = torch.abs(torch.sin(param.center * slope * torch.pi))
+        #rise = torch.clamp(param.center * slope , 0.0, 0.3)
+        #width = torch.clamp(torch.abs(torch.sin(param.center * slope * torch.pi)), rise)
+        #width = 0.5 - torch.cos(param.center * slope * torch.pi)/2
+        #width = torch.abs(torch.sin(t_w*torch.pi)) 
+        #width = torch.tanh(t*torch.pi)       
+        #width = torch.abs((t) % 2.0 - 1.0) 
+        #width = utils.dampened_oscilator(param.center * slope)
+
+        #saw = (param.center * slope*10) % 1.0
+        #width = torch.tanh(1.0-saw)
+        spd= 3.0
+        saw = (param.center * slope*10*spd) % spd
+        width = torch.tanh(spd-saw)
+        #width = torch.tensor(0.1,device=device)
+
+        #width = 1.0 - torch.abs((param.center * slope * 10) % 2.0 - 1.0) 
+        #width = 0.5 - torch.cos(param.center * slope * torch.pi) / 2
+        #width = torch.log1p(param.center)  
+        if param.center < 1000:     
+            width = torch.abs(torch.sin(t_w*torch.pi*10)) 
+            #width = torch.ones(1,device=device) 
+            #width = (param.center * slope * torch.pi) 
+            #gcenter = (param.center/200) 
+
+        with torch.no_grad():
+            param.center.add_(1.0)
+            
     if(ggauss and d2):
-        #gema += 0.1
-        gk = utils.gaussian_kernel_batched(adjusted_grad, center, width)
+        #gk1 = utils.gaussian_kernel_batched(adjusted_grad, center1, width)
+        #gk2 = utils.gaussian_kernel_batched(adjusted_grad, center2, width)
+        
+        #gk = torch.max(gk1, gk2)
+        gk = utils.wrapping_gaussian_kernel(adjusted_grad, gcenter, width)
         adjusted_grad = gk * adjusted_grad
     return adjusted_grad 
 
@@ -633,7 +683,7 @@ def model_step(iter_num, tl, best_val_loss, config):
         torch.compiler.cudagraph_mark_step_begin()
         _, loss = model(X, Y, decaying)
         #loss= loss + utils.surface_minimize(emb,x_out)*0.0001
-        loss = loss.mean()
+        #loss = loss.mean()
         loss.backward()
         return loss
         
@@ -673,7 +723,6 @@ def model_step(iter_num, tl, best_val_loss, config):
             wscrna = lrgpu/20.0 if decay_wa else config["swfa"]
             utils.wstep(model, wfunc, alphas = [0.0, wscrna])
 
-        model.resetsink()
 
     optimizer.zero_grad(set_to_none=True)
     if optimizer2 is not None:

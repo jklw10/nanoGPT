@@ -170,8 +170,54 @@ class ExplorativeTKE(torch.autograd.Function):
 
         grad_logits = grad_logits * learning_modulator
         return grad_logits, None, None
+class DiscreteLookupFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight):
+        # x: (B, T, H)
+        # weight: (V, H) - Shared with wte usually
+        logits = F.linear(x, weight) # (B, T, V)
+        #logits = utils.gumbell_noise(logits)
+        _, indices = torch.topk(logits, k=1, dim=-1) # (B, T, k)
+        
+        indices_flat = indices.squeeze(-1) # (B, T)
+        y = F.embedding(indices_flat, weight) # (B, T, H)
+        
+        ctx.save_for_backward(x, weight, logits, indices)
+        ctx.k = 1
+        return y#, indices
+  
+    @staticmethod
+    def backward(ctx, grad_y):
+        x, weight, logits, indices_flat = ctx.saved_tensors
+        B, T, H = grad_y.shape
+        V = weight.shape[0]
 
+        grad_proj = grad_y @ weight.t()
+        
+        _, target_idx = torch.topk(grad_proj, k=1, dim=-1, largest=False)
 
+        probs = torch.sigmoid(logits)
+        
+        target_mask = torch.zeros_like(probs)
+        target_mask.scatter_(-1, target_idx, 1.0)
+        
+        grad_logits = probs - target_mask 
+
+        grad_W = torch.zeros_like(weight)
+        
+        grad_W.index_add_(0, indices_flat.reshape(-1), grad_y.reshape(-1, H))
+        
+        grad_logits_flat = grad_logits.view(-1, V)
+        #x_flat = x.view(-1, H)
+        
+        #grad_head = grad_logits_flat.t() @ x_flat 
+        grad_W = grad_W #+ grad_head# avg?
+        
+        grad_x = grad_logits_flat @ weight
+        grad_x = grad_x.view(B, T, H)
+
+        return grad_x, grad_W
+    
 class TopKHot(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x,  k):
@@ -190,7 +236,55 @@ class TopKHot(torch.autograd.Function):
             hard_target = torch.zeros_like(x).scatter_(-1, topk_indices, 1.0)
         grad_x = F.sigmoid(x) - hard_target
         return grad_x,  None
+class BoltzmannTopKHot(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, k):
+        _, indices = torch.topk(x, k=k, dim=-1)
+        k_hot = torch.zeros_like(x).scatter_(-1, indices, 1.0)
+        
+        ctx.save_for_backward(x)
+        ctx.k = k
+        return k_hot
 
+    @staticmethod
+    def backward(ctx, g):
+        x, = ctx.saved_tensors
+        k = ctx.k
+        
+        with torch.no_grad():
+            _, topk_indices = torch.topk(-g, k=k, dim=-1)
+            hard_target = torch.zeros_like(x).scatter_(-1, topk_indices, 1.0)
+        
+            k_tensor = torch.tensor(k, device=x.device).float().expand(x.shape[0], 1)
+            
+            mu = utils.get_boltzmann_mu(x, k_tensor)
+        grad_x = torch.sigmoid(x - mu) - hard_target
+        
+        return grad_x, None
+class BoltzmannThresHot(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        # Forward remains similar: standard Softmax thresholding
+        probs = F.softmax(x, dim=-1)
+        k_hot = torch.where(probs >= (1.0 / x.shape[-1]), 1.0, 0.0)
+        ctx.save_for_backward(x)
+        return k_hot
+
+    @staticmethod
+    def backward(ctx, g):
+        x, = ctx.saved_tensors
+
+        with torch.no_grad():
+            g_mean = torch.mean(g, dim=-1, keepdim=True)
+            hard_target = torch.where(g < g_mean, 1.0, 0.0)
+            
+            current_k = hard_target.sum(dim=-1, keepdim=True)
+            
+            mu = utils.get_boltzmann_mu(x, current_k)
+
+        grad_x = torch.sigmoid(x - mu) - hard_target
+        
+        return grad_x
 
 class ThresHot(torch.autograd.Function):
     @staticmethod
@@ -269,25 +363,19 @@ class avgHot(torch.autograd.Function):
 def b_spline_basis(x, knots, degree):
    
     x = x.unsqueeze(-1)
-    n_knots = len(knots)
-    n_basis = n_knots - degree - 1
-
-    # Zeroth degree basis functions (piecewise constant)
+   
     b = (x >= knots[:-1]) & (x < knots[1:])
     b = b.to(x.dtype)
 
-    # Cox-de Boor recursion
     for d in range(1, degree + 1):
         
         term1_denom = knots[d:-1] - knots[:-d-1]
         term1_num = x - knots[:-d-1]
-        # Avoid division by zero
         term1_denom[term1_denom == 0] = 1e-6
         term1 = (term1_num / term1_denom) * b[:, :, :-1]
 
         term2_denom = knots[d+1:] - knots[1:-d]
         term2_num = knots[d+1:] - x
-        # Avoid division by zero
         term2_denom[term2_denom == 0] = 1e-6
         term2 = (term2_num / term2_denom) * b[:, :, 1:]
         
@@ -527,16 +615,13 @@ class Autoencoder(nn.Module):
         
         return k_hot
     
-    def dequant(self, k_hot, norm = True):
-        if norm:
-            k = self.k_from_hot(k_hot)
-            k_hot = k_hot / k
+    def dequant(self, k_hot, norm = False):
 
         q = self.codebook(k_hot)
+        if norm:
+            q = utils.rms(q)
         return self.decoder(q)
     
-    def k_from_hot(self, k_hot):
-        return k_hot.sum(dim=-1, keepdim=True).clamp(1,self.qdim).detach()
 
 
 class MultiHotVQVAEQuantizer(nn.Module):
@@ -800,13 +885,13 @@ class debugAutoencoder(nn.Module):
         self.quantizer = Hotmod(quantizer, k)
         self.codebook = nn.Linear(self.qdim, embed, bias=False)
         self.decoder = nn.Sequential(nn.Linear(embed, hidden), ac2, nn.Linear(hidden, input))
-        
     
     def forward(self, x):
-        khot, vq_loss = self.quant(x)
-        k = self.k_from_hot(khot)
-        reconstruction = self.dequant(khot)
-        return reconstruction, khot, vq_loss, k
+        k_hot, vq_loss = self.quant(x)
+        reconstruction = self.dequant(k_hot)
+
+        k = utils.k_from_hot(k_hot, self.qdim)
+        return reconstruction, k_hot, vq_loss, k
 
     def quant(self, x):
         logits = self.encoder(x)
@@ -816,15 +901,14 @@ class debugAutoencoder(nn.Module):
         
         return k_hot, vq_loss
     
-    def k_from_hot(self, k_hot):
-        return k_hot.sum(dim=-1, keepdim=True).clamp(1,self.qdim).detach()
 
-    def dequant(self, k_hot, norm = True):
+    def dequant(self, k_hot, norm = False):
+        k = utils.k_from_hot(k_hot, self.qdim)
         if norm:
-            k = self.k_from_hot(k_hot)
-            k_hot = k_hot / k
+            k_hot = k_hot / k.detach()
 
-        q = self.codebook(k_hot)
+        q = self.codebook(k_hot) #/ k.detach()
+        #q = utils.rms(q)
         return self.decoder(q)
 
     
@@ -982,10 +1066,10 @@ class GumbelGatherByGate(torch.autograd.Function):
         output = torch.gather(candidate_pool, 1, expanded_indices) #b, k, c
         ctx.save_for_backward(gate_logits, candidate_pool, output)
         ctx.k = k
-        return output
+        return output, top_indices
 
     @staticmethod
-    def backward(ctx, g):
+    def backward(ctx, g, _):
         gate_logits, candidate_pool, y = ctx.saved_tensors
         k = ctx.k
         grad_gate_logits = grad_candidate_pool = None
@@ -1033,6 +1117,198 @@ class GumbelGatherByGate(torch.autograd.Function):
         return grad_gate_logits, grad_candidate_pool, None, None, None
 
 
+class RLMAXgbg(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, gate_logits, candidate_pool, k, tau=1.0, training=False, sigma=0.3):
+        
+        if training:
+            gumbels = -torch.log(-torch.log(
+                torch.rand_like(gate_logits) + 1e-10
+            ) + 1e-10)
+            
+            gate_logits = (gate_logits + gumbels) / tau
+        else:
+            gate_logits = gate_logits
+        
+        b, ct, c = candidate_pool.shape
+        b, gt = gate_logits.shape
+        assert gt == ct
+        _, top_indices = torch.topk(gate_logits, k=k, dim=-1) #b, k
+        expanded_indices = top_indices.unsqueeze(-1).expand(b, k, c)
+        output = torch.gather(candidate_pool, 1, expanded_indices) #b, k, c
+        ctx.save_for_backward(gate_logits, candidate_pool, output,top_indices)
+        ctx.k = k
+        ctx.sigma = sigma
+        return output, top_indices
+
+    @staticmethod
+    def backward(ctx, grad_output, _):
+        gate_logits, candidate_pool, output, top_indices = ctx.saved_tensors
+        k = ctx.k
+        sigma = ctx.sigma
+        grad_gate_logits = grad_candidate_pool = None
+
+        with torch.no_grad():
+            ideal_targets = output - grad_output 
+            
+            
+            dist_sq = ((output - ideal_targets)**2).sum(dim=-1, keepdim=True)
+            mask = torch.exp(-dist_sq / (2 * sigma**2 + 1e-5))
+
+            
+            dot_products = torch.bmm(ideal_targets, candidate_pool.transpose(1, 2))
+            candidate_norm_sq = torch.sum(candidate_pool ** 2, dim=-1).unsqueeze(1)
+            scores = 2 * dot_products - candidate_norm_sq
+            
+            _, best_candidate_indices = torch.max(scores, dim=-1) # (b, k)
+           
+        
+        if ctx.needs_input_grad[0]:
+            hard_target = torch.zeros_like(gate_logits) 
+            hard_target.scatter_(dim=1, index=best_candidate_indices, value=1.0)
+            
+            probs = torch.sigmoid(gate_logits)
+            grad_gate_logits = probs - hard_target
+        if ctx.needs_input_grad[1]:
+            b,p,c = candidate_pool.shape
+            
+            
+            is_correct_selection = (top_indices == best_candidate_indices).float()
+
+            # Expand mask for dimensions (b, k, dim)
+            mask = is_correct_selection.unsqueeze(-1)
+
+            # Zero out gradients for the "Wrong" selections
+            masked_grad = grad_output * mask
+
+            # Scatter the masked gradient
+            expanded_indices = top_indices.unsqueeze(-1).expand(b, k, c)
+            grad_candidate_pool = torch.zeros_like(candidate_pool)
+            grad_candidate_pool.scatter_add_(1, expanded_indices, masked_grad)
+        
+        
+        return grad_gate_logits, grad_candidate_pool, None, None, None
+
+class RLMAXgbg2(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, gate_logits, candidate_pool, k, tau=1.0, training=False, sigma=0.5):
+        
+        ctx.sigma = sigma
+        if training:
+            gumbels = -torch.log(-torch.log(torch.rand_like(gate_logits) + 1e-10) + 1e-10)
+            noisy_logits = (gate_logits + gumbels) / tau
+        else:
+            noisy_logits = gate_logits
+        b, ct, c = candidate_pool.shape
+        _, top_indices = torch.topk(noisy_logits, k=k, dim=-1)
+        expanded_indices = top_indices.unsqueeze(-1).expand(b, k, c)
+        output = torch.gather(candidate_pool, 1, expanded_indices) 
+        ctx.save_for_backward(gate_logits, candidate_pool, output, top_indices)
+        return output, top_indices
+
+    @staticmethod
+    def backward(ctx, grad_output, _):
+        gate_logits, candidate_pool, output, top_indices = ctx.saved_tensors
+        sigma = ctx.sigma
+        
+        grad_gate_logits = grad_candidate_pool = None
+
+        ideal_pos = output - grad_output 
+        # --- GATE GRADIENT (The "Hindsight" Switch) ---
+        if ctx.needs_input_grad[0]:
+            target_norm = (ideal_pos**2).sum(-1).unsqueeze(2) # (b, k, 1)
+            cand_norm   = (candidate_pool**2).sum(-1).unsqueeze(1) # (b, 1, n)
+            dot         = torch.bmm(ideal_pos, candidate_pool.transpose(1, 2)) # (b, k, n)
+            
+            dists = target_norm + cand_norm - 2*dot # (b, k, n)
+            
+            _, best_indices = torch.min(dists, dim=-1)
+            
+            target_gate = torch.zeros_like(gate_logits)
+            target_gate.scatter_(1, best_indices, 1.0)
+            
+            probs = torch.sigmoid(gate_logits)
+            grad_gate_logits = probs - target_gate
+        if ctx.needs_input_grad[1]:
+            b, k, c = ideal_pos.shape
+            
+            dist_sq = ((output - ideal_pos)**2).sum(dim=-1, keepdim=True) # (b, k, 1)
+            mask = torch.exp(-dist_sq / (2 * sigma**2 + 1e-5))
+            
+            masked_grad = grad_output * mask
+            
+            b, n, c = candidate_pool.shape
+            expanded_indices = top_indices.unsqueeze(-1).expand(b, k, c)
+            grad_candidate_pool = torch.zeros_like(candidate_pool)
+            grad_candidate_pool.scatter_add_(1, expanded_indices, masked_grad)
+
+        
+
+        return grad_gate_logits, grad_candidate_pool, None, None, None, None
+
+class RLMAXgbg3(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, gate_logits, candidate_pool, k, tau=1.0, training=False, sigma=0.5):
+        
+        ctx.sigma = sigma
+        ctx.k = k
+        if training:
+            gumbels = -torch.log(-torch.log(torch.rand_like(gate_logits) + 1e-10) + 1e-10)
+            noisy_logits = (gate_logits + gumbels) / tau
+        else:
+            noisy_logits = gate_logits
+        b, ct, c = candidate_pool.shape
+        _, top_indices = torch.topk(noisy_logits, k=k, dim=-1)
+        expanded_indices = top_indices.unsqueeze(-1).expand(b, k, c)
+        output = torch.gather(candidate_pool, 1, expanded_indices) 
+        ctx.save_for_backward(gate_logits, candidate_pool, output, top_indices)
+        return output, top_indices
+
+    @staticmethod
+    def backward(ctx, grad_output, _):
+        gate_logits, candidate_pool, output, top_indices = ctx.saved_tensors
+        #candidate_pool = utils.rms(candidate_pool) 
+        sigma = ctx.sigma
+        k = ctx.k
+        grad_gate_logits = grad_candidate_pool = None
+        
+        #grad_norm = grad_output.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        #clamp_factor = torch.tanh(grad_norm) / grad_norm 
+        #grad_output = grad_output  * clamp_factor # Optional: Uncomment if unstable
+        grad_output = utils.rms(grad_output)
+        ideal_pos = output - grad_output 
+        if ctx.needs_input_grad[0]:
+            target_norm = (ideal_pos**2).sum(-1).unsqueeze(2) # (b, k, 1)
+            cand_norm   = (candidate_pool**2).sum(-1).unsqueeze(1) # (b, 1, n)
+            #candidate_pool = utils.rms(candidate_pool) 
+            dot         = torch.bmm(ideal_pos, candidate_pool.transpose(1, 2)) # (b, k, n)
+            
+            dists = target_norm + cand_norm - 2*dot # (b, k, n)
+            
+            b_dist, best_indices = torch.min(dists, dim=-1)
+            #b_dist, best_indices = torch.max(dot, dim=-1)
+            
+            target_gate = torch.zeros_like(gate_logits)
+            target_gate.scatter_(1, best_indices, 1.0)
+            
+            probs = torch.sigmoid(gate_logits)
+            grad_gate_logits = probs - target_gate
+        if ctx.needs_input_grad[1]:
+            b,p,c = candidate_pool.shape
+            
+        
+            ideal_indices = best_indices.unsqueeze(-1).expand(b, k, c)
+            
+            y_ideal = torch.gather(candidate_pool, 1, ideal_indices)
+            delta = output - y_ideal
+            g_corrected = grad_output - delta 
+            g_corrected = g_corrected / (b_dist.unsqueeze(-1)+1.0)
+            #g_corrected = torch.tanh(g_corrected)
+            grad_candidate_pool = torch.zeros_like(candidate_pool)
+            grad_candidate_pool.scatter_add_(1, ideal_indices, g_corrected)
+        
+        return grad_gate_logits, grad_candidate_pool, None, None, None, None
+
 class HungryGatherFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -1062,10 +1338,10 @@ class HungryGatherFunc(torch.autograd.Function):
         expanded_indices = top_indices.unsqueeze(-1).expand(b, k, c)
         output = torch.gather(candidate_pool, 1, expanded_indices) 
         
-        return output
+        return output, top_indices
 
     @staticmethod
-    def backward(ctx, g):
+    def backward(ctx, g,_):
         gate_logits, candidate_pool, top_indices, = ctx.saved_tensors
         k = ctx.k
         
@@ -1112,7 +1388,7 @@ class HungryGatherFunc2(torch.autograd.Function):
         # 1. Gumbel Noise (Exploration)
         if training:
             gumbels = -torch.log(-torch.log(torch.rand_like(gate_logits) + 1e-10) + 1e-10)
-            noisy_logits = (gate_logits + gumbels) / tau
+            noisy_logits = (gate_logits + gumbels)/ tau 
         else:
             noisy_logits = gate_logits
             
@@ -1130,10 +1406,10 @@ class HungryGatherFunc2(torch.autograd.Function):
         output = torch.gather(candidate_pool, 1, expanded_indices) 
         
         ctx.save_for_backward(gate_logits, candidate_pool, top_indices, output)
-        return output
+        return output, top_indices
 
     @staticmethod
-    def backward(ctx, g):
+    def backward(ctx, g,_):
         gate_logits, candidate_pool, top_indices, output = ctx.saved_tensors
         k = ctx.k
         repulsion = ctx.repulsion
@@ -1190,10 +1466,10 @@ class GatherByGate(torch.autograd.Function):
         output = torch.gather(candidate_pool, 1, expanded_indices) #b, k, c
         ctx.save_for_backward(gate_logits, candidate_pool, output)
         ctx.k = k
-        return output
+        return output,top_indices
 
     @staticmethod
-    def backward(ctx, g):
+    def backward(ctx, g,_):
         gate_logits, candidate_pool, y = ctx.saved_tensors
         k = ctx.k
         grad_gate_logits = grad_candidate_pool = None
@@ -1292,6 +1568,7 @@ class GatherByGate2(torch.autograd.Function):
         
         
         return grad_gate_logits, grad_candidate_pool, None
+
 
 def run_seed_viz():
     torch.manual_seed(42)
@@ -1409,11 +1686,10 @@ def run_seed_viz():
     plt.show()
 
 def run_live_viz():
-    torch.manual_seed(45) # 45 gives a nice swirl
+    torch.manual_seed(45) 
     N_STEPS = 2000
     N_CANDIDATES = 20
-    K = 1 # We need 2 to see them repel/orbit
-    
+    K = 2 
     # Init
     gate_logits = nn.Parameter(torch.randn(1, N_CANDIDATES) * 0.1)
     # Start candidates in a tight cluster to force them to explode out
@@ -1503,78 +1779,10 @@ def quantizer_run():
     # Base models
     # Instantiate the three models
     models = {
-        #"STE": Autoencoder(copy.deepcopy(encoder_base), STEQuantizer(QUANT_DIM, EMBED_DIM), copy.deepcopy(decoder_base)),
-        #"Hybrid": Autoencoder(copy.deepcopy(encoder_base), HybridQuantizer(QUANT_DIM, EMBED_DIM, beta=BETA), copy.deepcopy(decoder_base)),
-        #"ADAK": Autoencoder(copy.deepcopy(encoder_base), AdaKQuantizer(QUANT_DIM, EMBED_DIM, QUANT_DIM), copy.deepcopy(decoder_base)),
-        #"ADAK 15": Autoencoder(copy.deepcopy(encoder_base), AdaKQuantizer(QUANT_DIM, EMBED_DIM, 15), copy.deepcopy(decoder_base)),
-        #"VQ-VAE 32": Autoencoder(copy.deepcopy(encoder_for_vqvae), MultiHotVQVAEQuantizer(QUANT_DIM, EMBED_DIM,  QUANT_DIM//2, 0.25), copy.deepcopy(decoder_base)),
-        #"VQ-VAE":    Autoencoder(copy.deepcopy(encoder_for_vqvae), MultiHotVQVAEQuantizer(QUANT_DIM, EMBED_DIM, 1, 0.25), copy.deepcopy(decoder_base)),
-        #"Gumbell":   Autoencoder(copy.deepcopy(encoder_base),      GumbelQuantizer(QUANT_DIM, EMBED_DIM, 1), copy.deepcopy(decoder_base)),
-        #"CER":       Autoencoder(copy.deepcopy(encoder_base),      CustomQuantizer(QUANT_DIM, EMBED_DIM), copy.deepcopy(decoder_base)),
-        #"STE":       Autoencoder(copy.deepcopy(encoder_base),      STEQuantizer(QUANT_DIM, EMBED_DIM), copy.deepcopy(decoder_base)),
-        #"CERk 32":   Autoencoder(copy.deepcopy(encoder_base),      NKQuantizer(QUANT_DIM, EMBED_DIM, QUANT_DIM//2), copy.deepcopy(decoder_base)),
-        #"CER":       Autoencoder(copy.deepcopy(encoder_base),      CustomQuantizer(QUANT_DIM, EMBED_DIM), copy.deepcopy(decoder_base)),
-        #"adak":   Autoencoder(copy.deepcopy(encoder_base),      AdaKQuantizer(QUANT_DIM, EMBED_DIM,QUANT_DIM), copy.deepcopy(decoder_base)),
-        #"dynk3":   Autoencoder(copy.deepcopy(encoder_base),      DynKQuantizer2(QUANT_DIM, EMBED_DIM, QUANT_DIM), copy.deepcopy(decoder_base)),
-        #"cdynk":   Autoencoder(copy.deepcopy(encoder_base),      CER_DynamicK_Quantizer(QUANT_DIM, EMBED_DIM, QUANT_DIM), copy.deepcopy(decoder_base)),
-        #"dynk3": DynKQAE2(INPUT_DIM, EMBED_DIM, HIDDEN_DIM, QUANT_DIM),
-        #"threshk": ThreshotAE(INPUT_DIM, EMBED_DIM, HIDDEN_DIM, QUANT_DIM),
-        #"BCEGR k 32":      NKQAE(INPUT_DIM, EMBED_DIM, HIDDEN_DIM, QUANT_DIM, 32),
-        #"BCEGR k 1":      NKQAE(INPUT_DIM, EMBED_DIM, HIDDEN_DIM, QUANT_DIM, 1),
-        #"CER k 1":    Autoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopOneHot,  1),
-        #"CER2 k 1":   debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHot,    1),
-        "thot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, ThresHot, nn.SiLU, 32),
-        "avghot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, avgHot, nn.SiLU, 32),
-        
-        #"thot2":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, ThresHotV2, nn.SiLU, 32),
-        
-        #"bspline":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHotBCE, BSplineActivation, 32),
-        #"GatherByGate": GatherByGateAutoencoder(input_dim=INPUT_DIM,hidden_dim=HIDDEN_DIM,embed_dim=EMBED_DIM,quant_dim=QUANT_DIM, k=32),
-        #"attnGather": SelfAttentionPaletteAE(input_dim=INPUT_DIM,hidden_dim=HIDDEN_DIM,embed_dim=EMBED_DIM,quant_dim=QUANT_DIM, k=32),
-        #"ltae": LTAutoencoder(
-        #    input_dim=INPUT_DIM,
-        #    hidden_dim=HIDDEN_DIM,
-        #    embed_dim=EMBED_DIM,
-        #    quant_dim=QUANT_DIM, 
-        #    k=32
-        #),
-        #"topkCE":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM,  Hotmod(TopKHot,32), nn.SiLU ),
-        #"topkBCE":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM,  Hotmod(TopKHotBCE,32), nn.SiLU),
-        #"topkHBCE": debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, Hotmod(HardTopKHotBCE, 32), nn.SiLU),
-        #"treshot": debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, Hotmod(ThresHot, 32), nn.SiLU),
-        #"stochhot": debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, StochasticHotMod(ThresHot, 32), nn.SiLU),
-        #"gumbell": debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, Gumbell(32), nn.SiLU),
-        #"mh-vqvae": debugAutoencoderWithVQ(
-        #    input_dim=INPUT_DIM,
-        #    hidden_dim=HIDDEN_DIM,
-        #    embed_dim=EMBED_DIM,
-        #    quantizer=mhvqvae(
-        #        num_embeddings=QUANT_DIM,
-        #        embedding_dim=EMBED_DIM,
-        #        num_codes_to_select=32,
-        #        commitment_cost=0.25
-        #    ),
-        #    Act=nn.SiLU
-        #),
-        #"ogimpl": debugAutoencoderWithVQ(
-        #    input_dim=INPUT_DIM,
-        #    hidden_dim=HIDDEN_DIM,
-        #    embed_dim=EMBED_DIM,
-        #    quantizer=MultiHotVQVAEQuantizer(
-        #        quant_dim=QUANT_DIM,
-        #        embed_dim=EMBED_DIM,
-        #        k=32,
-        #        commitment_cost=0.25
-        #    ),
-        #    Act=nn.SiLU
-        #)
-        #"CER k 32":   debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHot,    32),
-        #"STE k1":    Autoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, tkSTE, 1),
-        #"STE k32":   Autoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, tkSTE, 32),
-        
-        #"CER 16": Autoencoder(copy.deepcopy(encoder_base), NKQuantizer(QUANT_DIM, EMBED_DIM, 16), copy.deepcopy(decoder_base)),
-        #"STE 16": Autoencoder(copy.deepcopy(encoder_base), MultiHotSTEQuantizer(QUANT_DIM, EMBED_DIM, 16), copy.deepcopy(decoder_base)),
-        #"STE qd0.5": Autoencoder(copy.deepcopy(encoder_base), MultiHotSTEQuantizer(QUANT_DIM, EMBED_DIM, QUANT_DIM//2), copy.deepcopy(decoder_base)),
+        "bthot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, BoltzmannThresHot, nn.LeakyReLU, 32),
+        "btkhot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, BoltzmannTopKHot, nn.LeakyReLU, 32),
+        "tkhot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHot, nn.LeakyReLU, 32),
+        "thot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, ThresHot, nn.LeakyReLU, 32),
     }
     
     print("Compiling models...")
@@ -1724,5 +1932,5 @@ def quantizer_run():
 
 if __name__ == '__main__':
     #run_seed_viz()
-    #run_live_viz()
-    quantizer_run()
+    run_live_viz()
+    #quantizer_run()

@@ -233,7 +233,7 @@ def modified_sin_gelu_leaky(x, leaky=0.01):
 
 
 
-class TrapdoorReLU(torch.autograd.Function):
+class RatchetRelu(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
         ctx.save_for_backward(x)
@@ -255,6 +255,37 @@ class TrapdoorReLU(torch.autograd.Function):
         
         return final_grad
 
+class DeadRatRelu(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return x.clamp(min=0) 
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, = ctx.saved_tensors
+        
+        grad_input = grad_output.clone()
+        
+        dead_mask = (x <= 0)
+        
+        if dead_mask.any():
+            dead_grads = grad_output[dead_mask]
+            revival_scale = 0.1 
+            suppression_scale = 0.001
+            scale = torch.where(dead_grads < 0, revival_scale, suppression_scale)
+            
+            grad_input[dead_mask] *= scale
+            
+        return grad_input
+def gumbell_noise(logits):
+    """
+    gumbell noises logits
+    """
+    eps = 1e-8
+    return logits -torch.log(-torch.log(torch.rand_like(logits) + eps) + eps)
+        
+def dead_rat_relu(x):
+     return DeadRatRelu.apply(x)
 class SyntheticReluGrad(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
@@ -269,8 +300,8 @@ class SyntheticReluGrad(torch.autograd.Function):
         grad_x = g * surrogate_grad
         return grad_x
 
-def trap_relu(x):
-     return TrapdoorReLU.apply(x)
+def rat_relu(x):
+     return RatchetRelu.apply(x)
 def synthrelu(x):
      return SyntheticReluGrad.apply(x)
 
@@ -798,6 +829,47 @@ def whiten_3d_global(x, **kwargs):
     
     return x_whitened
 
+@torch.compile(backend='inductor', mode='max-autotune')
+def orthogonalize_batches(G, epsilon=1e-5, steps=5):
+    if G.ndim < 2: return G
+    
+    n, d = G.shape
+    device, dtype = G.device, G.dtype
+    
+    G_mean = G.mean(dim=0, keepdim=True)
+    G_centered = G - G_mean
+    
+    if n < d:
+        Sigma = (1/n) * torch.matmul(G_centered, G_centered.T) + epsilon * torch.eye(n, device=device, dtype=dtype)
+        
+        norm_factor = torch.trace(Sigma) / n
+        B = Sigma / norm_factor
+        Y = torch.eye(n, device=device, dtype=dtype)
+        
+        for _ in range(steps):
+            T = 3 * torch.eye(n, device=device, dtype=dtype) - torch.matmul(Y, torch.matmul(B, Y))
+            Y = 0.5 * torch.matmul(Y, T)
+            
+        inv_sqrt = Y / (norm_factor ** 0.5)
+        
+        G_white = torch.matmul(inv_sqrt, G_centered)
+        
+    else:
+        Sigma = (1/n) * torch.matmul(G_centered.T, G_centered) + epsilon * torch.eye(d, device=device, dtype=dtype)
+        
+        norm_factor = torch.trace(Sigma) / d 
+        B = Sigma / norm_factor
+        Y = torch.eye(d, device=device, dtype=dtype)
+        
+        for _ in range(steps):
+            T = 3 * torch.eye(d, device=device, dtype=dtype) - torch.matmul(Y, torch.matmul(B, Y))
+            Y = 0.5 * torch.matmul(Y, T)
+            
+        inv_sqrt = Y / (norm_factor ** 0.5)
+        G_white = torch.matmul(G_centered, inv_sqrt)
+
+    return G_white # + G_mean
+
 def snormstep(p, alpha, dim):
     return (p.data - range_norm(p.data,dim=dim)) * alpha 
 
@@ -853,7 +925,41 @@ def justnorm(x, idim=-1):
     return res
 
 
+wn = torch.nn.utils.parametrizations.weight_norm
+class wnormlearnloss(nn.Module):
+    def __init__(self, embed):
+        super().__init__()
+              
+        self.head = nn.Sequential(
+                wn(nn.Linear(embed, embed*2),dim=None),
+                nn.GELU(),
+                #wn(nn.Linear(config.n_embd*2, config.n_embd*2),dim=None),
+                #nn.GELU(),
+                wn(nn.Linear(embed*2, 1))
+            )
 
+    def forward(self, x):
+        #TODO reconfigure, try rms, tanh
+        loss =  torch.tanh(self.head(x))#.mean()
+        return loss
+
+def get_boltzmann_mu(logits, target_k, steps=5):
+    mu = logits.mean(dim=-1, keepdim=True)
+    for _ in range(steps):
+        probs = torch.sigmoid(logits - mu)
+        current_sum = probs.sum(dim=-1, keepdim=True)
+        
+        grad_mu = -(probs * (1 - probs)).sum(dim=-1, keepdim=True)
+        
+        grad_mu = torch.where(grad_mu.abs() < 1e-6, -1e-6 * torch.ones_like(grad_mu), grad_mu)
+        
+        error = current_sum - target_k
+        delta = error / grad_mu
+        
+        delta = delta.clamp(-5.0, 5.0)
+        mu = mu - delta
+        
+    return mu
 def k_from_hot(k_hot, max):
     return k_hot.sum(dim=-1, keepdim=True).clamp(1,max)
 
@@ -1238,27 +1344,40 @@ def gaussian_kernel_batched(activation_tensor: torch.Tensor,
     features = activation_tensor.shape[-1]
     device = activation_tensor.device
     dtype = activation_tensor.dtype
-
-    # Generate position indices for the feature dimension
-    # Shape: (features,)
     indices = torch.arange(features, dtype=dtype, device=device)
-
-    # Unsqueeze center and sigma to allow broadcasting with indices
-    # center becomes (b, t, 1), sigma becomes (b, t, 1)
-    # indices is (features,). Broadcasting results in a (b, t, features) tensor.
     center = center_offset.unsqueeze(-1) * (features - 1)
     sigma = sigma.unsqueeze(-1) * (features - 1)
-    
-    # Avoid division by zero for sigma
     sigma = torch.clamp(sigma, min=1e-6)
-
-    # Compute Gaussian values
-    # The shapes are: (features,) - (b, t, 1) -> (b, t, features)
     kernel = torch.exp(-(indices - center).pow(2) / (2 * sigma**2))
+    return kernel
+@torch.compile(backend='inductor', mode='max-autotune')
+def wrapping_gaussian_kernel(activation_tensor: torch.Tensor, 
+                                     center_offset: torch.Tensor, 
+                                     sigma: torch.Tensor) -> torch.Tensor:
     
+    features = activation_tensor.shape[-1]
+    device = activation_tensor.device
+    dtype = activation_tensor.dtype
+    
+    indices = torch.arange(features, dtype=dtype, device=device)
+    
+    center = center_offset.unsqueeze(-1) * features
+    sigma = sigma.unsqueeze(-1) * features
+    sigma = torch.clamp(sigma, min=1e-6)
+    
+    # Calculate absolute difference
+    diff = torch.abs(indices - center)
+    diff = torch.min(diff, features - diff)
+    
+    kernel = torch.exp(-(diff).pow(2) / (2 * sigma**2))
     return kernel
 
-def mmdiem( a :torch.Tensor,b :torch.Tensor):
+def dampened_oscilator(t):
+    decay = torch.exp(-t * 2.0) 
+    value = 0.5 + 0.5 * decay * torch.cos(t * torch.pi * 4.0) 
+    return value
+
+def mmdiem(a :torch.Tensor, b :torch.Tensor):
     numel = a.numel()# torch.sqrt(torch.ones(1,device=a.device,dtype=a.dtype)* a.numel())
     afl = a.flatten()
     bfl = b.flatten()
@@ -1269,7 +1388,12 @@ def mmdiem( a :torch.Tensor,b :torch.Tensor):
     variance = torch.sqrt(a.var()*b.var()+1e-10)
     return torch.dot(anorm, bnorm) /  numel / variance # + (torch.abs(arange-brange)) + torch.abs(a.var() - b.var())
 
-
+def dotnear(a :torch.Tensor, b :torch.Tensor):
+    
+    anorm = a.norm(dim=-1, keepdim=True)
+    bnorm = b.norm(dim=-1, keepdim=True)
+    dot = torch.dot(a/anorm, b/bnorm)
+    return dot * gaussian_bump(anorm-bnorm)
 
 def quaternionize(x):
     b,t,n=x.shape
@@ -1323,16 +1447,47 @@ def fast_polar_decomposition(A, polar_iter=2):
         U = 0.5 * (U + U_inv_T)
         
     return U
+
+def rectangular_cursed_polar(A, polar_iter=2):
+    rows, cols = A.shape
+    U = A.clone()
+    
+    if rows <= cols:
+        I_k = torch.eye(rows, device=A.device, dtype=A.dtype)
+        
+        for _ in range(polar_iter):
+            v = torch.randn(cols, 1, device=A.device, dtype=A.dtype)
+            
+            u_p = U @ v
+            v_norm = v.norm() + 1e-8
+            s = (u_p.norm() / v_norm) + 1e-8
+            
+            U_scaled = U / s
+            Gram = U_scaled @ U_scaled.transpose(-2, -1)
+            Correction = 3.0 * I_k - Gram
+            U = 0.5 * Correction @ U_scaled
+
+    else:
+        I_k = torch.eye(cols, device=A.device, dtype=A.dtype)
+        
+        for _ in range(polar_iter):
+            v = torch.randn(rows, 1, device=A.device, dtype=A.dtype)
+            u_p = U.transpose(-2, -1) @ v
+            v_norm = v.norm() + 1e-8
+            s = (u_p.norm() / v_norm) + 1e-8
+            
+            U_scaled = U / s
+            Gram = U_scaled.transpose(-2, -1) @ U_scaled
+            Correction = 3.0 * I_k - Gram
+            U = 0.5 * U_scaled @ Correction
+            
+    return U
+
 def fast_polar_decomposition2(W, polar_iter=2):
-    # 1. Normalize by spectral norm estimate (using Frobenius for speed)
-    # This ensures convergence of Newton-Schulz
     norm = W.norm(p='fro') + 1e-9
     X = W / norm
     out_feat, in_feat = W.shape
-    # 2. Iterative Orthogonalization
     for _ in range(polar_iter):
-        # For non-square matrices, we compute X * (3I - X^T X)
-        # If Out < In: X * X^T is smaller. 
         if  out_feat < in_feat:
             gram = X.mm(X.t())
             eye = torch.eye(out_feat, device=X.device)
@@ -1343,6 +1498,28 @@ def fast_polar_decomposition2(W, polar_iter=2):
             X = 0.5 * X.mm(3.0 * eye - gram)
     
     return (X * norm)
+
+def polar_decomp3(M, steps=5, epsilon=1e-7):
+    if M.ndim < 2:
+        return M
+        
+    rows, cols = M.shape
+    frob_norm = M.norm(p='fro')
+    if frob_norm < epsilon:
+        return M
+    X = M / (frob_norm + epsilon)
+    if rows < cols:
+        for _ in range(steps):
+            gram = torch.matmul(X, X.transpose(-2, -1))
+            update_mat = 3.0 * torch.eye(rows, device=M.device, dtype=M.dtype) - gram
+            X = 0.5 * torch.matmul(update_mat, X)
+    else:
+        for _ in range(steps):
+            cov = torch.matmul(X.transpose(-2, -1), X)
+            update_mat = 3.0 * torch.eye(cols, device=M.device, dtype=M.dtype) - cov
+            X = 0.5 * torch.matmul(X, update_mat)
+    return X
+
 def cursed_polar_decomposition_smart(A, polar_iter=2):
     """
     Handles Square, Wide (1:2), and Tall (2:1) matrices by chunking.

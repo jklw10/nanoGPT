@@ -45,8 +45,8 @@ gradlog     = False
 gen         = False
 wnorm       = False
 genloss     = True
-
 qkhwn       = True
+
 #todo, wnorm, midreset, lr on memory, memswizzle,
 #ablate hierarchy, add innerblocks, make hierarchical output generation
 
@@ -149,7 +149,16 @@ class Model(nn.Module):
             x = block(x, causal)
 
         return self.transformer.ln_f(x)
-
+    def quant(self, x):
+        B,T,C = x.shape
+        
+        weight = self.transformer.wte.weight
+        V,_ = weight.shape
+        q = x.view(B, 1, T, C)
+        k = weight.view(1, 1, V, C) 
+        v = weight.view(1, 1, V, C)
+        scale = 10.0 
+        return F.scaled_dot_product_attention(q, k, v, scale=scale).view(x.shape)
 
     def forward(self, idx, Train=False, gumbel_temp=1.0, cl = 0.0):
 
@@ -164,8 +173,6 @@ class Model(nn.Module):
             return logits, None, None
         
         tok_emb = self.transformer.wte(idx)
-
-        #TODO: replace by rope
         pos_emb = self.transformer.wpe(torch.arange(T+1, device=device))
 
         x = tok_emb[:,:-2,:]
@@ -173,15 +180,17 @@ class Model(nn.Module):
         
         full_x = self.transformer_forward(tok_emb[:,:-1,:]+pos_emb)
         
+        g2_emb =full_x[:, :-1,:]#self.quant(full_x[:, :-1,:])
+        #g2_emb=quantizer.DiscreteLookupFunction.apply(full_x[:, :-1,:].contiguous(), self.lm_head.weight)
         #logits_full = self.lm_head(full_x)
         #logits_g1 = logits_full[:, :-1,:]
-
         #g1_pred_onehot = quantizer.TopKHot.apply(logits_g1, 3) / 3.0
         #g1_pred_onehot = torch.softmax(logits_g1, dim=-1)
         #g1_pred_onehot = F.gumbel_softmax(logits_g1, tau=gumbel_temp, hard=True, dim=-1)
         #g2_emb = g1_pred_onehot @ self.transformer.wte.weight
-        g2_emb=full_x[:, :-1,:]+pos_emb[1:,:]
-        gen2_x = self.transformer_forward(g2_emb,causal=True)
+        #g2_emb= full_x[:, :-1,:]
+        g2_emb=g2_emb+pos_emb[1:,:]
+        gen2_x = self.transformer_forward(g2_emb,causal=False)
 
         bfw = self.lm_head.weight.to(torch.bfloat16)
         
@@ -206,7 +215,7 @@ class Model(nn.Module):
             gk = utils.gaussian_kernel(L_guess,1.0,dim=-1) #centered on the end of sequence
             
 
-            loss = L_all.mean() + L_guess*gk
+            loss = L_all.mean() + torch.log1p(L_guess*gk).mean()
         else:
             loss = L_all.mean()
         L_guess = L_guess.mean().detach()
@@ -281,7 +290,6 @@ if gradlog:
         if p.requires_grad:
             p.register_hook(get_grad_hook(name))
 
-            
 t0 = time.time()
 t2 = time.time()
 

@@ -3,13 +3,13 @@ import os
 import time
 
 #os.environ['CUDA_LAUNCH_BLOCKING'] = "0" 
-import pickle
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import modules
 import quantizer
 import utils
+from cut_cross_entropy import linear_cross_entropy
 
 torch._inductor.config.disable_cpp_codegen = True
 #dataset = "shakespeare_char"
@@ -24,11 +24,11 @@ DIM_L2 = DIM_L1
 DIM_L3 = DIM_L2
 
 K_GATHER_L1 = block_size // 2
-K_GATHER_L2 = K_GATHER_L1 // 8
+K_GATHER_L2 = K_GATHER_L1 // 2
 
 mem_size = 48
 
-dropout = 0.1
+dropout = 0.0
 max_iters = 50000
 
 eval_interval = 1000
@@ -49,14 +49,19 @@ gen         = True
 memcheat    = False
 wnorm       = False
 genloss     = True
-resid       = False
+resid       = True
 ael         = False
+cce         = True
+winit       = True
+emb_wn      = False
+pattlin     = False
+wnll        = True
 #todo, wnorm, midreset, lr on memory, memswizzle,
 #ablate hierarchy, add innerblocks, make hierarchical output generation
 
 #Linear = modules.OrthogonalLinear
-#Linear = nn.Linear
-Linear = modules.HungryLinear
+Linear = nn.Linear 
+#Linear = modules.HungryLinear
 
 def get_lr(it):
     
@@ -86,36 +91,41 @@ class Patcher(nn.Module):
         self.sdim = 10
 
         self.up_scan = modules.Block(outer_dim,4,0.0,False)
-        self.up_proj = Linear(outer_dim,inner_dim,bias=False)
+        self.up_proj = Linear(outer_dim, inner_dim, bias=False)
+        if pattlin:
+            self.up_proj = modules.PattLayer(outer_dim, inner_dim, 4096)
         #self.up_proj = modules.Pattention(outer_dim,inner_dim,256)
         self.AE = quantizer.Autoencoder(
             inner_dim,inner_dim,inner_dim,inner_dim,
             quantizer.ThresHot
             )
         
-        self.resid_up = Linear(outer_dim, inner_dim,bias=False)
-       # self.resid_up = modules.Pattention(outer_dim,inner_dim,256)
-        self.resid_drop = nn.Dropout(0.5)
-        self.down_drop = nn.Dropout(0.1)
+        self.resid_up = Linear(outer_dim,inner_dim,bias= False)
+        if pattlin:
+            self.resid_up = modules.PattLayer(outer_dim, inner_dim, 4096)
+        self.resid_drop = nn.Dropout(dropout)
+        self.down_drop = nn.Dropout(dropout)
         self.output_pos_emb = nn.Embedding(outer_seq, inner_dim)
         
         self.down_block = modules.Block(inner_dim, 4, 0.0,False)
         self.down_scatter = modules.CombineBlock(inner_dim, 4, 0.0,False)
         self.down_scatter2 = modules.CombineBlock(outer_dim, 4, 0.0,False)
         self.down_proj = Linear(inner_dim,outer_dim,bias=False)
+        if pattlin:
+            self.down_proj = modules.PattLayer(inner_dim, outer_dim, 256)
         #self.down_proj = modules.Pattention(inner_dim,outer_dim,256)
         self.down_scan = modules.Block(outer_dim,4,0.0,False)
         
         self.up_gate = nn.Sequential(
-            Linear(outer_dim, outer_dim // 4,bias=False),
+            nn.Linear(outer_dim, outer_dim // 4,bias=False),
             nn.GELU(),
-            Linear(outer_dim // 4, 1)
+            nn.Linear(outer_dim // 4, 1)
         )
 
         self.down_gate = nn.Sequential(
-            Linear(outer_dim, outer_dim // 4,bias=False),
+            nn.Linear(outer_dim, outer_dim // 4,bias=False),
             nn.GELU(),
-            Linear(outer_dim // 4, outer_seq)
+            nn.Linear(outer_dim // 4, outer_seq)
         )
 
         self.res_norm = modules.LayerNorm(outer_dim, False)
@@ -124,27 +134,35 @@ class Patcher(nn.Module):
 
         self.up_norm = modules.LayerNorm(outer_dim, False)
         self.upgate_norm = modules.LayerNorm(outer_seq, False)
-        self.up_drain = nn.Parameter(torch.ones(outer_dim))
+        self.gather_norm = modules.LayerNorm(inner_dim,bias=False)
         
         
         self.query_block = modules.Block(outer_dim, 4, 0.0, False)
         self.gather_block = modules.CombineBlock(outer_dim, 4, 0.0,False)
         self.proj_block = modules.Block(inner_dim, 4, 0.0,False)
         
-        if not resid:
-            torch.nn.init.normal_(self.down_proj.weight, std=0.02) 
+        #if not resid:
+        #    torch.nn.init.normal_(self.down_proj.weight, std=0.02) 
             #torch.nn.init.normal_(self.down_proj.weight, std=0.02) 
-        
     
     def abstract_up(self, x, conf=None):
-        gathered = self.query_block(x, conf=conf)
+        gathered = self.query_block(x)
         gate = self.up_gate(gathered).squeeze(-1)
         gate = self.gate_norm(gate)
-        gathered = quantizer.GatherByGate.apply(
+        gathered = utils.rms(gathered)
+        gathered, _ = quantizer.RLMAXgbg3.apply(
             gate, 
             gathered, 
             self.inner_seq,
+            1.0,
+            #False,
+            self.training,
+            #0.3
             )
+        #noise =torch.randn_like(gathered,requires_grad=True)/(1.0+gathered.sum()) 
+        #gsink = 
+        #gathered= gathered+noise
+        #gathered= utils.rms(gathered)
         #gathered = quantizer.HungryGatherFunc2.apply(
         #    gate, 
         #    gathered, 
@@ -153,14 +171,17 @@ class Patcher(nn.Module):
         #    self.training,  # training
         #    0.0,   #magnet
         #    )
-        
+        #self.gln
+        #gathered= torch.tanh(gathered)
         up = self.up_proj(gathered)
-        up = self.proj_block(up, conf=conf)
+        #up= utils.rms(up)
+        up = self.proj_block(up)
         hot= None
         aux= 0.0
-        #ae_up, hot = self.AE(up)
-        #aux = F.mse_loss(up, ae_up)
-        #up = ae_up
+        if ael:
+            ae_up, hot = self.AE(up)
+            aux = F.mse_loss(up, ae_up)
+            up = ae_up
         return up, [x, hot, gate, aux]
     
     def abstract_down(self, x, residual, decaying =  None, conf=None):
@@ -175,34 +196,46 @@ class Patcher(nn.Module):
         scattered = quantizer.ScatterByGate.apply(gate, x, self.outer_seq)
         pos_emb = self.output_pos_emb(pos).expand(scattered.shape)
         scattered = scattered + pos_emb 
-        pds = self.down_block(scattered, conf=conf)
+        pds = self.down_block(scattered)
         pds = self.down_proj(pds)
             
         if resid:
-            query = residual
-            query = self.res_norm(query)
+            query = self.res_norm(residual+pos_emb)
         else:
             query = self.down_proj(pos_emb)
             query = self.res_norm(query)
             
-        xout = self.down_scatter2(pds, query, causal=True, conf=conf)
-        xout = self.down_scan(xout, conf=conf)
+        xout = self.down_scatter2(pds, query, causal=True)
+        if resid:
+            query = self.res_norm(residual)
+        else:
+            query = self.down_proj(pos_emb)
+            query = self.res_norm(query)
+        xout = self.down_scan(xout)
         aux = aux+upaux
         return xout, aux
     
     def forward(self, x, center, conf=None):
-        p_up, residual = self.abstract_up(x, conf=conf)
+        p_up, residual = self.abstract_up(x)
         passed, aux = center(p_up)
-        p_down, aux2 = self.abstract_down(passed, residual, conf=conf)
+        p_down, aux2 = self.abstract_down(passed, residual)
         return p_down, aux+aux2
     
 
 class HNet(nn.Module):
     def __init__(self, vocab_size):
         super().__init__()
-        self.token_embedder = nn.Embedding(vocab_size, DIM_L1)
-        self.pos_embedder = nn.Embedding(block_size, DIM_L1)
-        self.head = Linear(DIM_L1, vocab_size,bias=False)
+        self.tok_emb = nn.Embedding(vocab_size, DIM_L1)
+        if emb_wn:
+            torch.nn.init.normal_(self.tok_emb.weight, mean=0.0, std=0.02)
+ 
+            self.tok_emb = wn(self.tok_emb, dim=1)
+        
+        self.pos_emb = nn.Embedding(block_size, DIM_L1)
+        #self.head = nn.Linear(DIM_L1, vocab_size,bias=False)
+        #self.head.weight = self.tok_emb.weight
+        #self.head = wn(self.head)
+        self.wnll = utils.wnormlearnloss(DIM_L1)
         self.n_layer = 2
         self.h_ln = modules.LayerNorm(DIM_L1,bias=False)
         self.sLayers = nn.ModuleList([
@@ -228,15 +261,16 @@ class HNet(nn.Module):
             self.cmem= True
             self.dreamer = modules.Dreamer(**memconf)
             self.memory_selector = modules.Block(**memconf)
-   #    self.apply(self._init_weights)
+        if winit:
+            self.apply(self._init_weights)
    #
-   #def _init_weights(self, module):
+    def _init_weights(self, module):
         #if isinstance(module, Linear):
         #    torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
         #    if module.bias is not None:
         #        torch.nn.init.zeros_(module.bias)
-        #if isinstance(module, nn.Embedding):
-        #    torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        if isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     def mem_form(self, x):
         mem         = self.memory_selector(x, causal=self.cmem)[:,:self.mem_block_size,:] #(b, m, c)
         #check_nan(mem, "selector")
@@ -253,29 +287,35 @@ class HNet(nn.Module):
         b, t = idx.shape
         
         positions = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0)
-        tok_emb = self.token_embedder(idx)
-        pos_emb = self.pos_embedder(positions)
+        tok_emb = self.tok_emb(idx)
+        pos_emb = self.pos_emb(positions)
         x0 = tok_emb + pos_emb 
+        x0 = utils.rms(x0)
         x = x0
         residuals = []
         for i, layer in enumerate(self.sLayers):
             
-            x, res = layer.abstract_up(x, conf=conf)
+            x, res = layer.abstract_up(x)
             residuals.append(res)
 
         if mem:
-            x = self.mem_center(x, conf=conf)
+            x = self.mem_center(x)
         else:
             for block in self.inner:
-                x = block(x, conf=conf)
+                x = block(x)
         aux=0
         for i in reversed(range(len(self.sLayers))):
             layer = self.sLayers[i]
-            x, auxl = layer.abstract_down(x, residuals[i], decaying = decaying, conf=conf)
+            x, auxl = layer.abstract_down(x, residuals[i], decaying = decaying)
             aux = aux+auxl
+        wnl = 0
+        if self.training:
+            wnl = self.wnll(x)
+            aux = aux + wnl.mean()
         x = self.h_ln(x)
         if targets is None: #during inference skip the losses
-            logits = self.head(x[:, -skiptok:, :])
+            
+            logits = F.linear(x[:, -skiptok:, :], self.tok_emb.weight)
             return logits
         
         if cl:
@@ -294,22 +334,53 @@ class HNet(nn.Module):
                 current_output_rep = encoded_output
         
         
-        logits = self.head(x,conf)
-        B, T_out, C = logits.shape
-        targets_aligned = targets[:, :T_out]
-        
-        loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets_aligned.reshape(-1))
         gloss = 0.0
-        if genloss:
-            gloss = F.cross_entropy(logits[:,-1,:].reshape(-1, C), targets_aligned[:,-1].reshape(-1)).detach()
+        
+        logits = None
+        red = 'mean'
+        if wnll:
+            red='none'
+        if cce:
+            T_out = x.shape[1]
+            targets_aligned = targets[:, :T_out]
+
+            loss = linear_cross_entropy(x.to(torch.bfloat16), 
+                                            self.tok_emb.weight.to(torch.bfloat16), 
+                                            targets_aligned, 
+                                            impl='torch_compile',
+                                            reduction=red)
+            if genloss:
+                gloss = linear_cross_entropy(x.to(torch.bfloat16)[:,-1,:], 
+                                            self.tok_emb.weight.to(torch.bfloat16), 
+                                            targets_aligned[:,-1], 
+                                            impl='torch_compile')
+        else:
+            logits = F.linear(x, self.tok_emb.weight)
+            
+            B, T_out, C = logits.shape
+            targets_aligned = targets[:, :T_out]
+        
+            loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]),
+                                    targets_aligned.reshape(-1),
+                                    reduction=red)
+            if genloss:
+                gloss = F.cross_entropy(logits[:,-1,:].reshape(-1, C), targets_aligned[:,-1].reshape(-1)).detach()
+        
         if self.training:
+            if wnll:
+                chaos = ((1.0-wnl.detach())/2.0).mean()*0.99
+                scale = chaos
+                loss = loss / (1+ wnl.detach().squeeze(-1)*scale)
+                
             if idk_enabled:
                 loss = utils.idk_loss(loss, logits, targets, idk_token) 
             
             loss = loss+aux
             if cl:
                 loss = loss+total_cl
-
+        
+        if wnll:
+            loss= loss.mean()
         return logits, loss, gloss 
 
     def mem_center(self, x):
@@ -368,19 +439,6 @@ class HNet(nn.Module):
     def configure_optimizers(self, lr):
         return torch.optim.AdamW(self.parameters(), lr=lr)
 
-class FeedForward(nn.Module):
-    def __init__(self, n_in, n_out, dropout):
-        super().__init__()
-        self.net = nn.Sequential(
-            Linear(n_in, 4 * n_out,bias=False),
-            nn.GELU(),
-            Linear(4 * n_out, n_out,bias=False),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-    
 class cascadenet(nn.Module):
     def __init__(self, vocab_size, n_embd = 256, n_iter = 4, dropout=0.0):
         super().__init__()
@@ -391,16 +449,16 @@ class cascadenet(nn.Module):
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
 
-        # Initial state projector: x_t -> h_{t,0}
         self.mlp_init = nn.Sequential(
             nn.Linear(n_embd, n_embd),
             nn.GELU()
         )
-
-        # The core update MLP: (h_{t-1, k-1}, x_t) -> update_t
-        # It takes the concatenation of the previous state and current input
-        self.mlp_update = FeedForward(n_embd * 2, n_embd, dropout)
-
+        self.mlp_update = nn.Sequential(
+            Linear(n_embd*2, 4 * n_embd,bias=False),
+            nn.GELU(),
+            Linear(4 * n_embd, n_embd,bias=False),
+            nn.Dropout(dropout),
+        )
         # Layer norms for stability
         self.ln_in = nn.LayerNorm(n_embd)
         self.ln_out = nn.LayerNorm(n_embd)

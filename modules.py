@@ -6,6 +6,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import utils
 import quantizer
+import torch.nn.utils.parametrizations as parametrizations
 class HungryLinearFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input, weight, bias, config):
@@ -18,10 +19,13 @@ class HungryLinearFunc(torch.autograd.Function):
         conf = ctx.config
         #print("real")
         if conf.get('noise', False):
-            input_magnitude = input.abs().sum()
+            #larger batch = better sampling = less noise needed, i don't think i need to scale.
+            input_magnitude = input.abs().sum() #/ input.shape[0]
             noise = torch.randn_like(input) / ( 1.0 + input_magnitude)
-            noise2 = torch.randn_like(input) * grad_output.std() * 0.1
+            scale = conf.get('noise_scale', 0.1)
+            noise2 = torch.randn_like(input) * grad_output.std() * scale
             input = input + noise + noise2
+            #grad_output = grad_output + noise2
         #grad_output = utils.rms(grad_output)
         input_flat = input.reshape(-1, input.shape[-1])
         grad_flat = grad_output.reshape(-1, grad_output.shape[-1])
@@ -29,9 +33,10 @@ class HungryLinearFunc(torch.autograd.Function):
         grad_weight = grad_flat.t().matmul(input_flat)
         
         alpha = conf.get('lookahead_alpha', 0.001)
-        
-        #gwin = F.normalize(grad_weight)
-        future_weight = weight - (grad_weight * alpha)
+        gwin = grad_weight
+        if conf.get('gnorm', True):
+            gwin = utils.rms(gwin)
+        future_weight = weight - (gwin * alpha)
         
         grad_input = grad_output.matmul(future_weight)
         
@@ -42,7 +47,7 @@ class HungryLinearFunc(torch.autograd.Function):
         return grad_input, grad_weight, grad_bias, None
 
 class HungryLinear(nn.Module):
-    def __init__(self, in_features, out_features, bias = False, lookahead=1e-5, noise=True, zero_init=False):
+    def __init__(self, in_features, out_features, bias = False, lookahead=1e-2, noise=True, zero_init=True, g_norm =True):
         super().__init__()
         self.in_features = in_features
         
@@ -58,7 +63,8 @@ class HungryLinear(nn.Module):
         self.config = {
             'lookahead_alpha': lookahead,
             'noise': noise,
-            'noise_scale': 0.1, 
+            'noise_scale': 0.01, 
+            'g_norm': g_norm,
         }
         
     def forward(self, x, conf = None):
@@ -281,6 +287,27 @@ class ModularProbeFunc(torch.autograd.Function):
 
         return grad_input, grad_weight, grad_bias, None, None
 
+class HCLinear(nn.Module):
+    def __init__(self, in_features, out_features, gain=1.0, learn_gain=False, force=False):
+        super().__init__()
+        if learn_gain:
+            self.gain = nn.Parameter(torch.tensor(gain))
+        else:
+            self.register_buffer('gain', torch.tensor(gain))
+        self.force = force
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        nn.init.kaiming_normal_(self.weight)
+    def forward(self, x):
+        if self.force:
+            with torch.no_grad():
+                w_norm = utils.range_norm(self.weight,dim=None,scale=self.gain)
+                self.weight.data = w_norm
+            return F.linear(x,self.weight)
+        w_norm = utils.range_norm(self.weight,dim=None,scale=self.gain)
+        return F.linear(x,w_norm)
+
+
+
 class ProbingLinear(nn.Module):
     def __init__(self, in_features, out_features, activation=None, bias=True, tension=1e-6):
         super().__init__()
@@ -306,104 +333,8 @@ class ProbingLinear(nn.Module):
     def forward(self, x):
         return ModularProbeFunc.apply(x, self.weight, self.bias, self.activation, self.config)
 
-
-Linear = nn.Linear#HungryLinear
-
-class Patcher(nn.Module):
-    def __init__(self, outer_dim, inner_dim, outer_seq, inner_seq):
-        super().__init__()
-        self.inner_seq = inner_seq
-        self.outer_seq = outer_seq
-
-        self.up_scan = Block(outer_dim,4,0.0,False)
-        self.up_proj =Linear(outer_dim,inner_dim,bias=False)
-        self.AE = quantizer.Autoencoder(
-            inner_dim,inner_dim,inner_dim,inner_dim,
-            quantizer.ThresHot
-            )
-        
-        self.resid_up = Linear(outer_dim, inner_dim,bias=False)
-        self.output_pos_emb = nn.Embedding(outer_seq, inner_dim)
-        
-        self.down_block = Block(inner_dim, 4, 0.0,False)
-        self.down_scatter = CombineBlock(outer_dim, 4, 0.0,False)
-        self.down_proj = Linear(inner_dim,outer_dim,bias=False)
-        self.down_scan = Block(outer_dim,4,0.0,False)
-        
-        self.up_gate = nn.Sequential(
-            Linear(outer_dim, outer_dim // 4,bias=False),
-            nn.GELU(),
-            Linear(outer_dim // 4, 1)
-        )
-
-        self.down_gate = nn.Sequential(
-            Linear(outer_dim, outer_dim // 4,bias=False),
-            nn.GELU(),
-            Linear(outer_dim // 4, outer_seq)
-        )
-
-        self.res_norm = LayerNorm(outer_dim, False)
-        self.down_norm = LayerNorm(inner_dim, False)
-        self.gate_norm = LayerNorm(outer_seq, False)
-
-        self.up_norm = LayerNorm(outer_dim, False)
-        self.upgate_norm = LayerNorm(outer_seq, False)
-        
-        
-        self.query_block = Block(outer_dim, 4, 0.0, False)
-        self.gather_block = CombineBlock(outer_dim, 4, 0.0,False)
-        self.proj_block = Block(inner_dim, 4, 0.0,False)
-        
-        
-    
-    def abstract_up(self, x, conf=None):
-        gathered = self.query_block(x, conf=conf)
-        gate = self.up_gate(x).squeeze(-1)
-        gate = self.gate_norm(gate)
-        
-        gathered = quantizer.HungryGatherFunc2.apply(
-            gate, 
-            gathered, 
-            self.inner_seq,
-            0.01,   # tau
-            self.training,  # training
-            0.0,   #magnet
-            )
-        
-        up = self.up_proj(gathered, conf=conf)
-        up = self.proj_block(up, conf=conf)
-       
-        ae_up, hot = self.AE(up)
-        aux = F.mse_loss(up, ae_up)
-        up = ae_up
-        return up, [x, hot, gate, aux]
-    
-    def abstract_down(self, x, residual, conf=None):
-        residual, gate, upaux = residual
-        
-        x = self.down_norm(x)
-       
-        pos = torch.arange(0, self.outer_seq, dtype=torch.long, device=x.device) 
-        
-        pos_emb = self.output_pos_emb(pos).expand(x.shape[0],-1,-1)
-       
-        scattered = quantizer.ScatterByGate.apply(gate, x, self.outer_seq)
-        scattered = scattered + pos_emb 
-        pds = self.down_block(scattered, conf=conf)
-        pds = self.down_proj(pds, conf=conf)
-            
-        query = residual.detach()
-        query = self.res_norm(query)
-            
-        p_down = self.down_scatter(pds, query, causal=True, conf=conf)
-        
-        return self.down_scan(p_down, conf=conf), upaux
-    
-    def forward(self, x, center, conf=None):
-        p_up, residual = self.abstract_up(x, conf=conf)
-        passed, aux = center(p_up)
-        p_down, aux2 = self.abstract_down(passed, residual, conf=conf)
-        return p_down, aux+aux2
+Linear = nn.Linear
+#Linear = HungryLinear
 
 class Kattention(nn.Module):
     def __init__(self, config):
@@ -447,7 +378,7 @@ class Kattention(nn.Module):
         att = att.masked_fill(causal_mask == 0, 0.0) #float('-inf'))
         k_hot_mask = quantizer.avgHot.apply(att)#, k_val)
         att = att.masked_fill(k_hot_mask == 0, 0.0) #float('-inf'))
-        att = F.tanh(att) / k_val #utils.k_from_hot(k_hot_mask).detach()
+        att = F.tanh(att) #/ k_val #utils.k_from_hot(k_hot_mask).detach()
         #att = torch.softmax(att,dim=-1) 
         y = att@v
 
@@ -475,10 +406,16 @@ class PattLayer(nn.Module):
         nn.init.kaiming_uniform_(self.key_tokens, a=math.sqrt(5))
         nn.init.kaiming_uniform_(self.val_tokens, a=math.sqrt(5))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        scores = x @ self.key_tokens.T
+    def forward(self, x: torch.Tensor, get_scores=False) -> torch.Tensor:
+        #keytok = utils.zca_newton_schulz(self.key_tokens,steps=2,power_iters=2).to(self.key_tokens.dtype)
+        #with torch.no_grad():
+        #    self.val_tokens.data = utils.zca_newton_schulz(self.val_tokens,steps=2,power_iters=2).to(self.val_tokens.dtype)
+        scores = x @ self.key_tokens.T #self.key_tokens.T
         attn = tokenformer_theta(scores, dim=-1)
-        return attn @ self.val_tokens
+        x_out= attn @ self.val_tokens
+        if get_scores:#TODO gatherbygate
+            return x_out, scores
+        return x_out
 
     def add_tokens(self, n: int):
         device = self.key_tokens.device
@@ -534,8 +471,8 @@ class MHKPattLayer(nn.Module):
        # scores = scores * (1.0 / math.sqrt(self.key_head_dim))
         #scores = F.tanh(scores)
         scores = tokenformer_theta(scores, dim=-1)
-        #k_hot_mask = quantizer.ThresHot.apply(scores)
-        #scores = scores.masked_fill(k_hot_mask == 0, 0)
+        k_hot_mask = quantizer.ThresHot.apply(scores)
+        scores = scores.masked_fill(k_hot_mask == 0, 0)
         #scores = scores / utils.k_from_hot(k_hot_mask,scores.shape[-1]).detach()
         #scores = tokenformer_theta(scores, dim=-1)
         #scores = torch.softmax(scores, dim=-1)
@@ -592,7 +529,7 @@ class Pattention(nn.Module):
         #att = att.masked_fill(k_hot_mask == 0, float('-inf'))
         #
         #
-        ##att = F.tanh(att) / utils.k_from_hot(k_hot_mask).detach()
+        ##att = F.tanh(att) #/ utils.k_from_hot(k_hot_mask).detach()
         #att = torch.softmax(att,dim=-1) 
         #y = att@v
         y = torch.nn.functional.scaled_dot_product_attention(
@@ -693,6 +630,7 @@ class SSM(nn.Module):
         #self.shl_rh = SinkhornLinear(n_embd)
         self.shl_lh = ProcrustesLinear(n_embd,n_embd)
         self.shl_rh = ProcrustesLinear(n_embd,n_embd)
+        self.patt   = PattLayer(n_embd, n_embd, 256)#TODO
         with torch.no_grad():
             self.shl_lh.weight.data = (torch.eye(n_embd))
             self.shl_rh.weight.data = (torch.eye(n_embd))
@@ -777,7 +715,7 @@ class CombineAttention(nn.Module):
             v = self.v_proj(x,conf)
         else:
             q = self.q_proj(sx)
-            k = self.q_proj(x)#TODO: beware
+            k = self.k_proj(x)#TODO: beware
             v = self.v_proj(x)
         q = q.view(B, sT, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, sT, hs)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
@@ -1152,54 +1090,104 @@ class LearnableSpectralSinkhorn(nn.Module):
 
 class DoublyStochasticGradient(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight):
-        """
-        Forward is standard Linear: y = x @ W.t()
-        We save input and weight for the backward pass.
-        """
+    def forward(ctx, x, weight, lookahead_factor=1.0):
         ctx.save_for_backward(x, weight)
+        ctx.lookahead = lookahead_factor
         return F.linear(x, weight)
 
     @staticmethod
     def backward(ctx, grad_output):
         x, weight = ctx.saved_tensors
         
-        grad_input = grad_output.matmul(weight)
         grad_output_flat = grad_output.reshape(-1, grad_output.shape[-1])
         x_flat = x.reshape(-1, x.shape[-1])
+        
         grad_weight = grad_output_flat.t().matmul(x_flat)
 
-        # 2. GRADIENT PROJECTION 
-        # We want the gradient to have Row_Sum = 0 and Col_Sum = 0.
-        for _ in range(10):
-            gwdir= 0.5*(grad_weight.mean(dim=1, keepdim=True)+grad_weight.mean(dim=0, keepdim=True))
-            grad_weight = grad_weight - gwdir
+        row_mean = grad_weight.mean(dim=1, keepdim=True)
+        col_mean = grad_weight.mean(dim=0, keepdim=True)
+        global_mean = grad_weight.mean()
+        
+        grad_weight_projected = grad_weight - row_mean - col_mean + global_mean
 
-        return grad_input, grad_weight
+        if ctx.lookahead > 0:
+            effective_weight = weight + (ctx.lookahead * grad_weight_projected)
+            grad_input = grad_output.matmul(effective_weight)
+        else:
+            grad_input = grad_output.matmul(weight)
+
+        return grad_input, grad_weight_projected, None
 
 class SinkhornLinear2(nn.Module):
-    def __init__(self, size):
+    def __init__(self, size, lookahead=1.0):
         super().__init__()
         self.size = size
-        self.weight = nn.Parameter(torch.eye(size))
+        self.lookahead = lookahead
+        self.weight = nn.Parameter(torch.eye(size) + torch.randn(size, size) * 1e-4)
+        self.project_weights() 
+    def project_weights(self):
         
         with torch.no_grad():
-            noise = torch.randn(size, size) * 1e-5
-            # Project noise to be zero-sum 
-            for _ in range(10):
-                noise = noise - 0.5*(noise.mean(dim=1, keepdim=True)+noise.mean(dim=0, keepdim=True))
+            self.weight.clamp_(min=1e-8)
+            for _ in range(2): 
+                dir = 0.5*(self.weight.sum(dim=1, keepdim=True)+self.weight.sum(dim=0, keepdim=True))
+                self.weight.div_(dir)
                 
-            self.weight.add_(noise)
-            
     def forward(self, x):
-        #if self.training:
-        #    with torch.no_grad():
-        W = self.weight
-        target_mean = 1.0 / W.shape[1]
-        wdir = 0.5*(self.weight.mean(dim=1, keepdim=True)+self.weight.mean(dim=0, keepdim=True))
-        W = W-(wdir - target_mean)
-        return DoublyStochasticGradient.apply(x, W)
+        if self.training:
+            self.project_weights()
+            
+        return DoublyStochasticGradient.apply(x, self.weight, self.lookahead)
     
+class RatRelu(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, x):
+        return utils.rat_relu(x)
+    
+class DeadRatRelu(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, x):
+        return utils.dead_rat_relu(x)
+class WarmStartSinkhornLinear(nn.Module):
+    def __init__(self, size, n_iter=10, temp=0.1):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(size, size))
+        self.temp = temp
+        self.n_iter = n_iter
+        # Cache for warm start
+        self.register_buffer('r_prev', torch.zeros(size, 1))
+        self.register_buffer('c_prev', torch.zeros(1, size))
+
+    def forward(self, x):
+        # 1. Log-space weights
+        Q = self.weight / self.temp
+        
+        # 2. Initialize with previous step's scalings (Warm Start)
+        # This makes 1 iteration effectively as good as 10 iterations from scratch
+        r = self.r_prev
+        c = self.c_prev
+        
+        # 3. Sinkhorn Iterations
+        # Since we warm start, we can reduce n_iter drastically (e.g. to 2 or 3)
+        for _ in range(self.n_iter):
+            # Log-space Sinkhorn updates: u <- log(1/N) - log(sum(exp(Q + v)))
+            # r (rows) update
+            # Q is (N, N), c is (1, N) -> broadcasting
+            r = -torch.logsumexp(Q + c, dim=1, keepdim=True)
+            # c (cols) update
+            c = -torch.logsumexp(Q + r, dim=0, keepdim=True)
+            
+        # Save state for next forward pass
+        if self.training:
+            self.r_prev.data.copy_(r.detach())
+            self.c_prev.data.copy_(c.detach())
+
+        # 4. Final Matrix
+        P = (Q + r + c).exp()
+        
+        return F.linear(x, P) 
 class SinkhornLinear(nn.Module):
     def __init__(self, size, n_iter=10, eps=1e-6, grad_project=True, log_space=True,temp=0.125):
         super().__init__()
@@ -1243,10 +1231,10 @@ class SinkhornLinear(nn.Module):
         #W = utils.sin_relu(self.weight) + 1e-8
         #W= torch.abs(self.weight)
         #W= self.weight*F.relu(self.weight)
-        #W = self.weight*self.weight
+        W = self.weight*self.weight
         #W = utils.gaussian_bump(self.weight)
         #W = F.leaky_relu(self.weight) + 1e-8
-        W = utils.synthrelu(self.weight)+ 1e-8
+        #W = utils.synthrelu(self.weight)+ 1e-8
         for _ in range(self.n_iter):
             W_dir = 0.5*(W.sum(dim=1, keepdim=True)+W.sum(dim=0, keepdim=True))
             W = W / W_dir#todo sidmoid ese
