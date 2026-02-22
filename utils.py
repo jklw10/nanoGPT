@@ -255,6 +255,7 @@ class RatchetRelu(torch.autograd.Function):
         
         return final_grad
 
+#lovingly named
 class DeadRatRelu(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
@@ -277,6 +278,8 @@ class DeadRatRelu(torch.autograd.Function):
             grad_input[dead_mask] *= scale
             
         return grad_input
+def dead_rat_relu(x):
+     return DeadRatRelu.apply(x)
 def gumbell_noise(logits):
     """
     gumbell noises logits
@@ -284,8 +287,6 @@ def gumbell_noise(logits):
     eps = 1e-8
     return logits -torch.log(-torch.log(torch.rand_like(logits) + eps) + eps)
         
-def dead_rat_relu(x):
-     return DeadRatRelu.apply(x)
 class SyntheticReluGrad(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):

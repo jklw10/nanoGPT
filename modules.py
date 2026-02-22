@@ -630,7 +630,7 @@ class SSM(nn.Module):
         #self.shl_rh = SinkhornLinear(n_embd)
         self.shl_lh = ProcrustesLinear(n_embd,n_embd)
         self.shl_rh = ProcrustesLinear(n_embd,n_embd)
-        self.patt   = PattLayer(n_embd, n_embd, 256)#TODO
+        #self.patt   = PattLayer(n_embd, n_embd, 256)#TODO
         with torch.no_grad():
             self.shl_lh.weight.data = (torch.eye(n_embd))
             self.shl_rh.weight.data = (torch.eye(n_embd))
@@ -639,7 +639,7 @@ class SSM(nn.Module):
         return self.scanner.compute_orthogonal_weights()
 
     def forward(self, x: torch.tensor, weight = None): #same signature to allow easy swapping.
-        B, T, C = x.size() 
+        #B, T, C = x.size() 
         q = self.q_attn(x) 
         v = self.v_attn(x)
         if weight is None:
@@ -648,12 +648,12 @@ class SSM(nn.Module):
         #    self.shl_lh.project()
         #    self.shl_rh.project()
         def scan(left, right):
-            z = self.shl_lh(left) 
-            z = z + self.shl_rh(right)
-            z = utils.rms(z,dim=-1)
+            #z = self.shl_lh(left) 
+            #z = z + self.shl_rh(right)
+            #z = utils.rms(z,dim=-1)
 
-            #z = self.scanner(left,right,weight).to(x.dtype)
-            #z = utils.range_norm(z)
+            z = self.scanner(left,right,weight).to(x.dtype)
+            z = utils.rms(z)
             return z
         q = utils.pscan2(q, scan, self.identity)
         
@@ -663,14 +663,14 @@ class SSM(nn.Module):
         return Y, q
     
     def nexts(self, prev: torch.tensor, x: torch.tensor,  causal=False, weight = None): #same signature to allow easy swapping.
-        B, T, C = x.size() 
+       # B, T, C = x.size() 
         q = self.q_attn(x) 
         v = self.v_attn(x)
         if weight is None:
             weight = self.scanner.compute_orthogonal_weights()
         def scan(left, right):
             z = self.scanner(left,right,weight).to(x.dtype)
-            return utils.range_norm(z)
+            return utils.rms(z)
         q = scan(prev,q)
         
         Y = q*v 
