@@ -199,6 +199,27 @@ class TopKHot(torch.autograd.Function):
             hard_target = torch.zeros_like(x).scatter_(-1, topk_indices, 1.0)
         grad_x = F.sigmoid(x) - hard_target
         return grad_x,  None
+
+class ThresHot(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        probs = F.softmax(x, dim=-1)
+        k_hot = torch.where(probs >= (1.0 / x.shape[-1]), 1.0, 0.0)
+        ctx.save_for_backward(x)
+        return k_hot
+
+    @staticmethod
+    def backward(ctx, g):
+        x, = ctx.saved_tensors
+
+        with torch.no_grad():
+            g_mean = torch.mean(g, dim=-1, keepdim=True)
+            
+            hard_target = torch.where(g < g_mean, 1.0, 0.0)
+
+        grad_x = F.sigmoid(x) - hard_target
+        return grad_x    
+
 class BoltzmannTopKHot(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, k):
@@ -249,25 +270,6 @@ class BoltzmannThresHot(torch.autograd.Function):
         
         return grad_x
 
-class ThresHot(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-        probs = F.softmax(x, dim=-1)
-        k_hot = torch.where(probs >= (1.0 / x.shape[-1]), 1.0, 0.0)
-        ctx.save_for_backward(x)
-        return k_hot
-
-    @staticmethod
-    def backward(ctx, g):
-        x, = ctx.saved_tensors
-
-        with torch.no_grad():
-            g_mean = torch.mean(g, dim=-1, keepdim=True)
-            
-            hard_target = torch.where(g < g_mean, 1.0, 0.0)
-
-        grad_x = F.sigmoid(x) - hard_target
-        return grad_x
 
 class ThresHot2(torch.autograd.Function):
     @staticmethod
@@ -323,144 +325,7 @@ class avgHot(torch.autograd.Function):
         grad_x = F.sigmoid(x) - hard_target
         return grad_x
 
-
-class Autoencoder(nn.Module):
-    def __init__(self, input, hidden, embed, qdim, quantizer , k = None):
-        super().__init__()
-        self.qdim = qdim
-        self.encoder = nn.Sequential(
-            nn.Linear(input, hidden), 
-            acmod(utils.dead_rat_relu), 
-            nn.Linear(hidden, qdim))
-        self.quantizer = Hotmod(quantizer, k)
-        self.codebook = nn.Linear(self.qdim, embed, bias=False)
-        self.decoder = nn.Sequential(
-            nn.Linear(embed, hidden), 
-            acmod(utils.dead_rat_relu), 
-            nn.Linear(hidden, input))
-        
-    def forward(self, x):
-        khot = self.quant(x)
-        reconstruction = self.dequant(khot)
-        return reconstruction, khot
-
-    def quant(self, x):
-        logits = self.encoder(x)
-        
-        k_hot = self.quantizer(logits)
-        
-        return k_hot
     
-    def dequant(self, k_hot, norm = False):
-
-        q = self.codebook(k_hot)
-        if norm:
-            q = utils.rms(q)
-        return self.decoder(q)
-    
-
-
-class MultiHotVQVAEQuantizer(nn.Module):
-    def __init__(self, quant_dim, embed_dim, k=15, commitment_cost=0.25):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.quant_dim = quant_dim
-        self.k = k
-
-        self.commitment_cost = commitment_cost
-
-        self.embedding = nn.Embedding(self.quant_dim, self.embed_dim)
-        self.embedding.weight.data.uniform_(-1/self.quant_dim, 1/self.quant_dim)
-
-    def forward(self, z_e):
-        dist = torch.sum(z_e**2, dim=1, keepdim=True) - \
-               2 * torch.matmul(z_e, self.embedding.weight.t()) + \
-               torch.sum(self.embedding.weight**2, dim=1, keepdim=True).t()
-        
-        _, top_k_indices = torch.topk(-dist, k=self.k, dim=1)
-        
-        z_q_k = self.embedding(top_k_indices)
-        k_hot = torch.zeros(z_e.shape[0], self.quant_dim, device=z_e.device)
-        k_hot.scatter_(1, top_k_indices, 1.0)
-        z_q = torch.sum(z_q_k, dim=1)#why is this so much better than mean()?
-        #z_q = F.normalize(z_q, p=2, dim=1) * self.embed_dim**0.5
-
-        vq_loss = F.mse_loss(z_q, z_e.detach())
-        commitment_loss = F.mse_loss(z_e, z_q.detach())
-        total_vq_loss = vq_loss + self.commitment_cost * commitment_loss
-
-        z_q_ste = z_e + (z_q - z_e).detach()
-        return z_q_ste, total_vq_loss, k_hot
-
-class mhvqvae(nn.Module):
-    def __init__(self, num_embeddings, embedding_dim, num_codes_to_select, commitment_cost=0.25):
-        super().__init__()
-        self.num_embeddings = num_embeddings
-        self.embedding_dim = embedding_dim
-        self.k = num_codes_to_select
-        self.commitment_cost = commitment_cost
-
-        # The codebook is an nn.Embedding layer
-        self.codebook = nn.Embedding(self.num_embeddings, self.embedding_dim)
-        self.codebook.weight.data.uniform_(-1.0 / self.num_embeddings, 1.0 / self.num_embeddings)
-
-    def forward(self, z_e):
-        assert z_e.shape[-1] == self.embedding_dim
-
-        distances = torch.sum(z_e.unsqueeze(1).pow(2), dim=2, keepdim=False) \
-                  - 2 * torch.matmul(z_e, self.codebook.weight.t()) \
-                  + torch.sum(self.codebook.weight.pow(2), dim=1)
-
-        _, indices = torch.topk(-distances, self.k, dim=1)  # (B, k)
-
-        k_hot = torch.zeros(z_e.shape[0], self.num_embeddings, device=z_e.device)
-        k_hot.scatter_(1, indices, 1)
-
-        quantized_k_vectors = self.codebook(indices)  # (B, k, D)
-        z_q = quantized_k_vectors.mean(dim=1)  # (B, D)
-
-        codebook_loss = F.mse_loss(z_q, z_e.detach())
-        commitment_loss = self.commitment_cost * F.mse_loss(z_e, z_q.detach())
-        vq_loss = codebook_loss + commitment_loss
-        z_q = z_e + (z_q - z_e).detach()
-
-        return z_q, vq_loss, k_hot
-
-class debugAutoencoderWithVQ(nn.Module):
-    def __init__(self, input_dim, hidden_dim, embed_dim, quantizer, Act):
-        super().__init__()
-        self.embed_dim = embed_dim
-    
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            Act(),
-            nn.Linear(hidden_dim, embed_dim) 
-        )
-        
-        self.quantizer = quantizer 
-        self.decoder = nn.Sequential(
-            nn.Linear(embed_dim, hidden_dim),
-            Act(),
-            nn.Linear(hidden_dim, input_dim)
-        )
-    
-    def forward(self, x):
-        z_e = self.encoder(x)
-        
-        z_q, vq_loss, k_hot = self.quantizer(z_e)
-        
-        reconstruction = self.decoder(z_q)
-        
-        k = None #k_hot.sum(dim=-1).mean().detach()
-
-        return reconstruction, k_hot, vq_loss, k
-    
-    def optimizer(self, LR):
-        num_ae = sum(p.numel() for p in self.parameters())
-        print(f"ae parameters: {num_ae}")
-        return torch.optim.AdamW(self.parameters(), lr=LR)
-
-class SelfAttentionPaletteAE(nn.Module):
     def __init__(self, input_dim, hidden_dim, embed_dim, quant_dim, k):
         super().__init__()
         self.quant_dim = quant_dim

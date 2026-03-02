@@ -230,9 +230,39 @@ def modified_sin_gelu_leaky(x, leaky=0.01):
      base = 0.5 * x * (1 + F.tanh(sqpi * (x + 0.044715 * x**3)))
      sine_mod = torch.where(x >= 0, torch.sin(1.25 * x), x * leaky)
      return base + sine_mod
+def softsign(x):
+    return x / (1 + abs(x))
+def leakytanh(x):
+    return torch.tanh(x)+x*0.1
+def snake(x):
+    return torch.sin(x)*0.99 +x
 
+def sneak(x):
+    return x - torch.sin(x)*0.99
 
+def untanh(x):
+    return x - torch.tanh(x)*0.99
+def unsoftsign(x): 
+    return x - (x / (1 + abs(x)))*0.99
 
+def unsoftishsign(x): 
+    return x - (x / (1 + x*x))*0.99
+
+def softsoftplus(x):
+    return  torch.log1p(torch.exp(x)) / (2 + torch.abs(x))
+def log_softplus(x):
+    return torch.log1p(F.softplus(x))
+def root_softplus(x):
+    return torch.sqrt(F.softplus(x) + 1e-6)
+class Buntan(nn.Module):
+    def __init__(self, n_embd, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.alpha = nn.Parameter(torch.ones(n_embd))
+        #torch.nn.init.uniform_(self.alpha,0,1.0)
+    def forward(self, x):
+        return x - torch.tanh(x)*self.alpha
+
+phi = 1.61803398875
 class RatchetRelu(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
@@ -280,6 +310,8 @@ class DeadRatRelu(torch.autograd.Function):
         return grad_input
 def dead_rat_relu(x):
      return DeadRatRelu.apply(x)
+
+
 def gumbell_noise(logits):
     """
     gumbell noises logits
@@ -925,7 +957,6 @@ def justnorm(x, idim=-1):
     res = (x / x.norm(p=2, dim=idim, keepdim=True)).to(dtype=dtype) 
     return res
 
-
 wn = torch.nn.utils.parametrizations.weight_norm
 class wnormlearnloss(nn.Module):
     def __init__(self, embed):
@@ -941,7 +972,7 @@ class wnormlearnloss(nn.Module):
 
     def forward(self, x):
         #TODO reconfigure, try rms, tanh
-        loss =  torch.tanh(self.head(x))#.mean()
+        loss = (torch.tanh(self.head(x)))#.mean()
         return loss
 
 def get_boltzmann_mu(logits, target_k, steps=5):
@@ -1403,7 +1434,7 @@ def quaternionize(x):
     x_normalized = x4d / x_norm             
     return x_normalized
 
-def rms(x, dim=-1):
+def rms_norm(x, dim=-1):
     return x * torch.rsqrt(x.pow(2).mean(dim=dim, keepdim=True) + 1e-8)
 
 def perplexity(logits, dim = -1):

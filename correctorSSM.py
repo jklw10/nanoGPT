@@ -109,7 +109,7 @@ class SSM(nn.Module):
 
             denom = (1.0 + torch.arange(0, self.lanes, device=left.device)).view(1, 1, self.lanes, 1)
             
-            z = utils.rms(z,dim=-1) / denom
+            z = utils.rms_norm(z,dim=-1) / denom
             
             z = z.reshape(B_curr, T_curr, C_curr)
             

@@ -35,7 +35,7 @@ class HungryLinearFunc(torch.autograd.Function):
         alpha = conf.get('lookahead_alpha', 0.001)
         gwin = grad_weight
         if conf.get('gnorm', True):
-            gwin = utils.rms(gwin)
+            gwin = utils.rms_norm(gwin)
         future_weight = weight - (gwin * alpha)
         
         grad_input = grad_output.matmul(future_weight)
@@ -653,7 +653,7 @@ class SSM(nn.Module):
             #z = utils.rms(z,dim=-1)
 
             z = self.scanner(left,right,weight).to(x.dtype)
-            z = utils.rms(z)
+            z = utils.rms_norm(z)
             return z
         q = utils.pscan2(q, scan, self.identity)
         
@@ -670,7 +670,7 @@ class SSM(nn.Module):
             weight = self.scanner.compute_orthogonal_weights()
         def scan(left, right):
             z = self.scanner(left,right,weight).to(x.dtype)
-            return utils.rms(z)
+            return utils.rms_norm(z)
         q = scan(prev,q)
         
         Y = q*v 
@@ -1188,6 +1188,71 @@ class WarmStartSinkhornLinear(nn.Module):
         P = (Q + r + c).exp()
         
         return F.linear(x, P) 
+
+class ZeroMeanLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias=False, strict=True):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.strict = strict
+        
+        # Standard Linear initialization
+        self.weight = nn.Parameter(torch.empty((out_features, in_features)))
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+            bound = 1 / math.sqrt(in_features) if in_features > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+        else:
+            self.register_parameter('bias', None)
+
+    def forward(self, x):
+        w_mean = self.weight.mean(dim=0, keepdim=True)
+        
+        if self.strict:
+            w_centered = self.weight - w_mean
+        else:
+            w_centered = self.weight - w_mean + (1.0 / self.out_features)
+            
+        out = F.linear(x, w_centered)
+        
+        if self.bias is not None:
+            b_centered = self.bias - self.bias.mean() if self.strict else self.bias
+            out = out + b_centered
+            
+        return out
+
+class SymmetricLowRankRouting(nn.Module):
+    def __init__(self, n_embd, rank=3, temperature=0.1, n_iter=3):
+        super().__init__()
+        # Ensure n_embd is divisible by (rank + 1)
+        assert n_embd % (rank + 1) == 0 
+        
+        self.rank = rank
+        self.temperature = temperature
+        self.n_iter = n_iter
+
+    def forward(self, x):
+        b, t, n_embd = x.shape
+        chunks = x.chunk(self.rank + 1, dim=-1)
+        
+        payload = chunks[0] # Shape: [b, t, M]
+        
+        V = torch.stack(chunks[1:], dim=-1) # Shape: [b, t, M, rank]
+        
+        log_P = torch.matmul(V, V.transpose(-1, -2)) / self.temperature # [b, t, M, M]
+        
+        for _ in range(self.n_iter):
+            r_sum = torch.logsumexp(log_P, dim=-1, keepdim=True) # [b, t, M, 1]
+            log_P = log_P - 0.5 * r_sum - 0.5 * r_sum.transpose(-1, -2)
+            
+        P = log_P.exp()
+        
+        routed_payload = torch.einsum('btij,btj->bti', P, payload)
+        
+        return routed_payload 
+
 class SinkhornLinear(nn.Module):
     def __init__(self, size, n_iter=10, eps=1e-6, grad_project=True, log_space=True,temp=0.125):
         super().__init__()
@@ -1268,7 +1333,7 @@ class GdiffLinearfunc(torch.autograd.Function):
             
             raw_grad = grad_flat.t().mm(input_flat)
             
-            g_norm = utils.rms(raw_grad)
+            g_norm = utils.rms_norm(raw_grad)
 
             # C. Regularization
             wreg = weight
@@ -1457,7 +1522,7 @@ class HungryGdiffLinearfunc(torch.autograd.Function):
 
         adjusted_grad = adjusted_grad * g_diff
         gw2 = adjusted_grad
-        adjusted_grad = utils.rms(adjusted_grad)
+        adjusted_grad = utils.rms_norm(adjusted_grad)
         # E. Final Gradient
         grad_weight = adjusted_grad 
         weight_ema.add_(smoothing * (weight - weight_ema))
@@ -1593,3 +1658,43 @@ class HungryVGMLinear(nn.Module):
         return HungryVGMLinearFunc.apply(
             x, self.weight, self.weight_ema, self.bias, self.config
         ) 
+    
+class DRRelu(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(x):
+        return utils.dead_rat_relu(x)
+
+class Autoencoder(nn.Module):
+    def __init__(self, input, hidden, embed, qdim, quantizer):
+        super().__init__()
+        self.qdim = qdim
+        self.encoder = nn.Sequential(
+            nn.Linear(input, hidden), 
+            DRRelu(), 
+            nn.Linear(hidden, qdim))
+        self.quantizer = quantizer
+        self.codebook = nn.Linear(self.qdim, embed, bias=False)
+        self.decoder = nn.Sequential(
+            nn.Linear(embed, hidden), 
+            DRRelu(), 
+            nn.Linear(hidden, input))
+        
+    def forward(self, x):
+        khot = self.quant(x)
+        reconstruction = self.dequant(khot)
+        return reconstruction, khot
+
+    def quant(self, x):
+        logits = self.encoder(x)
+        
+        k_hot = self.quantizer(logits)
+        
+        return k_hot
+    
+    def dequant(self, k_hot, norm = False):
+
+        q = self.codebook(k_hot)
+        if norm:
+            q = utils.rms_norm(q)
+        return self.decoder(q)

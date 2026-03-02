@@ -24,7 +24,8 @@ import quantizer
 #todo
 #prediction machine
 #Linear = optim.OptimizedLinear
-Linear = nn.Linear
+#Linear = nn.Linear
+Linear = modules.ZeroMeanLinear
 #Linear = modules.TensionLinear
 Plin = modules.ProbingLinear
 #Linear = modules.HungryGdiffLinear
@@ -36,10 +37,14 @@ Orthlin = modules.OrthogonalLinear
 soloblock       = False
 loopblock       = False
 spl             = False
-#good in shkspr
+#good in shkspr-char
 mix_squish      = False
+#good in owt-char
+qrot            = False
+diffac          = True
+rms_lnorm       = True
 #good in owt
-emb_norm        = False
+emb_norm        = True
 wnHead          = False #
 qksink          = False#
 qkfft           = False
@@ -61,7 +66,6 @@ diffembd        = False
 qope            = False
 side_squish     = False
 #slow
-qrot            = False
 think           = False
 repeat_block    = False
 repeat_center   = False
@@ -129,6 +133,8 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         #if(tests):
         #    return input
+        if rms_lnorm:
+            return self.weight * utils.rms_norm(input)
         if(normless):
             return input
         if(mmnorm):
@@ -210,7 +216,7 @@ class Attention(nn.Module):
         mag = x_f.abs() + 1e-8
         phase = x_f.angle()
         
-        norm_mag= utils.rms(mag,dim=-1)
+        norm_mag= utils.rms_norm(mag,dim=-1)
         processed_mag = sinkhorn_layer(norm_mag)
         processed_complex = processed_mag * torch.exp(torch.complex(torch.zeros_like(phase),phase))
 
@@ -221,7 +227,7 @@ class Attention(nn.Module):
         qkx= x
         if qkfft:
             qkx = torch.fft.fft(x, dim=-1).abs()
-            qkx = utils.rms(qkx)
+            qkx = utils.rms_norm(qkx)
 
         if qksink:
             q = (self.q_attn(self.energy_bind1(qkx)))
@@ -272,6 +278,7 @@ class MLP(nn.Module):
             self.c_proj  = Linear( 2 * config.n_embd, config.n_embd, bias=config.bias)
         
         self.dropout = nn.Dropout(config.dropout)
+        self.dac = utils.Buntan(config.n_embd*4)
 
     def forward(self, x):
         if pattmlp:
@@ -281,7 +288,10 @@ class MLP(nn.Module):
             return self.qrot(x)
         
         x = self.c_fc(x)
-        x = self.gelu(x)
+        if diffac:
+            x = self.dac(x)
+        else:
+            x = self.gelu(x)
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
@@ -329,10 +339,14 @@ class Block(nn.Module):
 
     def forward(self, x,  causal = True):
         self.block_input = x
+
+
         if p_atten:
             x = x + self.attn(self.ln_1(x))
             x = x + self.mlp(self.ln_2(x))
             return x
+        
+
         if(qrottention):
             x = x + self.attn(self.ln_1(x))[0]
             x = x + self.mlp(self.ln_2(x))
@@ -469,7 +483,8 @@ class GPT(nn.Module):
         x = self.transformer.drop(x)
 
         if emb_norm:
-            x = utils.rms(x)
+            x = x-x.mean()
+            #x = utils.rms(x)
             #x = utils.quatnorm(x)
         
         

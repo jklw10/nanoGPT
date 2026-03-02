@@ -6,6 +6,7 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import gather
 import modules
 import quantizer
 import utils
@@ -95,9 +96,9 @@ class Patcher(nn.Module):
         if pattlin:
             self.up_proj = modules.PattLayer(outer_dim, inner_dim, 4096)
         #self.up_proj = modules.Pattention(outer_dim,inner_dim,256)
-        self.AE = quantizer.Autoencoder(
+        self.AE = modules.Autoencoder(
             inner_dim,inner_dim,inner_dim,inner_dim,
-            quantizer.ThresHot
+            quantizer.ThresHot.apply
             )
         
         self.resid_up = Linear(outer_dim,inner_dim,bias= False)
@@ -149,8 +150,8 @@ class Patcher(nn.Module):
         gathered = self.query_block(x)
         gate = self.up_gate(gathered).squeeze(-1)
         gate = self.gate_norm(gate)
-        gathered = utils.rms(gathered)
-        gathered, _ = quantizer.RLMAXgbg3.apply(
+        gathered = utils.rms_norm(gathered)
+        gathered, _ = gather.RLMAXgbg3.apply(
             gate, 
             gathered, 
             self.inner_seq,
@@ -193,7 +194,7 @@ class Patcher(nn.Module):
         
         pos = torch.arange(0, self.outer_seq, dtype=torch.long, device=device) 
        
-        scattered = quantizer.ScatterByGate.apply(gate, x, self.outer_seq)
+        scattered = gather.ScatterByGate.apply(gate, x, self.outer_seq)
         pos_emb = self.output_pos_emb(pos).expand(scattered.shape)
         scattered = scattered + pos_emb 
         pds = self.down_block(scattered)
@@ -290,7 +291,7 @@ class HNet(nn.Module):
         tok_emb = self.tok_emb(idx)
         pos_emb = self.pos_emb(positions)
         x0 = tok_emb + pos_emb 
-        x0 = utils.rms(x0)
+        x0 = utils.rms_norm(x0)
         x = x0
         residuals = []
         for i, layer in enumerate(self.sLayers):

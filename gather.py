@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import numpy as np
-
+import utils
 
 class GumbelGatherByGate(torch.autograd.Function):
     @staticmethod
@@ -239,7 +239,7 @@ class RLMAXgbg3(torch.autograd.Function):
         #grad_norm = grad_output.norm(dim=-1, keepdim=True).clamp(min=1e-6)
         #clamp_factor = torch.tanh(grad_norm) / grad_norm 
         #grad_output = grad_output  * clamp_factor # Optional: Uncomment if unstable
-        grad_output = utils.rms(grad_output)
+        grad_output = utils.rms_norm(grad_output)
         ideal_pos = output - grad_output 
         if ctx.needs_input_grad[0]:
             target_norm = (ideal_pos**2).sum(-1).unsqueeze(2) # (b, k, 1)
