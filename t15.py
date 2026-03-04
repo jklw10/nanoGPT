@@ -56,7 +56,7 @@ class PureTriadicBrain(nn.Module):
         hps = {
             'EMA_SPEED': 0.05,
             'FIXED_REWARD_SENSITIVITY': 1.0,
-            'LR': 0.0033,
+            'LR': 0.006,
             'MOMENTUM': 0.4,
             'UNTANH': 0.6, 
             'speed': 0.5,
@@ -67,7 +67,7 @@ class PureTriadicBrain(nn.Module):
             'G_NORM': 1.0,       # 1.0 = True, 0.0 = False
             'conn_count': 1500,
             'c_moment': 0.99,
-            'w_scale': 0.0
+            'w_scale': 0.27
         }
         hps.update(hp_grids)
         
@@ -82,29 +82,35 @@ class PureTriadicBrain(nn.Module):
         self.W2 = nn.Parameter(w_scale*torch.randn(batch_size, self.N, dim, dim, device=DEVICE) / math.sqrt(self.D))
         self.W3 = nn.Parameter(w_scale*torch.randn(batch_size, self.N, dim, dim, device=DEVICE) / math.sqrt(self.D))
         
-        self.register_buffer('M1', torch.randn_like(self.W1)*0.2)
-        self.register_buffer('M2', torch.randn_like(self.W2)*0.2)
-        self.register_buffer('M3', torch.randn_like(self.W3)*0.2)
+        self.W1.copy_(utils.rms_norm(self.W1)*w_scale)
+        self.W2.copy_(utils.rms_norm(self.W2)*w_scale)
+        self.W3.copy_(utils.rms_norm(self.W3)*w_scale)
+
+        self.register_buffer('M1', torch.randn_like(self.W1)*0.01)
+        self.register_buffer('M2', torch.randn_like(self.W2)*0.01)
+        self.register_buffer('M3', torch.randn_like(self.W3)*0.01)
         
-        self.register_buffer('E_baseline', 0.1*torch.randn(batch_size, self.N, dim, device=DEVICE))
+        self.register_buffer('E_baseline', 0.01+ 0.01*torch.randn(batch_size, self.N, dim, device=DEVICE))
         #init state to noise
-        self.register_buffer('state', 0.1*torch.randn(batch_size, self.N, dim, device=DEVICE))
-        self.register_buffer('output', 0.1*torch.randn(batch_size, self.N, dim, device=DEVICE))
-        self.register_buffer('target', 0.1*torch.randn(batch_size, self.N, dim, device=DEVICE))
+        self.register_buffer('state', 0.01*torch.randn(batch_size, self.N, dim, device=DEVICE))
+        self.register_buffer('output', 0.01*torch.randn(batch_size, self.N, dim, device=DEVICE))
+        self.register_buffer('target', 0.01*torch.randn(batch_size, self.N, dim, device=DEVICE))
         self.register_buffer('step_counter', torch.tensor(0.0, device=DEVICE))
         
         self.register_buffer('A', torch.randn(batch_size, self.N, self.N, device=DEVICE))
         
+        self.register_buffer('A_ema', torch.zeros(batch_size, self.N, self.N, device=DEVICE))
+        
         conn_count = self.hp('conn_count', 1)
-        for b in range(batch_size):
-            if isinstance(conn_count, torch.Tensor):
-                cc = conn_count[b].int()
-            else:
-                cc = conn_count
-            for _ in range(cc):
-                src = torch.randint(0, self.N, (1,)).item()
-                dst = torch.randint(2, self.N, (1,)).item() 
-                self.A[b, dst, src] = 1.0
+        #for b in range(batch_size):
+        #    if isinstance(conn_count, torch.Tensor):
+        #        cc = conn_count[b].int()
+        #    else:
+        #        cc = conn_count
+        #    for _ in range(cc):
+        #        src = torch.randint(0, self.N, (1,)).item()
+        #        dst = torch.randint(2, self.N, (1,)).item() 
+        #        self.A[b, dst, src] = 1.0
         self.A = F.softmax(self.A, dim=2)  
         #self.A = self.A / (self.A.sum(dim=2, keepdim=True) + 1e-5)
 
@@ -123,28 +129,31 @@ class PureTriadicBrain(nn.Module):
 
         # Compute raw affinities [B, N, N]
         raw_A = torch.bmm(queries, keys.transpose(1, 2)) / math.sqrt(self.D)
-        
+        #raw_A = raw_A / math.sqrt(self.D)
         #exploration_temp = max(1.0, 3.0 - (self.step_counter.item() / 250.0))
-        #raw_A = raw_A + torch.randn_like(raw_A) * exploration_temp
-        raw_A = utils.gumbell_noise(raw_A, 1.0)
-        P_dense = F.softmax(raw_A, dim=2)
-        uniform_baseline = 1.0 / (self.N+1.0)
+        raw_A = raw_A + torch.randn_like(raw_A) * 1e-5
+        #raw_A = utils.gumbell_noise(raw_A, 1.0)
+        #P_dense = F.softmax(raw_A, dim=2)
+        #uniform_baseline = 1.0 / (self.N+1.0)
+        #above_avg_mask = P_dense > uniform_baseline
+        #sparse_logits = torch.where(above_avg_mask, raw_A, torch.tensor(float('-inf'), device=DEVICE))
         
-        # 3. Create mask: Keep if > uniform, OR if it's the absolute best (Safety Net)
-        above_avg_mask = P_dense > uniform_baseline
-        is_max_mask = P_dense == P_dense.max(dim=2, keepdim=True)[0]
-        keep_mask = above_avg_mask | is_max_mask
-
-        # 4. Mask the raw logits (-inf means softmax will make it exactly 0.0)
-        sparse_logits = torch.where(keep_mask, raw_A, torch.tensor(float('-inf'), device=DEVICE))
-        
-        P = F.softmax(sparse_logits, dim=2)
-
         routing_momentum = self.hp('c_moment', 3)
         if self.step_counter.item() == 1.0:
-            self.A.copy_(P)  
+            self.A_ema.copy_(raw_A)  
         else:
-            self.A.copy_(self.A * routing_momentum + P * (1.0 - routing_momentum))
+            self.A_ema.copy_(self.A_ema * routing_momentum + raw_A * (1.0 - routing_momentum))
+
+        #topk_vals, topk_indices = torch.topk(self.A_ema, k=5, dim=2)
+        #sparse_A = torch.full_like(self.A_ema, float('-inf'))
+        #sparse_A.scatter_(2, topk_indices, topk_vals)
+        sparse_A = self.A_ema
+        #sparse_A.clamp_(min=1e-8)
+        #for _ in range(5): 
+        #    dir = 0.5*(sparse_A.sum(dim=1, keepdim=True)+sparse_A.sum(dim=0, keepdim=True))
+        #    sparse_A.div_(dir)
+        P = F.softmax(sparse_A, dim=2)
+        self.A.copy_(self.A * routing_momentum + P * (1.0 - routing_momentum))
 
         # 3. Protect your sensory nodes (Eyes and Stomach shouldn't receive signals)
         # Sinkhorn makes them receive 1.0, so we forcefully zero them out after.
@@ -152,7 +161,7 @@ class PureTriadicBrain(nn.Module):
 
         # 4. Route the signals
         total_in = torch.bmm(self.A, self.output)
-        # We don't need self.A_sums division anymore because Sinkhorn already normalized the rows!
+        
         self.target = total_in 
 
         self.target[:, 0, :] = eye_env
@@ -180,33 +189,27 @@ class PureTriadicBrain(nn.Module):
         
         rew_sens = self.hp('FIXED_REWARD_SENSITIVITY', 4)
         R = -utils.rms_norm(advantage.unsqueeze(3) * rew_sens) 
-        
+        # 1. Base error from the environment
         state_mag = self.state.abs().sum(dim=[-2,-1], keepdim=True) 
-        noise1 = torch.randn_like(self.state) / (1.0 + state_mag)
         n_scale = self.hp('NOISE_SCALE', 3)
-        noise2 = torch.randn_like(self.state) * error_signal.std() * n_scale
         
-        noisy_state = self.state + noise1 + noise2
-        
-        local_grad = -torch.einsum('bni,bnj->bnij', error_signal, noisy_state)
+        def get_noisy_state():
+            noise1 = torch.randn_like(self.state) / (1.0 + state_mag)
+            noise2 = torch.randn_like(self.state) * error_signal.std() * n_scale
+            return self.state + noise1 + noise2
         
         g_norm_flag = self.hp('G_NORM', 4)
-        if(isinstance(g_norm_flag, torch.Tensor)):
-            gn_mask = (g_norm_flag > 0.5).float()
-            rms_scale = torch.rsqrt(local_grad.pow(2).mean(dim=(2,3), keepdim=True) + 1e-6)
-            local_grad = local_grad * (rms_scale*gn_mask + 1-gn_mask)
-        else:
-            if(g_norm_flag > 0.5):
-                local_grad = utils.rms_norm(local_grad,dim=(2,3))
+        def apply_gnorm(lg):
+            if isinstance(g_norm_flag, torch.Tensor):
+                gn_mask = (g_norm_flag > 0.5).float()
+                rms_scale = torch.rsqrt(lg.pow(2).mean(dim=(2,3), keepdim=True) + 1e-6)
+                return lg * (rms_scale*gn_mask + 1-gn_mask)
+            else:
+                return utils.rms_norm(lg, dim=(2,3)) if g_norm_flag > 0.5 else lg
         
         wd = self.hp('weight_decay', 4)
         lat_decay = self.hp('lateral_decay', 4)
         plasticity = 1.0 - R  
-        mask = (self.E_baseline > 0).float().unsqueeze(3)
-        grad1 = (plasticity * local_grad*mask) + (lat_decay * self.W3) - (wd * self.W1)
-        grad2 = (plasticity * local_grad*mask) + (lat_decay * self.W1) - (wd * self.W2)
-        grad3 = (plasticity * local_grad*mask) + (lat_decay * self.W2) - (wd * self.W3)
-        
         speed = self.hp('speed', 4)
         width = self.hp('width', 4)
         
@@ -216,6 +219,23 @@ class PureTriadicBrain(nn.Module):
         diff = torch.minimum(diff, self.D - diff)
         g_mask = torch.exp(-(diff ** 2) / (2 * width ** 2 + 1e-6))
         
+        lg1 = -torch.einsum('bni,bnj->bnij', error_signal, get_noisy_state())
+        #lg2 = -torch.einsum('bni,bnj->bnij', error_signal, get_noisy_state())
+        #lg3 = -torch.einsum('bni,bnj->bnij', error_signal, get_noisy_state())
+        
+        lg1 = apply_gnorm(lg1)
+        #lg2 = apply_gnorm(lg2)
+        #lg3 = apply_gnorm(lg3)
+        
+        grad1 = (plasticity * lg1) + (lat_decay * self.W3) - (wd * self.W1)
+        adv_expanded = advantage.unsqueeze(3)
+
+        w3_drift = torch.randn_like(self.W3) * F.relu(adv_expanded) 
+        w2_drift = torch.randn_like(self.W2) * F.relu(adv_expanded)
+
+        grad2 = w2_drift + (lat_decay * self.W2) - (wd * self.W2)
+        grad3 = w3_drift + (lat_decay * self.W3) - (wd * self.W3)
+
         grad1 = grad1 * g_mask
         grad2 = grad2 * g_mask
         grad3 = grad3 * g_mask
@@ -228,54 +248,21 @@ class PureTriadicBrain(nn.Module):
         self.M3.mul_(momentum).add_((1.0 - momentum) * grad3)
         
         self.W1.add_(lr * self.M1)
-        self.W2.add_(lr * self.M2)
+        self.W2.add_(lr * self.M2) 
         self.W3.add_(lr * self.M3)
-        
         
         w_scale = self.hp('w_scale', 4)
         self.W1.copy_(utils.rms_norm(self.W1)*w_scale)
         self.W2.copy_(utils.rms_norm(self.W2)*w_scale)
         self.W3.copy_(utils.rms_norm(self.W3)*w_scale)
-
+        
         self.output.copy_(prediction)
-        self.state.copy_(self.target)
+        self.state.copy_(self.target*0.95)
 
 # ==========================================
 # 2. RUNNER & RENDERER
 # ==========================================
 
-def analyze_brains(brain,):
-    B, N, D, _ = brain.W1.shape
-    
-    stats = {}
-    
-    # 1. Tanh Saturation (Are the neurons maxed out / dead?)
-    # Assuming state_history is [Steps, Batch, N, D]
-    final_states = brain.state # [B, N, D]
-    max_val = math.sqrt(2 + math.sqrt(2))
-    # Count how many activations are within 5% of the absolute limit
-    saturation = (final_states.abs() > (max_val * 0.95)).float().mean(dim=(1,2))
-    stats['saturation_pct'] = saturation.cpu().numpy()
-    
-    # 2. Singular Value Collapse (Did the matrix rank collapse?)
-    # Look at W1 (the prediction matrix)
-    s_vals = torch.linalg.svdvals(brain.W1.view(B*N, D, D)) #[B*N, D]
-    s_vals = s_vals.view(B, N, D)
-    # Ratio of the largest singular value to the sum of all singular values
-    # If this is near 1.0, the matrix is mathematically 1-dimensional (Rank 1)
-    condition_ratio = s_vals[:, :, 0] / (s_vals.sum(dim=-1) + 1e-6)
-    stats['rank_collapse_ratio'] = condition_ratio.mean(dim=1).cpu().numpy()
-    
-    # 3. Routing Entropy (Is the attention graph healthy?)
-    # brain.A is [B, N, N]. Add epsilon for log safety.
-    A_safe = brain.A + 1e-7
-    entropy = -torch.sum(A_safe * torch.log(A_safe), dim=2).mean(dim=1)
-    stats['routing_entropy'] = entropy.cpu().numpy()
-    
-    # 4. Weight Magnitudes
-    stats['w1_norm'] = brain.W1.norm(dim=[2,3]).cpu().numpy()
-    
-    return stats
 
 def run_tracking_task(sweep, dim=16):
     batch_size = sweep.batch_size
@@ -286,7 +273,7 @@ def run_tracking_task(sweep, dim=16):
     agent_pos = torch.full((batch_size, 2), -3.0, device=DEVICE)
     agent_vel = torch.zeros(batch_size, 2, device=DEVICE)
     
-    total_steps = 3000
+    total_steps = 2000
     eval_start = 1000 
     eval_steps = total_steps - eval_start
     
@@ -324,7 +311,7 @@ def run_tracking_task(sweep, dim=16):
     mean_dist = dist_history.mean(dim=0).cpu()
     var_dist = dist_history.var(dim=0).cpu()
     fitness = torch.exp(-(mean_dist + var_dist))
-    return fitness, mean_dist, var_dist, agent_pos_history, food_pos_history, eval_start
+    return fitness, mean_dist, var_dist, agent_pos_history, food_pos_history, eval_start, brain
 
 def visualize_sweep(sweep, fitness, mean_dist, var_dist, agent_pos_history, food_pos_history, eval_start):
     perf_grid = sweep.to_2d_grid(fitness).numpy()
@@ -372,7 +359,86 @@ def visualize_sweep(sweep, fitness, mean_dist, var_dist, agent_pos_history, food
     plt.suptitle("Agent Trajectories", fontsize=16)
     plt.tight_layout()
     plt.show()
+def diagnose_batch_health(brain, fitness):
+    print("\n" + "="*80)
+    print("🧠 RUNNING BATCH AUTOPSY & FEATURE CORRELATION")
+    print("="*80)
+    fitness=fitness.to(brain.W1.device)
+    B = brain.batch_size
+    metrics = {}
+    eps = 1e-7
+    
+    # ---------------------------------------------------------
+    # 1. ROUTING TOPOLOGY (Did it actually build the right brain?)
+    # ---------------------------------------------------------
+    # Does the Motor (Node 2) listen to the Eye (Node 0)?
+    metrics['Motor_Listens_To_Eye'] = brain.A[:, 2, 0]
+    # Does the Motor listen to the Stomach (Node 1)? (Usually causes thrashing)
+    metrics['Motor_Listens_To_Stomach'] = brain.A[:, 2, 1]
+    # Self-obsession: Do nodes just listen to themselves?
+    metrics['Avg_Self_Attention'] = torch.diagonal(brain.A, dim1=1, dim2=2).mean(dim=1)
+    
+    # Routing Entropy (Are attention maps sharp or smeared into a grey paste?)
+    A_norm = brain.A / (brain.A.sum(dim=-1, keepdim=True) + eps)
+    metrics['Routing_Entropy'] = -(A_norm * torch.log(A_norm + eps)).sum(dim=-1).mean(dim=-1)
 
+    # ---------------------------------------------------------
+    # 2. WEIGHT COLLAPSE / SYMMETRY (Are the matrices cloning each other?)
+    # ---------------------------------------------------------
+    w1_flat = brain.W1.view(B, -1)
+    w2_flat = brain.W2.view(B, -1)
+    w3_flat = brain.W3.view(B, -1)
+    
+    # If W1 and W2 share the same gradients, they might just become identical.
+    metrics['CosSim_W1_W2'] = F.cosine_similarity(w1_flat, w2_flat, dim=1)
+    metrics['CosSim_W2_W3'] = F.cosine_similarity(w2_flat, w3_flat, dim=1)
+
+    # ---------------------------------------------------------
+    # 3. SATURATION & DEAD NEURONS (Is the signal exploding?)
+    # ---------------------------------------------------------
+    limit = math.sqrt(2 + math.sqrt(2))
+    # Percentage of outputs that are pinned completely against the tanh ceiling
+    metrics['Output_Saturation_Pct'] = (brain.output.abs()).mean(dim=(1,2))
+    #ignore inputs
+    metrics['Mean_State_Magnitude'] = brain.state[:, 2:, :].abs().mean(dim=(1,2))
+    
+    # ---------------------------------------------------------
+    # 4. LEARNING / ERROR SIGNALS
+    # ---------------------------------------------------------
+    metrics['E_Baseline_Mag'] = brain.E_baseline.abs().mean(dim=(1,2))
+    metrics['W1_Norm'] = brain.W1.view(B, -1).norm(dim=1)
+    metrics['W2_Norm'] = brain.W2.view(B, -1).norm(dim=1)
+
+    # =========================================================
+    # CORRELATION ENGINE
+    # =========================================================
+    threshold = torch.quantile(fitness, 0.95)
+    top_mask = fitness >= threshold
+    bot_mask = fitness < threshold
+    
+    results =[]
+    for name, vals in metrics.items():
+        # Pearson Correlation: cov(x,y) / (std(x)*std(y))
+        vx = vals - vals.mean()
+        vy = fitness - fitness.mean()
+        corr = (vx * vy).sum() / (vx.norm() * vy.norm() + eps)
+        
+        top_mean = vals[top_mask].mean().item()
+        bot_mean = vals[bot_mask].mean().item()
+        
+        results.append((corr.item(), name, top_mean, bot_mean))
+        
+    # Sort by absolute correlation strength
+    results.sort(key=lambda x: abs(x[0]), reverse=True)
+    
+    print(f"{'Metric Name':<28} | {'Corr w/ Fitness':<17} | {'Top 5% Mean':<12} | {'Bottom 95% Mean':<12}")
+    print("-" * 78)
+    for corr, name, top_mean, bot_mean in results:
+        # Add visual markers for strong correlations
+        marker = "🔥" if abs(corr) > 0.4 else "  "
+        print(f"{marker} {name:<25} | {corr:>15.4f}   | {top_mean:>12.4f} | {bot_mean:>12.4f}")
+        
+    return metrics
 # ==========================================
 # 3. EXECUTION SCRIPT
 # ==========================================
@@ -392,109 +458,26 @@ if __name__ == "__main__":
     #        'G_NORM': 0.0,       # 1.0 = True, 0.0 = False
     #        'conn_count': 1500,
     #        'c_moment': 0.99,
-    #         äw_scale'
+    #         w_scale'
     #    }
     sweep = Sweep2D(
-        param_x_name='conn_count', param_x_vals=np.linspace(10, 101, 32),
-        param_y_name='w_scale', param_y_vals=np.linspace(0.1, 2.0, 32),
+        param_x_name='LR', param_x_vals=np.linspace(0.001, 0.01, 32),
+        param_y_name='untanh', param_y_vals=np.linspace(0.3, 1.8, 32),
     )
-    
-    fitness, mean_dist, var_dist, agent_pos_hist, food_pos_hist, eval_start = run_tracking_task(sweep, dim=16)
+    #fitness, mean_dist, var_dist, agent_pos_hist, food_pos_hist, eval_start = run_tracking_task(sweep, dim=16)
+    #visualize_sweep(sweep, fitness, mean_dist, var_dist, agent_pos_hist, food_pos_hist, eval_start)
+#
+    #sweep = Sweep2D(
+    #    param_x_name='LR', param_x_vals=np.linspace(0.0005, 1.0, 32),
+    #    param_y_name='w_scale', param_y_vals=np.linspace(0.1, 2.0, 32),
+    #)
+    #fitness, mean_dist, var_dist, agent_pos_hist, food_pos_hist, eval_start = run_tracking_task(sweep, dim=16)
+    #visualize_sweep(sweep, fitness, mean_dist, var_dist, agent_pos_hist, food_pos_hist, eval_start)
+
+    #sweep = Sweep2D(
+    #    param_x_name='LR', param_x_vals=np.linspace(0.00005, 1.0, 32),
+    #    param_y_name='UNTANH', param_y_vals=np.linspace(0.1, 2.0, 32),
+    #)
+    fitness, mean_dist, var_dist, agent_pos_hist, food_pos_hist, eval_start, brain = run_tracking_task(sweep, dim=16)
+    diagnose_batch_health(brain,fitness)
     visualize_sweep(sweep, fitness, mean_dist, var_dist, agent_pos_hist, food_pos_hist, eval_start)
-#def run_tracking_task_batch(hps, batch_size=128, dim=16):
-#    brain = PureTriadicBrain(dim=dim, batch_size=batch_size, **hps).to(DEVICE)
-#    
-#    agent_pos = torch.full((batch_size, 2), -3.0, device=DEVICE)
-#    agent_vel = torch.zeros(batch_size, 2, device=DEVICE)
-#    
-#    total_steps = 2500
-#    eval_start = 1000 
-#    eval_steps = total_steps - eval_start
-#    
-#    dist_history = torch.zeros((eval_steps, batch_size), device=DEVICE)
-#    
-#    for step in range(total_steps):
-#        t = step / 100.0
-#        food_pos = torch.tensor([[math.sin(t) * 2.0, math.sin(t * 2.0) * 1.5]], device=DEVICE).expand(batch_size, 2)
-#        
-#        diffs = food_pos - agent_pos
-#        dists = torch.norm(diffs, dim=1, keepdim=True)
-#        direction = diffs / (dists + 1e-5)
-#        
-#        eye_env = torch.zeros(batch_size, brain.D, device=DEVICE)
-#        eye_env[:, 0:2] = direction
-#        
-#        starvation = torch.clamp(dists / 4.0, 0.0, 1.0)
-#        stomach_env = torch.randn(batch_size, brain.D, device=DEVICE) * starvation * 2.0
-#
-#        brain.step(eye_env, stomach_env)
-#        
-#        motor_out = brain.output[:, 2, 0:2].clone()
-#        agent_vel = (agent_vel * 0.85) + (motor_out * 0.2)
-#        agent_pos += agent_vel
-#        agent_pos = torch.clamp(agent_pos, -4.0, 4.0)
-#        
-#        if step >= eval_start:
-#            dist_history[step - eval_start] = dists.squeeze()
-#
-#    mean_dist = dist_history.mean(dim=0).cpu()
-#    var_dist = dist_history.var(dim=0).cpu()
-#    fitness = torch.exp(-(mean_dist + var_dist))
-#    
-#    return fitness
-#def objective(trial):
-#    # Let Optuna hunt for the magic recipe using CMA-ES
-#    hps = {
-#        'w_scale': trial.suggest_float('w_scale', 0.5, 4.0),           # Raised the floor!
-#        'conn_count': trial.suggest_int('conn_count', 100, 2000),
-#        'LR': trial.suggest_float('LR', 1e-4, 5e-2, log=True),
-#        'MOMENTUM': trial.suggest_float('MOMENTUM', 0.1, 0.95),
-#        'NOISE_SCALE': trial.suggest_float('NOISE_SCALE', 0.01, 2.0, log=True),
-#        'weight_decay': trial.suggest_float('weight_decay', 1e-6, 0.1, log=True),
-#        'l1_ratio': trial.suggest_float('l1_ratio', 0.0, 1.0),         # Hunt for the perfect sparsity
-#        'c_moment': trial.suggest_float('c_moment', 0.9, 0.999),       # Routing momentum
-#        'UNTANH': trial.suggest_float('UNTANH', 0.1, 1.0)
-#    }
-#    
-#    # Run a batch of 128 to sample the "lottery tickets" for these HPs
-#    batch_size = 128
-#    
-#    try:
-#        with torch.no_grad():
-#            fitness = run_tracking_task_batch(hps, batch_size=batch_size, dim=16)
-#        
-#        # What do we maximize? 
-#        # By taking the 90th percentile, we tell Optuna:
-#        # "Find hyperparameters that yield INCREDIBLE results for at least 10% of the seeds"
-#        score = torch.quantile(fitness, 0.90).item()
-#        
-#        # If it exploded to NaNs
-#        if math.isnan(score):
-#            return 0.0
-#            
-#        return score
-#        
-#    except Exception as e:
-#        # If the math completely explodes (CUDA OOM or tensor bounds)
-#        return 0.0
-#
-#if __name__ == "__main__":
-#    print("Starting Evolutionary Search with Optuna (CMA-ES)...")
-#    
-#    # CMA-ES is incredibly good at finding needle-in-a-haystack sweet spots
-#    study = optuna.create_study(
-#        direction="maximize", 
-#        sampler=optuna.samplers.CmaEsSampler()
-#    )
-#    
-#    # Run 200 generations (trials)
-#    study.optimize(objective, n_trials=200, show_progress_bar=True)
-#    
-#    print("\n==================================")
-#    print("BEST HYPERPARAMETERS FOUND:")
-#    print("==================================")
-#    for key, value in study.best_trial.params.items():
-#        print(f"  {key}: {value}")
-#    print(f"\nBest Fitness (90th Percentile): {study.best_value:.4f}")
-#    print("==================================")
-    

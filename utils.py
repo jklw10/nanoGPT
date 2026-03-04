@@ -240,14 +240,25 @@ def snake(x):
 def sneak(x):
     return x - torch.sin(x)*0.99
 
-def untanh(x):
-    return x - torch.tanh(x)*0.99
+def untanh(x, slope):
+    return x - torch.tanh(x)*slope
+
+def buntanh(x, slope, bound):
+    return torch.tanh(x - torch.tanh(x)*slope)*bound
 def unsoftsign(x): 
     return x - (x / (1 + abs(x)))*0.99
 
 def unsoftishsign(x): 
     return x - (x / (1 + x*x))*0.99
-
+def sinkhorn_knopp(log_alpha,iter=5,dim=[-1,-2]):
+    device = log_alpha.device
+    
+    u = torch.zeros(log_alpha.shape[:-1] + (1,), device=device) # (batch, M, 1)
+    v = torch.zeros(log_alpha.shape[:-2] + (1, log_alpha.shape[-1]), device=device) # (batch, 1, N)
+    for _ in range(iter):
+        u = -torch.logsumexp(log_alpha + v, dim=-1, keepdim=True)
+        v = -torch.logsumexp(log_alpha + u, dim=-2, keepdim=True)
+    return torch.exp(log_alpha + u + v)
 def softsoftplus(x):
     return  torch.log1p(torch.exp(x)) / (2 + torch.abs(x))
 def log_softplus(x):
@@ -262,6 +273,11 @@ class Buntan(nn.Module):
     def forward(self, x):
         return x - torch.tanh(x)*self.alpha
 
+def noised_input(input, grad, scale=0.1):
+    state_mag = input.abs().sum(dim=[-2,-1], keepdim=True) 
+    noise1 = torch.randn_like(input) / (1.0 + state_mag)
+    noise2 = torch.randn_like(input) * grad.std() * scale
+    return input + noise1 + noise2
 phi = 1.61803398875
 class RatchetRelu(torch.autograd.Function):
     @staticmethod
@@ -312,12 +328,9 @@ def dead_rat_relu(x):
      return DeadRatRelu.apply(x)
 
 
-def gumbell_noise(logits):
-    """
-    gumbell noises logits
-    """
+def gumbell_noise(logits,scale):
     eps = 1e-8
-    return logits -torch.log(-torch.log(torch.rand_like(logits) + eps) + eps)
+    return logits - scale*torch.log(-torch.log(torch.rand_like(logits) + eps) + eps)
         
 class SyntheticReluGrad(torch.autograd.Function):
     @staticmethod
@@ -1403,7 +1416,26 @@ def wrapping_gaussian_kernel(activation_tensor: torch.Tensor,
     
     kernel = torch.exp(-(diff).pow(2) / (2 * sigma**2))
     return kernel
-
+torch.compile(backend='inductor', mode='max-autotune')
+def wrapping_gaussian_kernel2(activation_tensor: torch.Tensor, 
+                                     center_offset, 
+                                     sigma) -> torch.Tensor:
+    
+    features = activation_tensor.shape[-1]
+    device = activation_tensor.device
+    dtype = activation_tensor.dtype
+    
+    indices = torch.arange(features, dtype=dtype, device=device)
+    
+    center = center_offset * features
+    sigma = sigma * features
+    
+    # Calculate absolute difference
+    diff = torch.abs(indices - center)
+    diff = torch.min(diff, features - diff)
+    
+    kernel = torch.exp(-(diff).pow(2) / (2 * sigma**2))
+    return kernel
 def dampened_oscilator(t):
     decay = torch.exp(-t * 2.0) 
     value = 0.5 + 0.5 * decay * torch.cos(t * torch.pi * 4.0) 
