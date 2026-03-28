@@ -1,0 +1,349 @@
+{
+    "LR_1773236462": {
+        "parameter": "LR",
+        "law": {
+            "master": [
+                "MOMENTUM",
+                "w_scale"
+            ],
+            "a": 0.0031411469519964635,
+            "b": 0.019825385966551808,
+            "c": 0.003112075173939924,
+            "type": "multi_linear",
+            "strikes": 0
+        },
+        "reason": "Failed Gauntlet",
+        "generation_pruned": "2026-03-11 15:41:02"
+    },
+    "NOISE_SCALE_1773236907": {
+        "parameter": "NOISE_SCALE",
+        "law": {
+            "master": [
+                "c_moment",
+                "w_scale"
+            ],
+            "a": 0.8997926306476095,
+            "b": -0.386138912394046,
+            "c": 0.6924959671343219,
+            "type": "multi_linear",
+            "strikes": 0
+        },
+        "reason": "Failed to push peak",
+        "generation_pruned": "2026-03-11 15:48:27"
+    },
+    "sharpness_1773237427": {
+        "parameter": "sharpness",
+        "law": {
+            "master": [
+                "UNTANH",
+                "c_moment"
+            ],
+            "a": 0.5144323167030282,
+            "b": -2.3100487873488067,
+            "c": 3.3555089203553035,
+            "type": "multi_linear",
+            "strikes": 0
+        },
+        "reason": "Failed to push peak",
+        "generation_pruned": "2026-03-11 15:57:07"
+    },
+    "EMA_SPEED_1773238012": {
+        "parameter": "EMA_SPEED",
+        "law": {
+            "master": "MOMENTUM",
+            "a": 1.1255782094874662,
+            "b": -1.378362173110986,
+            "c": 0.5337168548932488,
+            "type": "quadratic",
+            "strikes": 0
+        },
+        "reason": "Failed to push peak",
+        "generation_pruned": "2026-03-11 16:06:52"
+    },
+    "w_scale_1773238648": {
+        "parameter": "w_scale",
+        "law": {
+            "master": "UNTANH",
+            "a": -0.4931350901900033,
+            "b": 1.2359746669863534,
+            "c": 0.08235938307342194,
+            "type": "quadratic",
+            "strikes": 0
+        },
+        "reason": "Failed to push peak",
+        "generation_pruned": "2026-03-11 16:17:28"
+    },
+    "MOMENTUM_1773348089": {
+        "parameter": "MOMENTUM",
+        "law": {
+            "master": [
+                "weight_decay",
+                "N"
+            ],
+            "a": -4.031251501278967,
+            "b": -0.024813206567044967,
+            "c": 1.0180126270775114,
+            "type": "multi_linear",
+            "strikes": 0
+        },
+        "reason": "Failed to push peak",
+        "generation_pruned": "2026-03-12 22:41:29"
+    },
+    "NOISE_SCALE_1773348512": {
+        "parameter": "NOISE_SCALE",
+        "law": {
+            "master": [
+                "LR",
+                "w_scale"
+            ],
+            "a": -6.602821400991866,
+            "b": 0.7371207625788582,
+            "c": 0.5070049935766658,
+            "type": "multi_linear",
+            "strikes": 0
+        },
+        "reason": "Failed to push peak",
+        "generation_pruned": "2026-03-12 22:48:32"
+    },
+    "sharpness_1773348991": {
+        "parameter": "sharpness",
+        "law": {
+            "master": [
+                "LR",
+                "weight_decay"
+            ],
+            "a": -55.710849474248505,
+            "b": -24.207488826963917,
+            "c": 5.888201861404173,
+            "type": "multi_linear",
+            "strikes": 0
+        },
+        "reason": "Failed to push peak",
+        "generation_pruned": "2026-03-12 22:56:31"
+    },
+    "weight_decay_1773349495": {
+        "parameter": "weight_decay",
+        "law": {
+            "master": [
+                "UNTANH",
+                "LR"
+            ],
+            "a": 0.0243961884252458,
+            "b": -0.5806206126860555,
+            "c": 0.04360025307946,
+            "type": "multi_linear",
+            "strikes": 0
+        },
+        "reason": "Failed to push peak",
+        "generation_pruned": "2026-03-12 23:04:55"
+    },
+    "EMA_SPEED_1773350087": {
+        "parameter": "EMA_SPEED",
+        "law": {
+            "master": [
+                "UNTANH",
+                "FIXED_REWARD_SENSITIVITY"
+            ],
+            "a": 0.05146499445628262,
+            "b": -0.11234664243487831,
+            "c": 0.3605871748398533,
+            "type": "multi_linear",
+            "strikes": 0
+        },
+        "reason": "Failed to push peak",
+        "generation_pruned": "2026-03-12 23:14:47"
+    },
+    "NOISE_SCALE_1773352834": {
+        "parameter": "NOISE_SCALE",
+        "law": {
+            "master": [
+                "MOMENTUM",
+                "weight_decay"
+            ],
+            "a": 2.739461913758389,
+            "b": 0.40402592235425744,
+            "c": 0.2667494886496363,
+            "type": "multi_power",
+            "strikes": 0
+        },
+        "reason": "Ablation increased yield",
+        "generation_pruned": "2026-03-13 00:00:34"
+    },
+    "w_scale_1773353670": {
+        "parameter": "w_scale",
+        "law": {
+            "master": "UNTANH",
+            "a": -1.7411195272626603,
+            "b": 3.3178440914476597,
+            "c": -0.24971577860367078,
+            "type": "quadratic",
+            "strikes": 0
+        },
+        "reason": "Ablation increased yield",
+        "generation_pruned": "2026-03-13 00:14:30"
+    },
+    "c_moment_1773354132": {
+        "parameter": "c_moment",
+        "law": {
+            "master": [
+                "EMA_SPEED",
+                "MOMENTUM"
+            ],
+            "a": 0.5618406205369202,
+            "b": 0.42638949073360666,
+            "c": 0.10584331351468651,
+            "type": "multi_linear",
+            "strikes": 0
+        },
+        "reason": "Failed Gauntlet",
+        "generation_pruned": "2026-03-13 00:22:12"
+    },
+    "FIXED_REWARD_SENSITIVITY_1773354807": {
+        "parameter": "FIXED_REWARD_SENSITIVITY",
+        "law": {
+            "master": "weight_decay",
+            "a": 7.370466801581374,
+            "b": 0.7784455091432122,
+            "c": 0.0,
+            "type": "linear",
+            "strikes": 0
+        },
+        "reason": "Failed Gauntlet",
+        "generation_pruned": "2026-03-13 00:33:27"
+    },
+    "EMA_SPEED_1773355501": {
+        "parameter": "EMA_SPEED",
+        "law": {
+            "master": [
+                "LR",
+                "weight_decay"
+            ],
+            "a": -3.890202162226811,
+            "b": 0.5725649576324647,
+            "c": 0.33754408163469557,
+            "type": "multi_linear",
+            "strikes": 0
+        },
+        "reason": "Failed Gauntlet",
+        "generation_pruned": "2026-03-13 00:45:01"
+    },
+    "sharpness_1773356218": {
+        "parameter": "sharpness",
+        "law": {
+            "master": [
+                "LR",
+                "MOMENTUM"
+            ],
+            "a": 19.608727051191444,
+            "b": 2.97604427378751,
+            "c": 1.02975906593056,
+            "type": "multi_linear",
+            "strikes": 0
+        },
+        "reason": "Ablation increased yield",
+        "generation_pruned": "2026-03-13 00:56:58"
+    },
+    "MOMENTUM_1773395250": {
+        "parameter": "MOMENTUM",
+        "law": {
+            "master": "weight_decay",
+            "a": -110.59533349680434,
+            "b": 13.536030482012919,
+            "c": 0.27657966431530906,
+            "type": "quadratic",
+            "strikes": 0
+        },
+        "reason": "Failed Gauntlet",
+        "generation_pruned": "2026-03-13 11:47:30"
+    },
+    "a_variance_1773396641": {
+        "parameter": "a_variance",
+        "law": {
+            "master": "w_scale",
+            "a": 0.4322876447190549,
+            "b": -0.6688168526561628,
+            "c": 0.2934362709797699,
+            "type": "quadratic",
+            "strikes": 0
+        },
+        "reason": "Ablation increased yield",
+        "generation_pruned": "2026-03-13 12:10:41"
+    },
+    "LR_1774144574": {
+        "parameter": "LR",
+        "law": {
+            "master": [
+                "UNTANH",
+                "a_variance"
+            ],
+            "a": -0.01840690421793009,
+            "b": -0.036895260304190006,
+            "c": 0.05857546411974841,
+            "type": "multi_linear",
+            "strikes": 0
+        },
+        "reason": "Ablation increased yield",
+        "generation_pruned": "2026-03-22 03:56:14"
+    },
+    "weight_decay_1774145285": {
+        "parameter": "weight_decay",
+        "law": {
+            "master": [
+                "EMA_SPEED",
+                "MOMENTUM"
+            ],
+            "a": -0.10996173864492693,
+            "b": -0.03026121131990378,
+            "c": 0.09827826073039139,
+            "type": "multi_linear",
+            "strikes": 0
+        },
+        "reason": "Failed Gauntlet",
+        "generation_pruned": "2026-03-22 04:08:05"
+    },
+    "EMA_SPEED_1774259651": {
+        "parameter": "EMA_SPEED",
+        "law": {
+            "master": [
+                "FIXED_REWARD_SENSITIVITY",
+                "weight_decay"
+            ],
+            "a": -0.09645530304415555,
+            "b": -1.8154210875341146,
+            "c": 0.5223146228351574,
+            "type": "multi_linear",
+            "strikes": 0
+        },
+        "reason": "Failed Gauntlet",
+        "generation_pruned": "2026-03-23 11:54:11"
+    },
+    "NOISE_SCALE_1774260555": {
+        "parameter": "NOISE_SCALE",
+        "law": {
+            "master": [
+                "c_moment",
+                "w_scale"
+            ],
+            "a": 0.6338904770125435,
+            "b": -0.05920693186974531,
+            "c": 0.7404525302590903,
+            "type": "multi_linear",
+            "strikes": 0
+        },
+        "reason": "Ablation increased yield",
+        "generation_pruned": "2026-03-23 12:09:15"
+    },
+    "w_scale_1774261054": {
+        "parameter": "w_scale",
+        "law": {
+            "master": "UNTANH",
+            "a": -0.6772523955431634,
+            "b": 1.6509583033186064,
+            "c": -0.05650043001482985,
+            "type": "quadratic",
+            "strikes": 0
+        },
+        "reason": "Failed Gauntlet",
+        "generation_pruned": "2026-03-23 12:17:34"
+    }
+}

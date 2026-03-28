@@ -1,0 +1,24 @@
+{
+    "weight_decay": {
+        "master": [
+            "LR",
+            "MOMENTUM"
+        ],
+        "a": -0.7535248254127073,
+        "b": 0.06126753336283439,
+        "c": 0.03985579548815409,
+        "type": "multi_linear",
+        "strikes": 0
+    },
+    "MOMENTUM": {
+        "master": [
+            "FIXED_REWARD_SENSITIVITY",
+            "c_moment"
+        ],
+        "a": 0.14822755871497809,
+        "b": 0.32716667592352816,
+        "c": 0.11532719773456923,
+        "type": "multi_linear",
+        "strikes": 0
+    }
+}

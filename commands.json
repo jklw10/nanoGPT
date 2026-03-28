@@ -1,0 +1,5 @@
+{
+    "t16": "python -m models.node_agent.t16_butcool",
+    "t17": "python -m models.node_agent.t16",
+    "t16_std": "python -m models.node_agent.t16_standard"
+}

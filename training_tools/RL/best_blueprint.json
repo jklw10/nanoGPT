@@ -1,0 +1,29 @@
+{
+    "global_best_fitness": 0.7536479234695435,
+    "generation_found": 49,
+    "structural_scale": {
+        "N": 8,
+        "D": 32
+    },
+    "active_hyperparameters": {
+        "EMA_SPEED": 0.20310950837532799,
+        "FIXED_REWARD_SENSITIVITY": 1.360218046607915,
+        "LR": 0.005720721430830338,
+        "MOMENTUM": 0.2521688557418596,
+        "weight_decay": 0.021698750753204772,
+        "NOISE_SCALE": 0.5546767726839642,
+        "c_moment": 0.8021549684435622,
+        "w_scale": 0.6340345603476942,
+        "sharpness": 1.0390895413424572,
+        "a_variance": 0.002633467302632888
+    },
+    "active_laws_at_time_of_save": {
+        "UNTANH": {
+            "master": "N",
+            "a": 0.04452220789145427,
+            "b": 0.5496353994691827,
+            "c": 0.0,
+            "type": "linear"
+        }
+    }
+}

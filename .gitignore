@@ -14,3 +14,4 @@ logs/
 log/
 /MNIST
 /out
+/arc_data
