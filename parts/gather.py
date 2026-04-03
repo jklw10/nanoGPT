@@ -83,7 +83,13 @@ class GumbelGatherByGate(torch.autograd.Function):
 
 class RLMAXgbg(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, gate_logits, candidate_pool, k, tau=1.0, training=False, sigma=0.3):
+    def forward(ctx, 
+                gate_logits, 
+                candidate_pool, 
+                k, 
+                tau=1.0, 
+                training=False, 
+                sigma=0.3):
         
         if training:
             gumbels = -torch.log(-torch.log(
@@ -151,7 +157,7 @@ class RLMAXgbg(torch.autograd.Function):
             grad_candidate_pool.scatter_add_(1, expanded_indices, masked_grad)
         
         
-        return grad_gate_logits, grad_candidate_pool, None, None, None
+        return grad_gate_logits, grad_candidate_pool, None, None, None, None
     
 class RLMAXgbg2(torch.autograd.Function):
     @staticmethod
@@ -574,8 +580,12 @@ def run_viz():
         target_pos, phase_msg = get_target(step)
         optimizer.zero_grad()
         
-        gathered_candidates, selected_indices = RLMAXgbg3.apply(
-            gate_logits, candidate_pool, K, 0.1, False # True enables Gumbel noise
+        #gathered_candidates, selected_indices = RLMAXgbg3.apply(
+        #    gate_logits, candidate_pool, K, 0.1, True # True enables Gumbel noise
+        #)
+        
+        gathered_candidates, selected_indices = RLMAXgbg.apply(
+            gate_logits, candidate_pool, K, 0.1, True, 0.3 
         )
 
         model_output = gathered_candidates.mean(dim=1) 

@@ -7,12 +7,13 @@ def run_tracking_task(model_constructor, optimizer, device, batch_size, total_st
     
     brain = model_constructor(batch_size=batch_size, **model_args).to(device)
     brain = torch.compile(brain)
-    optimizer = optimizer(
-        brain.parameters(), 
-        lr=0.005, 
-        weight_decay=0.02, 
-        #betas=(0.9, 0.999)
-    )
+    if optimizer:
+        optimizer = optimizer(
+            brain.parameters(), 
+            lr=0.005, 
+            weight_decay=0.02, 
+            #betas=(0.9, 0.999)
+        )
     initial_snapshots = copy.deepcopy(brain)
     agent_pos = torch.full((batch_size, 2), -3.0, device=device)
     agent_vel = torch.zeros(batch_size, 2, device=device)
@@ -35,9 +36,10 @@ def run_tracking_task(model_constructor, optimizer, device, batch_size, total_st
         environment = torch.randn(batch_size, 2, device=device) * starvation * 1e-5
         environment[:, 0:2] = direction
         
-        output, loss = brain(environment)
-        loss.backward()
-        optimizer.step()
+        loss, output = brain(environment)
+        if optimizer:
+            loss.backward()
+            optimizer.step()
 
         motor_out = output[:, 2, 0:2].clone()
         agent_vel = (agent_vel * 0.85) + (motor_out * 0.2)

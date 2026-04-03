@@ -638,7 +638,7 @@ class SSM(nn.Module):
     def get_weight(self):
         return self.scanner.compute_orthogonal_weights()
 
-    def forward(self, x: torch.tensor, weight = None): #same signature to allow easy swapping.
+    def forward(self, x: torch.tensor, causal=True, get_q=False, weight = None,): #same signature to allow easy swapping.
         #B, T, C = x.size() 
         q = self.q_attn(x) 
         v = self.v_attn(x)
@@ -660,7 +660,9 @@ class SSM(nn.Module):
         Y = q*v 
         Y = self.c_proj(Y)
         Y = self.resid_dropout(Y)
-        return Y, q
+        if get_q:
+            return Y, q
+        return Y
     
     def nexts(self, prev: torch.tensor, x: torch.tensor,  causal=False, weight = None): #same signature to allow easy swapping.
        # B, T, C = x.size() 

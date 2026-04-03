@@ -97,11 +97,79 @@ dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported
 compile = True # use PyTorch 2.0 to compile the model to be faster
 
 
+force_gc            = False
+#switches
+best                = False
+
+mnorm_enabled       = False
+#wack
+dfw_enabled         = False
+decor_enabled       = False
+#rough
+wnorm_enabled       = False
+gdiff_enabled       = False
+grokfast            = False
+sign_enabled        = False
+seqbatch            = False
+#??
+wscrnorm            = False 
+gradorth            = False
+gwrot               = False
+wwhite_enabled      = False
+
+ndiff_enabled       = False
+decay_wa            = False
+
+gball               = False
+gavg                = False
+grms                = False
+
+gstd                = False
+#not abysmal
+gsphere             = False
+ggauss              = False #or best
+gchaos              = False #or best
+
+sizejump            = False
+
+grefl               = False
+
+wstep               = False
+
+gblend              = False
+
+#known good
+gfft                = False #or best
+gnorm               = False #or best
+gzca_enabled        = False #or best
+swnorm_enabled      = False or best
+
+plot                = False
+muon                = False
+
+endgen              = True
+wfunc               = utils.polar_decomp3
+
+zcastep             = 2 #2, 5
+szcapow             = 2 #2, 10
+
+ghook = gblend or gstd or grms or gavg or grefl or gball or gwrot or gdiff_enabled or ndiff_enabled or gnorm or dfw_enabled or grokfast or gfft or gzca_enabled or sign_enabled or gsphere or ggauss or gchaos or gradorth or muon
+
+decay               = False
+decaying = 1.0
+
+eigenInit           = False
+
+lrfinder            = False
+
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 train_logging = False
-exec(open('configurator.py').read()) # overrides from command line or config file
+exec(open('training_tools/configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
+#for fftmem owt: 1e-5 #beta2 dependent
+#for fftmem skspr: 5e-5 #beta2 dependent
+config["swfa"]      = 1e-5 if dataset == "openwebtext" else 1e-3
 # -----------------------------------------------------------------------------
 #torch._dynamo.reset() #in case of cache corruption throw it off a bridge.
 
@@ -192,75 +260,6 @@ if block_size < model.config.block_size:
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
-
-force_gc            = False
-#switches
-best                = False
-
-mnorm_enabled       = False
-#wack
-dfw_enabled         = False
-decor_enabled       = False
-#rough
-wnorm_enabled       = False
-gdiff_enabled       = False
-grokfast            = False
-sign_enabled        = False
-seqbatch            = False
-#??
-wscrnorm            = False 
-gradorth            = False
-gwrot               = False
-wwhite_enabled      = False
-
-ndiff_enabled       = False
-decay_wa            = False
-
-gball               = False
-gavg                = False
-grms                = False
-
-gstd                = False
-#not abysmal
-gsphere             = False
-ggauss              = False #or best
-gchaos              = False #or best
-
-sizejump            = False
-
-grefl               = False
-
-wstep               = False
-
-gblend              = False
-
-#known good
-gfft                = False #or best
-gnorm               = False #or best
-gzca_enabled        = False #or best
-swnorm_enabled      = False or best
-
-plot                = False
-muon                = False
-
-endgen              = True
-#for fftmem owt: 1e-5 #beta2 dependent
-#for fftmem skspr: 5e-5 #beta2 dependent
-wfunc               = utils.fast_polar_decomposition
-#wfunc = utils.range_norm
-#no clue why this way of passing is needed here but not for the bools. love python
-config["swfa"]      = 1e-5 if dataset == "openwebtext" else 1e-3
-zcastep             = 2 #2, 5
-szcapow             = 2 #2, 10
-
-ghook = gblend or gstd or grms or gavg or grefl or gball or gwrot or gdiff_enabled or ndiff_enabled or gnorm or dfw_enabled or grokfast or gfft or gzca_enabled or sign_enabled or gsphere or ggauss or gchaos or gradorth or muon
-
-decay               = False
-decaying = 1.0
-
-eigenInit           = False
-
-lrfinder            = False
 
 if(ghook):
     if(gdiff_enabled or dfw_enabled or muon or grokfast or ggauss):

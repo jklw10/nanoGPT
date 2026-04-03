@@ -11,11 +11,9 @@ import math
 import inspect
 from dataclasses import dataclass
 
-from numpy import isin
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-import parts.kattn as kattn
 import parts.modules as modules
 import parts.optim as optim
 import parts.utils as utils
@@ -26,7 +24,7 @@ import parts.quantizer as quantizer
 #prediction machine
 #Linear = optim.OptimizedLinear
 #Linear = nn.Linear
-Linear = modules.ZeroMeanLinear
+Linear = nn.Linear
 #Linear = modules.TensionLinear
 Plin = modules.ProbingLinear
 #Linear = modules.HungryGdiffLinear
@@ -47,18 +45,21 @@ diffac          = False
 rms_lnorm       = False
 #good in owt
 emb_norm        = True
-wnHead          = False #
+wnHead          = True #
 qksink          = False#
 qkfft           = False
 qkwn            = True#
-pattmlp         = False#
+pattmlp         = True#
 
 hcmlp           = False
 v_patt          = False
+v_patt_2        = False
 hcnvc           = False
 hcnHead         = False
+
+
 #bad
-posembless      = False
+posembless      = True
 
 mem_mix_squish  = False #or fftmem
 causal_mem      = False
@@ -71,7 +72,9 @@ think           = False
 repeat_block    = False
 repeat_center   = False
 
-qrottention     = False
+res_attn        = False
+qrottention     = True
+
 symloss         = False
 midchaos        = False
 
@@ -164,6 +167,9 @@ class Attention(nn.Module):
         
         self.q_attn = (Linear(config.n_embd, config.n_embd, bias=config.bias))
         self.k_attn = (Linear(config.n_embd, config.n_embd, bias=config.bias))
+        if v_patt_2:
+            self.v_attn = modules.PattLayer(config.n_embd,  config.n_embd, v_ptok)# bias=config.bias)
+            self.v_attn2 = Linear(config.n_embd,  config.n_embd)# bias=config.bias)
         
         
         if v_patt:
@@ -246,13 +252,32 @@ class Attention(nn.Module):
             q_scale = math.log(T)*self.qm
         else:
             q_scale = 1.0
-        y = torch.nn.functional.scaled_dot_product_attention(q*q_scale,k,  v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal= causal)
-            
+        y = torch.nn.functional.scaled_dot_product_attention(q*q_scale,k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal= causal)
+        #y2 = torch.nn.functional.scaled_dot_product_attention(q*q_scale,k, v2, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal= causal)
+        
         y = y.transpose(1, 2).contiguous().view(B, T, C) 
+        if v_patt_2:
+            v2 = (self.v_attn2(x))
+            y=y+v2
+        
         y = self.resid_dropout(self.c_proj(y))
 
         return y
 
+#[10: 10   : 10]
+#[10: 1-10 : 10]
+#[10: 10 : 10]
+
+#[1: 1 : 10]
+#[1: 3 : 10]
+#[1: 5 : 10]
+# =
+#[1: 10 : 10]
+#[1: 10 : 10]
+#[1: 10 : 10]
+######  |
+#### ## |
+#####   |
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -342,17 +367,6 @@ class Block(nn.Module):
     def forward(self, x, causal = True):
         self.block_input = x
         
-        if p_atten:
-            x = x + self.attn(self.ln_1(x))
-            x = x + self.mlp(self.ln_2(x))
-            return x
-        
-
-        if(qrottention):
-            x = x + self.attn(self.ln_1(x))[0]
-            x = x + self.mlp(self.ln_2(x))
-            return x
-        
         if residless:
             x = self.attn(self.ln_1(x), causal)
             x = self.mlp(self.ln_2(x))
@@ -386,6 +400,8 @@ class Block2(nn.Module):
         super().__init__()
         self.attn = Attention(config)
         
+        if(qrottention):
+            self.attn = modules.SSM(config.n_embd,config.dropout,config.bias)
         self.ln_1 = LayerNorm(config)
         self.ln_2 = LayerNorm(config)
         self.mlp = MLP(config)
@@ -468,8 +484,12 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.n_embd = config.n_embd
         self.config = config
-        blocks = nn.ModuleList([Block2(config) for _ in range(config.n_layer)])
+        if res_attn:
+            blocks = nn.ModuleList([Block2(config) for _ in range(config.n_layer)])
+        else:
+            blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         
+
         if(exposemb):
             wpe = nn.Embedding(config.block_size//2, config.n_embd)
         else:
