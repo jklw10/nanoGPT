@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from parts import quantizer
 import parts.utils as utils
 
 from dataclasses import dataclass
@@ -46,7 +47,7 @@ defaults = {
     "LR": 0.005720721430830338,
     "MOMENTUM": 0.999,
     "weight_decay": 0.021698750753204772,
-    "NOISE_SCALE": 1.5,
+    "NOISE_SCALE": 0.01,
     "c_moment": 0.8021549684435622,
     "w_scale": 0.6340345603476942,
     "sharpness": 1.0390895413424572,
@@ -427,11 +428,6 @@ class NodeNet(nn.Module):
 
     def forward(self, env_input):
         
-        #gemini comment on naming:
-        #If you view this through the lens of recurrent state-space models.
-        #state -> latent_state
-        #output -> hidden_state (or memory)
-        #target -> observed_state
 
         self.step_counter.add_(1.0)
         
@@ -488,7 +484,7 @@ class NodeNet(nn.Module):
         self.current_input_nodes = 0
 
 
-class CustomHebbianLinear(torch.autograd.Function):
+class PredictiveLinear(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, w_scale, untanh_slope, error_ema, ema_speed, rew_sens, n_scale, step_counter, speed, width):
         norm_weight = F.normalize(weight, p=2, dim=-2) * w_scale
@@ -514,8 +510,8 @@ class CustomHebbianLinear(torch.autograd.Function):
             E_curr = F.softmax(error_signal, dim=-1)
             advantage = E_curr - error_ema
             plasticity = 1.0 + utils.rms_norm(advantage.unsqueeze(3) * rew_sens)
-
-            noisy_state = utils.noised_input(x, error_signal, n_scale)
+            #noisy_state = x
+            noisy_state = utils.noised_input(x, error_signal, 0.0, 0.0)
             
             lg1 = utils.rms_norm(torch.einsum('bni,bnj->bnij', error_signal, noisy_state))
             grad_weight = plasticity * lg1
@@ -525,28 +521,29 @@ class CustomHebbianLinear(torch.autograd.Function):
             grad_weight = grad_weight * g_mask
 
         return None, grad_weight, None, None, None, None, None, None, None, None, None
-
+    
 class StandardNodeParams(nn.Module):
-    def __init__(self, batch_size, num_nodes, dim, device):
+    def __init__(self, batch_size, num_nodes, in_dim, out_dim, device):
         super().__init__() 
-        self.D = dim
+        self.in_dim = in_dim
+        self.out_dim = out_dim
         self.device = device
         
-        base_weight = torch.randn(batch_size, num_nodes, dim, dim, device=device) / math.sqrt(self.D)
+        base_weight = torch.randn(batch_size, num_nodes, in_dim, out_dim, device=device) / math.sqrt(self.in_dim)
         self.weight = nn.Parameter(base_weight)
-        self.register_buffer('error_ema', 0.01 + 0.01 * torch.randn(batch_size, num_nodes, dim, device=device))
         
-        # Defaults
+        self.register_buffer('error_ema', 0.01 + 0.01 * torch.randn(batch_size, num_nodes, out_dim, device=device))
+        
         self.untanh_slope = torch.tensor(1.0, device=device)
         self.w_scale = torch.tensor(1.0, device=device)
         self.ema_speed = torch.tensor(0.2, device=device)
         self.rew_sens = torch.tensor(1.36, device=device)
-        self.n_scale = torch.tensor(1.5, device=device)
+        self.n_scale = torch.tensor(0.0, device=device)
         self.speed = torch.tensor(0.5, device=device)
         self.width = torch.tensor(0.01, device=device)
      
     def forward(self, x, step_counter):
-        return CustomHebbianLinear.apply(
+        return PredictiveLinear.apply(
             x, self.weight, self.w_scale, self.untanh_slope,
             self.error_ema, self.ema_speed, self.rew_sens, self.n_scale,
             step_counter, self.speed, self.width
@@ -563,6 +560,45 @@ class StandardNodeParams(nn.Module):
             self.speed = config.speed.view(-1, 1, 1, 1)
             self.width = config.width.view(-1, 1, 1, 1)
 
+class NodeParams2(nn.Module):
+    def __init__(self, batch_size, num_nodes, in_dim, out_dim, device):
+        super().__init__() 
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.device = device
+        
+        base_weight = torch.randn(batch_size, num_nodes, in_dim, out_dim, device=device) / math.sqrt(self.in_dim)
+        self.weight = nn.Parameter(base_weight)
+        
+        self.register_buffer('error_ema', 0.01 + 0.01 * torch.randn(batch_size, num_nodes, out_dim, device=device))
+        
+        self.untanh_slope = torch.tensor(1.0, device=device)
+        self.w_scale = torch.tensor(1.0, device=device)
+        self.ema_speed = torch.tensor(0.2, device=device)
+        self.rew_sens = torch.tensor(1.36, device=device)
+        self.n_scale = torch.tensor(0.0, device=device)
+        self.speed = torch.tensor(0.5, device=device)
+        self.width = torch.tensor(0.01, device=device)
+    def forward(self, x, step_counter):
+        norm_weight = F.normalize(self.weight, p=2, dim=-2) * self.w_scale
+        
+        raw_pred = torch.einsum('bnd,bnde->bne', x, norm_weight)
+        
+        bound = math.sqrt(2.0 + math.sqrt(2.0))
+        out = utils.buntanh(raw_pred, self.untanh_slope, bound)
+        
+        return out
+    
+    def apply_hyperparams(self, config):
+        self.untanh_slope = config.UNTANH.view(-1, 1, 1)
+        self.w_scale = config.w_scale.view(-1, 1, 1, 1)
+        
+        if hasattr(config, 'EMA_SPEED'):
+            self.ema_speed = config.EMA_SPEED.view(-1, 1, 1)
+            self.rew_sens = config.FIXED_REWARD_SENSITIVITY.view(-1, 1, 1, 1)
+            self.n_scale = config.NOISE_SCALE.view(-1, 1, 1)
+            self.speed = config.speed.view(-1, 1, 1, 1)
+            self.width = config.width.view(-1, 1, 1, 1)
 class StandardMultiHeadTriadNodeNet(nn.Module):
     """autograd compatible"""
     def __init__(self, batch_size, num_nodes, dim, device):
@@ -573,9 +609,9 @@ class StandardMultiHeadTriadNodeNet(nn.Module):
         self.head_dim = 4
         self.device = device
         
-        self.w1 = NodeParams(batch_size, num_nodes, dim, device)
-        self.w2 = NodeParams(batch_size, num_nodes, dim, device)
-        self.w3 = NodeParams(batch_size, num_nodes, dim, device)
+        self.w1 = StandardNodeParams(batch_size, num_nodes, dim, dim, device)
+        self.w2 = StandardNodeParams(batch_size, num_nodes, dim, dim, device)
+        self.w3 = StandardNodeParams(batch_size, num_nodes, dim, dim, device)
         
         self.register_buffer('state', 1e-5 * torch.randn(batch_size, self.N, dim, device=device))
         self.register_buffer('output', 1e-5 * torch.randn(batch_size, self.N, dim, device=device))
@@ -591,7 +627,7 @@ class StandardMultiHeadTriadNodeNet(nn.Module):
         if hasattr(config, 'c_moment'):
             self.c_moment = config.c_moment.view(-1, 1, 1, 1)
         if hasattr(config, 'a_variance'):
-            self.a_variance = config.a_variance.view(-1, 1, 1, 1)
+            self.a_variance = config.a_variance.view(-1, 1, 1)
             
         self.w1.apply_hyperparams(config)
         self.w2.apply_hyperparams(config)
@@ -640,8 +676,8 @@ class StandardMultiHeadTriadNodeNet(nn.Module):
         vd = F.relu(self.a_variance - current_var)
         
         V = self.output.view(batch_size, self.N, self.H, self.head_dim).transpose(1, 2)
-        boredom_noise = vd * torch.randn_like(V)
-        V = V + boredom_noise 
+        boredom_noise = torch.sqrt(vd) * torch.randn_like(V)
+        V = V + boredom_noise
         
         target = torch.matmul(A, V) 
         target = target.transpose(1, 2).reshape(batch_size, self.N, self.D)
@@ -674,4 +710,304 @@ class StandardMultiHeadTriadNodeNet(nn.Module):
         self.output = prediction.detach()
         self.state = target.detach()
 
-        return self.output, total_loss
+        return total_loss
+    
+
+class StandardNodeNet(nn.Module):
+    def __init__(self, batch_size, num_nodes, dim, device):
+        super().__init__()
+        self.N = num_nodes
+        self.D = dim
+        self.device = device
+        
+        self.w1 = StandardNodeParams(batch_size, num_nodes, dim, dim, device)
+        self.router = StandardNodeParams(batch_size, num_nodes, dim, num_nodes, device)
+        self.wnll = utils.wnormlearnloss(dim)
+        
+        self.register_buffer('state', 1e-5 * torch.randn(batch_size, self.N, dim, device=device))
+        self.register_buffer('output', 1e-5 * torch.randn(batch_size, self.N, dim, device=device))
+
+        self.current_input_nodes = 0
+        self.register_buffer('step_counter', torch.tensor(0.0, device=device))
+        
+        self.c_moment = 0.8
+        self.a_variance = 0.0026
+
+    def apply_hyperparams(self, config):
+        if hasattr(config, 'c_moment'):
+            self.c_moment = config.c_moment.view(-1, 1, 1, 1)
+        if hasattr(config, 'a_variance'):
+            self.a_variance = config.a_variance.view(-1, 1, 1)
+            
+        self.w1.apply_hyperparams(config)
+
+    def forward(self, env_input):
+        self.step_counter.add_(1.0)
+        batch_size, input_dim = env_input.shape
+
+        wnll = self.wnll(self.state).mean()
+        
+        boredom_scale = (1-wnll.detach()) / 2.0 
+
+        num_input_nodes = math.ceil(input_dim / self.D)
+        prediction = self.w1(self.state, self.step_counter) 
+        router = self.router(self.state, self.step_counter)
+        router = utils.rms_norm(router, dim=[-1]) 
+        
+        DS_route = utils.sinkhorn_knopp(router)
+        sparse_route = quantizer.ThresHot.apply(DS_route)
+        route = utils.sinkhorn_knopp(sparse_route) 
+        
+        current_var = route.var(dim=[-1], keepdim=True)
+        vd = F.relu(self.a_variance - current_var)
+        
+        V = self.output
+        
+        base_noise = torch.sqrt(vd) * torch.randn_like(V)
+        boredom_noise = base_noise * boredom_scale
+        
+        V = V + boredom_noise
+        
+        target = torch.matmul(route, V) 
+        target = utils.softsign(target)
+
+        pad_len = num_input_nodes * self.D - input_dim
+        if pad_len > 0:
+            env_input_padded = F.pad(env_input, (0, pad_len))
+        else:
+            env_input_padded = env_input
+            
+        env_input_reshaped = env_input_padded.view(batch_size, num_input_nodes, self.D)
+        
+        if num_input_nodes < self.N:
+            target = torch.cat([env_input_reshaped, target[:, num_input_nodes:, :]], dim=1)
+        else:
+            target = env_input_reshaped
+
+        loss_w1 = F.mse_loss(prediction, target, reduction='none')
+
+        total_loss = (loss_w1).sum() + wnll.sum()
+        
+        self.output = prediction.detach()
+        self.state = target.detach()
+
+        return total_loss
+    
+    
+class StandardNodeNet2(nn.Module):
+    def __init__(self, batch_size, num_nodes, dim, device):
+        super().__init__()
+        self.N = num_nodes
+        self.D = dim
+        self.device = device
+        
+        self.w1 = NodeParams2(batch_size, num_nodes, dim, dim, device)
+        self.router = NodeParams2(batch_size, num_nodes, dim, num_nodes, device)
+        self.wnll = utils.wnormlearnloss(dim)
+        
+        self.register_buffer('state', 1e-5 * torch.randn(batch_size, self.N, dim, device=device))
+        self.register_buffer('output', 1e-5 * torch.randn(batch_size, self.N, dim, device=device))
+
+        self.current_input_nodes = 0
+        self.register_buffer('step_counter', torch.tensor(0.0, device=device))
+        
+        self.c_moment = 0.8
+        self.a_variance = 0.0026
+
+    def apply_hyperparams(self, config):
+        if hasattr(config, 'c_moment'):
+            self.c_moment = config.c_moment.view(-1, 1, 1, 1)
+        if hasattr(config, 'a_variance'):
+            self.a_variance = config.a_variance.view(-1, 1, 1)
+            
+        self.w1.apply_hyperparams(config)
+
+    def forward(self, env_input):
+        self.step_counter.add_(1.0)
+        batch_size, input_dim = env_input.shape
+
+        wnll = self.wnll(self.state) 
+        
+        boredom_scale = (1-wnll.detach()) / 2.0 
+
+        num_input_nodes = math.ceil(input_dim / self.D)
+        
+        prediction = self.w1(self.state, self.step_counter) 
+        router = self.router(self.state, self.step_counter)
+        router = utils.rms_norm(router, dim=[-1]) 
+        
+        DS_route = utils.sinkhorn_knopp(router)
+        sparse_route = quantizer.ThresHot.apply(DS_route)
+        route = utils.sinkhorn_knopp(sparse_route) 
+        
+        current_var = route.var(dim=[-1], keepdim=True)
+        vd = F.relu(self.a_variance - current_var)
+        
+        V = self.output
+        
+        base_noise = torch.sqrt(vd) * torch.randn_like(V)
+        boredom_noise = base_noise * boredom_scale
+        
+        V = V + boredom_noise
+        
+        target = torch.matmul(route, V) 
+        target = utils.softsign(target)
+
+        pad_len = num_input_nodes * self.D - input_dim
+        if pad_len > 0:
+            env_input_padded = F.pad(env_input, (0, pad_len))
+        else:
+            env_input_padded = env_input
+            
+        env_input_reshaped = env_input_padded.view(batch_size, num_input_nodes, self.D)
+        
+        if num_input_nodes < self.N:
+            target = torch.cat([env_input_reshaped, target[:, num_input_nodes:, :]], dim=1)
+        else:
+            target = env_input_reshaped
+
+        loss_w1 = F.mse_loss(prediction, target, reduction='none')
+
+        total_loss = (loss_w1).sum() + wnll.sum()
+        
+        self.output = prediction.detach()
+        self.state = target.detach()
+
+        return total_loss
+    
+class ArbitraryDelayMemory(nn.Module):
+    def __init__(self, batch_size, num_nodes, dim, M, device):
+        super().__init__()
+        self.M = M
+        self.device = device
+        
+        self.register_buffer('bank', torch.zeros(batch_size, num_nodes, M, dim, device=device))
+        
+        self.head = NodeParams2(batch_size, num_nodes, dim, dim, device)
+        
+        self.read_router = NodeParams2(batch_size, num_nodes, dim, M, device)
+        self.write_router = NodeParams2(batch_size, num_nodes, dim, M, device)
+        
+        self.write_threshold = 1.5 
+
+    def read_and_predict(self, state, step_counter):
+        read_logits = self.read_router(state, step_counter)
+        
+        noise = -torch.empty_like(read_logits).exponential_().log()
+        noisy_read_logits = read_logits + noise
+        
+        read_selection = quantizer.TopKHot.apply(noisy_read_logits, 1) # [B, N, M]
+        past_state = torch.sum(self.bank * read_selection.unsqueeze(-1), dim=2) # [B, N, D]
+        
+        predicted_present = self.head(past_state, step_counter)
+        return predicted_present
+
+    def write(self, target, step_counter):
+        write_logits = self.write_router(target, step_counter)
+        
+        write_mask = quantizer.AdjThresHot.apply(write_logits, self.write_threshold) # [B, N, M]
+        write_mask_exp = write_mask.unsqueeze(-1)
+        
+        new_bank = self.bank * (1.0 - write_mask_exp) + target.unsqueeze(2) * write_mask_exp
+        self.bank = new_bank.detach()
+        
+        return write_mask
+    
+class MemNodeNet(nn.Module):
+    def __init__(self, batch_size, num_nodes, dim, device):
+        super().__init__()
+        self.N = num_nodes
+        self.D = dim
+        self.device = device
+        
+        self.w1 = NodeParams2(batch_size, num_nodes, dim, dim, device)
+        self.router = NodeParams2(batch_size, num_nodes, dim, num_nodes, device)
+        self.wnll = utils.wnormlearnloss(dim)
+        
+        # --- The Arbitrary Delay Memory ---
+        self.memory_slots = 16 
+        self.memory = ArbitraryDelayMemory(batch_size, num_nodes, dim, self.memory_slots, device)
+        
+        # Learnable parameter initialized to ZERO. Allows w1 to ignore the memory initially.
+        self.p_mix = nn.Parameter(torch.zeros(1, num_nodes, 1, device=device)) 
+        
+        self.register_buffer('state', 1e-5 * torch.randn(batch_size, self.N, dim, device=device))
+        self.register_buffer('output', 1e-5 * torch.randn(batch_size, self.N, dim, device=device))
+
+        self.current_input_nodes = 0
+        self.register_buffer('step_counter', torch.tensor(0.0, device=device))
+        
+        self.c_moment = 0.8
+        self.a_variance = 0.0026
+
+    def apply_hyperparams(self, config):
+        if hasattr(config, 'c_moment'):
+            self.c_moment = config.c_moment.view(-1, 1, 1, 1)
+        if hasattr(config, 'a_variance'):
+            self.a_variance = config.a_variance.view(-1, 1, 1)
+            
+        self.w1.apply_hyperparams(config)
+
+    def forward(self, env_input):
+        self.step_counter.add_(1.0)
+        batch_size, input_dim = env_input.shape
+
+        wnll = self.wnll(self.state) 
+        boredom_scale = (1-wnll.detach()) / 2.0 
+
+        num_input_nodes = math.ceil(input_dim / self.D)
+        
+        predicted_present = self.memory.read_and_predict(self.state, self.step_counter)
+        
+        state_aug = self.state + (predicted_present * self.p_mix)
+        
+        prediction = self.w1(state_aug, self.step_counter) 
+        router = self.router(state_aug, self.step_counter)
+        router = utils.rms_norm(router, dim=[-1]) 
+        
+        DS_route = utils.sinkhorn_knopp(router)
+        
+        sparse_route = quantizer.ThresHot.apply(DS_route) 
+        route = utils.sinkhorn_knopp(sparse_route) 
+        
+        current_var = route.var(dim=[-1], keepdim=True)
+        vd = F.relu(self.a_variance - current_var)
+        
+        V = self.output
+        base_noise = torch.sqrt(vd) * torch.randn_like(V)
+        boredom_noise = base_noise * boredom_scale
+        V = V + boredom_noise
+        
+        target = torch.matmul(route, V) 
+        target = utils.softsign(target)
+
+        pad_len = num_input_nodes * self.D - input_dim
+        if pad_len > 0:
+            env_input_padded = F.pad(env_input, (0, pad_len))
+        else:
+            env_input_padded = env_input
+            
+        env_input_reshaped = env_input_padded.view(batch_size, num_input_nodes, self.D)
+        
+        if num_input_nodes < self.N:
+            target = torch.cat([env_input_reshaped, target[:, num_input_nodes:, :]], dim=1)
+        else:
+            target = env_input_reshaped
+
+        loss_w1 = F.mse_loss(prediction, target, reduction='none')
+        
+        loss_future = F.mse_loss(predicted_present, target.detach(), reduction='none')
+        
+        write_mask = self.memory.write(target.detach(), self.step_counter)
+        
+        validation_pred = self.memory.head(target.detach(), self.step_counter)
+        loss_validation = F.mse_loss(validation_pred, target.detach(), reduction='none').mean(dim=-1, keepdim=True)
+        
+        loss_mint = (loss_validation * write_mask).sum()
+
+        total_loss = loss_w1.sum() + wnll.sum() + loss_future.sum() + loss_mint
+        
+        self.output = prediction.detach()
+        self.state = target.detach()
+
+        return total_loss

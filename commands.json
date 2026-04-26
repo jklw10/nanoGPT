@@ -1,10 +1,9 @@
 {
-    "t16": "python -m models.node_agent.t16_butcool",
-    "t17": "python -m models.node_agent.t16",
-    "t16_std": "python -m models.node_agent.t16_standard",
+    "t16_std": "python -m training_tools.agent_runner",
     "llm owt":"python -m training_tools.train config/train_shakespeare_char.py --grad_clip=0.0 --max_iters=100000 --n_embd=228 --n_layer=4 --lr_decay_iters=30000 --dataset='openwebtext' --dropout=0.0 --block_size=64 --batch_size=64 --beta2=0.999",
     "llm owt char":"python -m training_tools.train config/train_shakespeare_char.py --grad_clip=0.0 --max_iters=100000 --n_embd=228 --n_layer=4 --lr_decay_iters=30000 --dataset='openwebtext' --dropout=0.1 --block_size=64 --batch_size=64 --beta2=0.999 --always_byte=True",
     "quantizer":"python -m models.quantizer 2> logs/error_log.txt",
+    "gather":"python -m parts.gather 2> logs/error_log.txt", 
     "llm hnet":"python -m models.HNet 2> logs/error_log.txt",
     "llm corrector":"python -m models.corrector 2> logs/error_log.txt"
 }

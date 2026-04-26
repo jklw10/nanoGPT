@@ -279,6 +279,154 @@ class RLMAXgbg3(torch.autograd.Function):
         
         return grad_gate_logits, grad_candidate_pool, None, None, None, None
 
+
+class RLMAXgbg4(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, 
+                gate_logits, 
+                candidate_pool, 
+                k, 
+                tau=1.0, 
+                training=False, 
+                sigma=0.3):
+        
+        if training:
+            gumbels = -torch.log(-torch.log(
+                torch.rand_like(gate_logits) + 1e-10
+            ) + 1e-10)
+            
+            gate_logits = (gate_logits + gumbels) / tau
+        else:
+            gate_logits = gate_logits
+        
+        b, ct, c = candidate_pool.shape
+        b, gt = gate_logits.shape
+        assert gt == ct
+        _, top_indices = torch.topk(gate_logits, k=k, dim=-1) #b, k
+        expanded_indices = top_indices.unsqueeze(-1).expand(b, k, c)
+        output = torch.gather(candidate_pool, 1, expanded_indices) #b, k, c
+        ctx.save_for_backward(gate_logits, candidate_pool, output,top_indices)
+        ctx.k = k
+        ctx.sigma = sigma
+        return output, top_indices
+
+    @staticmethod
+    def backward(ctx, grad_output, _):
+        gate_logits, candidate_pool, output, top_indices = ctx.saved_tensors
+        k = ctx.k
+        grad_gate_logits = grad_candidate_pool = None
+
+        with torch.no_grad():
+            descent_dir = (-grad_output)
+            
+            pool_dir = (candidate_pool)
+            
+            scores = torch.bmm(descent_dir, pool_dir.transpose(1, 2))
+            
+            _, best_candidate_indices = torch.max(scores, dim=-1) 
+            
+        if ctx.needs_input_grad[0]:
+            hard_target = torch.zeros_like(gate_logits) 
+            hard_target.scatter_add_(dim=1, index=best_candidate_indices, src=torch.ones_like(best_candidate_indices, dtype=torch.float))
+            
+            hard_target = torch.clamp(hard_target, max=1.0)
+            
+            probs = torch.sigmoid(gate_logits)
+            grad_gate_logits = probs - hard_target
+            
+        if ctx.needs_input_grad[1]:
+            b,p,c = candidate_pool.shape
+            
+            
+            is_correct_selection = (top_indices == best_candidate_indices).float()
+
+            # Expand mask for dimensions (b, k, dim)
+            mask = is_correct_selection.unsqueeze(-1)
+
+            # Zero out gradients for the "Wrong" selections
+            masked_grad = grad_output * mask
+
+            # Scatter the masked gradient
+            expanded_indices = top_indices.unsqueeze(-1).expand(b, k, c)
+            grad_candidate_pool = torch.zeros_like(candidate_pool)
+            grad_candidate_pool.scatter_add_(1, expanded_indices, masked_grad)
+        
+        return grad_gate_logits, grad_candidate_pool, None, None, None, None
+
+
+class RLMAXgbg5(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, 
+                gate_logits, 
+                candidate_pool, 
+                k, 
+                tau=1.0, 
+                training=False, 
+                sigma=0.3):
+        
+        if training:
+            gumbels = -torch.log(-torch.log(
+                torch.rand_like(gate_logits) + 1e-10
+            ) + 1e-10)
+            
+            gate_logits = (gate_logits + gumbels) / tau
+        else:
+            gate_logits = gate_logits
+        
+        b, ct, c = candidate_pool.shape
+        b, gt = gate_logits.shape
+        assert gt == ct
+        _, top_indices = torch.topk(gate_logits, k=k, dim=-1) #b, k
+        expanded_indices = top_indices.unsqueeze(-1).expand(b, k, c)
+        output = torch.gather(candidate_pool, 1, expanded_indices) #b, k, c
+        ctx.save_for_backward(gate_logits, candidate_pool, output,top_indices)
+        ctx.k = k
+        ctx.sigma = sigma
+        return output, top_indices
+
+    @staticmethod
+    def backward(ctx, grad_output, _):
+        gate_logits, candidate_pool, output, top_indices = ctx.saved_tensors
+        k = ctx.k
+        grad_gate_logits = grad_candidate_pool = None
+
+        with torch.no_grad():
+            ideal_targets = output - grad_output 
+            
+            ideal_targets_norm = F.normalize(ideal_targets, p=2, dim=-1)
+            candidate_pool_norm = F.normalize(candidate_pool, p=2, dim=-1)
+            
+            scores = torch.bmm(ideal_targets_norm, candidate_pool_norm.transpose(1, 2))
+            
+            _, best_candidate_indices = torch.max(scores, dim=-1) # (b, k)
+            
+        if ctx.needs_input_grad[0]:
+            hard_target = torch.zeros_like(gate_logits) 
+            hard_target.scatter_add_(dim=1, index=best_candidate_indices, src=torch.ones_like(best_candidate_indices, dtype=torch.float))
+            
+            hard_target = torch.clamp(hard_target, max=1.0)
+            
+            probs = torch.sigmoid(gate_logits)
+            grad_gate_logits = probs - hard_target
+            
+        if ctx.needs_input_grad[1]:
+            b, p, c = candidate_pool.shape
+            
+            selected_cosine_sim = torch.gather(scores, 2, top_indices.unsqueeze(-1)).squeeze(-1)
+            
+            soft_mask = F.relu(selected_cosine_sim) ** 2 
+            mask = soft_mask.unsqueeze(-1)
+            
+            masked_grad = grad_output * mask
+
+            expanded_indices = top_indices.unsqueeze(-1).expand(b, k, c)
+            grad_candidate_pool = torch.zeros_like(candidate_pool)
+            grad_candidate_pool.scatter_add_(1, expanded_indices, masked_grad)
+        
+        return grad_gate_logits, grad_candidate_pool, None, None, None, None
+
+
+
 class HungryGatherFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -539,7 +687,144 @@ class GatherByGate2(torch.autograd.Function):
         
         return grad_gate_logits, grad_candidate_pool, None
 
+class PureAdvantageGBG(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, gate_logits, candidate_pool, k, tau, training, gumbel_scale, error_ema):
+        # 1. PURE ROUTING (No task logic)
+        if training and gumbel_scale > 0:
+            gumbels = -torch.log(-torch.log(torch.rand_like(gate_logits) + 1e-10) + 1e-10)
+            routing_logits = (gate_logits + gumbels * gumbel_scale) / tau
+        else:
+            routing_logits = gate_logits / tau
+            
+        _, top_indices = torch.topk(routing_logits, k=k, dim=-1) #[B, K]
+        
+        # 2. PURE GATHERING (Maintains [B, K, D] shape)
+        b, k_dim = top_indices.shape
+        
+        if candidate_pool.dim() == 2: # Pool is [N, D]
+            gathered_vals = F.embedding(top_indices, candidate_pool) # [B, K, D]
+        else:                         # Pool is[B, N, D]
+            expanded_indices = top_indices.unsqueeze(-1).expand(-1, -1, candidate_pool.size(-1))
+            gathered_vals = torch.gather(candidate_pool, 1, expanded_indices) # [B, K, D]
+        
+        ctx.save_for_backward(gate_logits, candidate_pool, top_indices, error_ema)
+        ctx.k = k
+        return gathered_vals, top_indices
 
+    @staticmethod
+    def backward(ctx, grad_gathered, grad_indices):
+        gate_logits, candidate_pool, top_indices, error_ema = ctx.saved_tensors
+        k = ctx.k
+        b = grad_gathered.size(0)
+        grad_gate_logits = grad_candidate_pool = None
+        current_error = grad_gathered.reshape(b, -1).norm(p=2, dim=-1, keepdim=True) 
+            
+        # Update the baseline directly using the gradient of the gathered embeddings
+        error_ema.copy_(error_ema * 0.95 + current_error.mean() * 0.05)
+            
+        advantage = error_ema - current_error
+        with torch.no_grad():
+            current_error = grad_gathered.reshape(b, -1).norm(p=2, dim=-1, keepdim=True) 
+            advantage = error_ema - current_error
+            
+            norm_advantage = advantage
+            if advantage.numel() > 1:
+                adv_mean = advantage.mean()
+                adv_std = advantage.std() + 1e-8
+                norm_advantage = (advantage - adv_mean) / adv_std 
+
+        if ctx.needs_input_grad[0]:
+            chosen_mask = torch.zeros_like(gate_logits)
+            chosen_mask.scatter_(1, top_indices, 1.0)
+            
+            probs = torch.sigmoid(gate_logits)
+            grad_gate_logits = chosen_mask * (probs - 1.0) * norm_advantage
+            grad_gate_logits += (probs * 0.01) 
+        if ctx.needs_input_grad[1]:
+            plasticity = F.relu(norm_advantage).unsqueeze(-1) 
+            
+            masked_grad = grad_gathered * plasticity 
+            
+            if candidate_pool.dim() == 2:
+                grad_candidate_pool = torch.zeros_like(candidate_pool)
+                flat_indices = top_indices.reshape(-1)
+                flat_grads = masked_grad.reshape(-1, candidate_pool.size(1))
+                grad_candidate_pool.index_add_(0, flat_indices, flat_grads)
+            else:
+                grad_candidate_pool = torch.zeros_like(candidate_pool)
+                expanded_indices = top_indices.unsqueeze(-1).expand(-1, -1, candidate_pool.size(-1))
+                grad_candidate_pool.scatter_add_(1, expanded_indices, masked_grad)
+
+        return grad_gate_logits, grad_candidate_pool, None, None, None, None, None
+
+class AntiClumpGBG(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, gate_logits, candidate_pool, k, tau=1.0, training=False):
+        if training:
+            gumbels = -torch.log(-torch.log(torch.rand_like(gate_logits) + 1e-10) + 1e-10)
+            routing_logits = (gate_logits + gumbels) / tau
+        else:
+            routing_logits = gate_logits / tau
+            
+        b, ct, c = candidate_pool.shape
+        _, top_indices = torch.topk(routing_logits, k=k, dim=-1) # [B, K]
+        
+        expanded_indices = top_indices.unsqueeze(-1).expand(b, k, c)
+        output = torch.gather(candidate_pool, 1, expanded_indices) # [B, K, C]
+        
+        ctx.save_for_backward(gate_logits, candidate_pool, output, top_indices)
+        ctx.k = k
+        return output, top_indices
+
+    @staticmethod
+    def backward(ctx, grad_output, _):
+        gate_logits, candidate_pool, output, top_indices = ctx.saved_tensors
+        b, k, c = output.shape
+        grad_gate_logits = grad_candidate_pool = None
+
+        # ---------------------------------------------------------
+        # 1. ANTI-CLUMPING LOGIC (Winner-Take-All Update)
+        # ---------------------------------------------------------
+        if ctx.needs_input_grad[1]:
+            with torch.no_grad():
+                # grad_output points AWAY from target. -grad_output points TOWARDS it.
+                # Because it passed through mean(), it is identical for all K slots.
+                step_direction = -grad_output 
+                
+                # Project the K candidates onto the direction we need to move.
+                # The highest projection is the candidate "closest" to the target direction.
+                projections = (output * step_direction).sum(dim=-1) #[B, K]
+                
+                # Find the single best candidate out of the K selected
+                _, best_k_idx = torch.max(projections, dim=-1) # [B]
+                
+                # Create a mask so ONLY the vanguard candidate gets updated
+                mask = torch.zeros(b, k, device=output.device)
+                mask.scatter_(1, best_k_idx.unsqueeze(-1), 1.0)
+                mask = mask.unsqueeze(-1) # [B, K, 1]
+                
+            # Apply mask. We multiply by K so the overall step size of the Mean 
+            # remains mathematically consistent, but all force is applied to one node.
+            masked_grad = grad_output * mask * k
+            
+            grad_candidate_pool = torch.zeros_like(candidate_pool)
+            expanded_indices = top_indices.unsqueeze(-1).expand(b, k, c)
+            grad_candidate_pool.scatter_add_(1, expanded_indices, masked_grad)
+
+        # ---------------------------------------------------------
+        # 2. ROUTER GRADIENTS
+        # ---------------------------------------------------------
+        if ctx.needs_input_grad[0]:
+            # Simple push-pull to keep the router exploring the chosen indices.
+            # (If you are still tracking EMA advantages, you can multiply norm_advantage here!)
+            chosen_mask = torch.zeros_like(gate_logits)
+            chosen_mask.scatter_(1, top_indices, 1.0)
+            
+            probs = torch.sigmoid(gate_logits)
+            grad_gate_logits = (probs - chosen_mask) * 0.1 
+
+        return grad_gate_logits, grad_candidate_pool, None, None, None
 # --- Main Visualization Loop ---
 def run_viz():
     torch.manual_seed(42)
@@ -576,17 +861,26 @@ def run_viz():
     print("Green  = Actual Selection (Noisy / Training)")
     print("Orange = Validation Selection (Clean / Deterministic)")
     
+    gema = torch.zeros(1, 1, device=gate_logits.device)
+
     for step in range(N_STEPS):
+        with torch.no_grad():
+            candidate_pool = F.normalize(candidate_pool, dim=-1)
         target_pos, phase_msg = get_target(step)
         optimizer.zero_grad()
         
         #gathered_candidates, selected_indices = RLMAXgbg3.apply(
         #    gate_logits, candidate_pool, K, 0.1, True # True enables Gumbel noise
         #)
-        
         gathered_candidates, selected_indices = RLMAXgbg.apply(
-            gate_logits, candidate_pool, K, 0.1, True, 0.3 
+            gate_logits, candidate_pool, K, 0.1, True,
         )
+        #gathered_candidates, selected_indices = AntiClumpGBG.apply(
+        #    gate_logits, candidate_pool, K, 0.1, True,
+        #)
+        #gathered_candidates, selected_indices = RLMAXgbg4.apply(
+        #    gate_logits, candidate_pool, K, 0.1, True, 0.3 
+        #)
 
         model_output = gathered_candidates.mean(dim=1) 
         loss = ((model_output - target_pos)**2).sum()

@@ -290,7 +290,6 @@ class Puntan(nn.Module):
     def forward(self, x):
         return x - torch.tanh(x)*self.alpha
 
-
 class Psinrelu(nn.Module):
     def __init__(self, n_embd, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -304,11 +303,21 @@ class Psinrelu(nn.Module):
 
         return leaky_sin_relu_power(x,slope,power, 2.5)
 
-def noised_input(input, grad, scale=0.1):
+class Univfun(nn.Module):
+    def __init__(self, n_embd, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.xy = nn.Linear(n_embd, n_embd * 2) 
+    def forward(self, x):
+        x_proj, y_proj = self.xy(x).chunk(2, dim=-1)
+        x_proj = torch.clamp(x_proj, max=70.0) 
+        y_proj = torch.clamp(y_proj, min=1e-8) 
+        return torch.exp(x_proj) - torch.log(y_proj)
+
+def noised_input(input, grad, scale1=0.0,scale2=0.0):
     state_mag = input.abs().sum(dim=[-2,-1], keepdim=True) 
-    noise1 = torch.randn_like(input) / (1.0 + state_mag)
-    noise2 = torch.randn_like(input) * grad.std() * scale
-    return input + noise1 + noise2
+    noise1 = torch.randn_like(input) * grad.std()
+    noise2 = torch.randn_like(input) / (1.0 + state_mag)
+    return input + noise1*scale1 + noise2*scale2
 phi = 1.61803398875
 class RatchetRelu(torch.autograd.Function):
     @staticmethod

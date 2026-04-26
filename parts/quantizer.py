@@ -213,6 +213,22 @@ class ThresHot(torch.autograd.Function):
         return grad_x    
 
 
+class AdjThresHot(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, threshold_mult):
+        probs = F.softmax(x, dim=-1)
+        k_hot = torch.where(probs >= (threshold_mult / x.shape[-1]), 1.0, 0.0)
+        ctx.save_for_backward(x)
+        return k_hot
+
+    @staticmethod
+    def backward(ctx, g):
+        x, = ctx.saved_tensors
+        with torch.no_grad():
+            g_mean = torch.mean(g, dim=-1, keepdim=True)
+            hard_target = torch.where(g < g_mean, 1.0, 0.0)
+        grad_x = torch.sigmoid(x) - hard_target
+        return grad_x, None
 
 
 class ThresHot2(torch.autograd.Function):
@@ -319,69 +335,6 @@ class BoltzmannThresHot(torch.autograd.Function):
         
         return grad_x
 
-    
-    def __init__(self, input_dim, hidden_dim, embed_dim, quant_dim, k):
-        super().__init__()
-        self.quant_dim = quant_dim
-        self.embed_dim = embed_dim
-        self.k = k # Not directly used in this version, but kept for consistency
-        
-        self.shape_n = 16 # How many shapes in our dynamic palette
-        self.shape_dim = 16 # The dimension of each shape
-        self.shape_K = quant_dim // self.shape_dim # How many shapes to select
-
-        self.encoder_palette_generator = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, self.shape_n * self.shape_dim)
-        )
-        
-        self.query_generator = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, self.shape_dim) # Query must have same dim as shapes
-        )
-        self.codebook = nn.Linear(self.quant_dim, embed_dim, bias=False)
-        self.decoder = nn.Sequential(
-            nn.Linear(embed_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, input_dim)
-        )
-        self.attn = modules.Attention(self.shape_dim, 1, 0.0, False)
-    
-    def forward(self, x):
-        k_hot, vq_loss, logits = self.quant(x)
-        k = self.k_from_hot(k_hot).detach() 
-        reconstruction = self.dequant(k_hot)
-        return reconstruction, logits, vq_loss, k
-
-    def quant(self, x):
-        batch_size = x.shape[0]
-        
-        flat_palette = self.encoder_palette_generator(x)
-        dynamic_palette = flat_palette.view(batch_size, self.shape_n, self.shape_dim)
-
-        selected_shapes = self.attn(dynamic_palette,causal=False)[:,:self.shape_K,:]
-
-        hot = ThresHot.apply(selected_shapes)
-        hot = hot.view(batch_size, -1)
-        
-        return hot, 0.0, selected_shapes
-    
-    def k_from_hot(self, hot):
-        return hot.sum(dim=-1, keepdim=True).clamp(1,self.quant_dim).detach()
-
-    def dequant(self, hot, norm = True):
-        if norm:
-            k = self.k_from_hot(hot)
-            hot = hot / k
-        q = self.codebook(hot)
-        return self.decoder(q)
-        
-    def optimizer(self, LR):
-        num_ae = sum(p.numel() for p in self.parameters())
-        print(f"ae parameters: {num_ae}")
-        return torch.optim.AdamW(self.parameters(), lr=LR)
 # --- The Autoencoder and Experiment Setup ---
 wn = torch.nn.utils.parametrizations.weight_norm
 class RegenerativeLinear(nn.Module):
