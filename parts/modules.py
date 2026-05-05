@@ -339,7 +339,7 @@ Linear = nn.Linear
 class Kattention(nn.Module):
     def __init__(self, config):
         super().__init__()
-        assert config.n_embd % config.n_head == 0
+        #assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
         
         self.q_attn = (Linear(config.n_embd,  config.n_embd, bias=config.bias))
@@ -352,10 +352,10 @@ class Kattention(nn.Module):
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head 
         self.n_embd = config.n_embd
+        self.n_head = self.n_embd // 8
         self.dropout = config.dropout
-        self.head_dim =  self.n_embd //  self.n_head 
+        self.head_dim =  self.n_embd // self.n_head 
 
         self.k_sparse=4
 
@@ -375,13 +375,194 @@ class Kattention(nn.Module):
         att = (q*(math.log(T)*self.qm) @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
     
         causal_mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, T, T)
-        att = att.masked_fill(causal_mask == 0, 0.0) #float('-inf'))
-        k_hot_mask = quantizer.avgHot.apply(att)#, k_val)
-        att = att.masked_fill(k_hot_mask == 0, 0.0) #float('-inf'))
+        att = att.masked_fill(causal_mask == 0, float('-inf'))
+        k_hot_mask = quantizer.TopKHot.apply(att,k_val)
+        att = att.masked_fill(k_hot_mask == 0, float('-inf'))
+        #att = att*k_hot_mask
+        #att = att.masked_fill(causal_mask == 0, 0.0)
+        #att = att.masked_fill(k_hot_mask == 0, 0.0)
         #att = F.tanh(att) #/ k_val #utils.k_from_hot(k_hot_mask).detach()
+        #att = F.relu(att)
+        #att = att / att.sum(dim =-1, keepdim=True)
         att = torch.softmax(att,dim=-1) 
+        #att = F.relu(att)
+        #sum_att = att.sum(dim=-1, keepdim=True)
+        #att = att / (sum_att + 1e-8)
+        
         y = att@v
 
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.resid_dropout(self.c_proj(y))
+        
+        return y
+
+
+class HydraKattention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        self.bias = config.bias
+
+        self.head_dim = 16
+        self.n_head = self.n_embd // self.head_dim 
+        
+        self.num_kv_heads = getattr(config, "num_kv_heads", self.n_head // 4)
+        self.num_queries_per_kv = self.n_head // self.num_kv_heads
+        
+        self.q_dim = self.n_head * self.head_dim
+        self.kv_dim = self.num_kv_heads * self.head_dim
+
+        self.q_attn = nn.Linear(self.n_embd, self.q_dim, bias=self.bias)
+        self.k_attn = nn.Linear(self.n_embd, self.kv_dim, bias=self.bias)
+        self.v_attn = nn.Linear(self.n_embd, self.kv_dim, bias=self.bias)
+        
+        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=self.bias)
+        
+        self.attn_dropout = nn.Dropout(self.dropout)
+        self.resid_dropout = nn.Dropout(self.dropout)
+
+        self.k_sparse = 4
+        self.qm = nn.Parameter(torch.ones(self.head_dim).normal_(mean=1, std=0.1))
+
+        self.fattn = SparseFlexAttention(32)
+        
+    def forward(self, x, causal=True):
+        B, T, C = x.size() 
+        
+        q = self.q_attn(x)
+        k = self.k_attn(x)
+        v = self.v_attn(x)
+        
+        q = q.view(B, T, self.num_kv_heads, self.num_queries_per_kv, self.head_dim).permute(0, 2, 3, 1, 4)
+        
+        k = k.view(B, T, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3).unsqueeze(2)
+        v = v.view(B, T, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3).unsqueeze(2)
+
+        k_val = min(self.k_sparse, T)
+
+        att = (q * (math.log(T) * self.qm) @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
+    
+        causal_mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, 1, T, T)
+        att = att.masked_fill(causal_mask == 0, float('-inf'))
+        
+        k_hot_mask = quantizer.TopKHot.apply(att, k_val)
+        att = att.masked_fill(k_hot_mask == 0, float('-inf'))
+
+        att = torch.softmax(att, dim=-1) 
+        att = self.attn_dropout(att)
+        
+        y = att @ v
+
+        y = y.permute(0, 3, 1, 2, 4).contiguous().view(B, T, C)
+        
+        y = self.resid_dropout(self.c_proj(y))
+        
+        return y
+
+
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+
+
+class SparseFlexAttention(nn.Module):
+    def __init__(self, block_size=64):
+        super().__init__()
+        self.block_size = block_size
+
+    def forward(self, q, k, v, k_val):
+        B, H, T, D = q.shape
+        num_blocks = T // self.block_size
+
+        # 1. Compute a downsampled, coarse logit map for block selection
+        # Instead of T x T, we compute (T/64) x (T/64)
+        q_coarse = q.view(B, H, num_blocks, self.block_size, D).mean(dim=-2)
+        k_coarse = k.view(B, H, num_blocks, self.block_size, D).mean(dim=-2)
+        coarse_logits = torch.matmul(q_coarse, k_coarse.transpose(-1, -2))
+
+        # 2. Use your custom autograd TopKHot on the coarse logits
+        # This keeps the Straight-Through gradients intact!
+        block_sparsity_mask, _ = quantizer.vmapTopKHot.apply(coarse_logits, k_val)
+
+        # 3. Create a mask_mod using the coarse predictions
+        def custom_mask_mod(b, h, q_idx, kv_idx):
+            q_block = q_idx // self.block_size
+            kv_block = kv_idx // self.block_size
+            # Direct pointwise read from our learned coarse mask
+            return (q_idx >= kv_idx) & (block_sparsity_mask[b, h, q_block, kv_block] == 1.0)
+
+        # 4. Generate the optimized block mask for PyTorch's Triton backend
+        block_mask = create_block_mask(
+            custom_mask_mod, B=B, H=H, Q_LEN=T, KV_LEN=T, BLOCK_SIZE=self.block_size, _compile=True
+        )
+
+        # 5. Execute heavy attention computation only on valid blocks
+        out = flex_attention(q, k, v, block_mask=block_mask)
+        return out
+
+
+class FKattention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        self.bias = config.bias
+
+        # 16 is a clean dimension for Tensor Cores
+        self.head_dim = 16
+        self.n_head = self.n_embd // self.head_dim 
+        
+        # In GQA, the number of Q heads is a multiple of KV heads
+        self.num_kv_heads = getattr(config, "num_kv_heads", self.n_head // 4)
+        self.num_queries_per_kv = self.n_head // self.num_kv_heads
+        
+        self.q_dim = self.n_head * self.head_dim
+        self.kv_dim = self.num_kv_heads * self.head_dim
+
+        self.q_attn = nn.Linear(self.n_embd, self.q_dim, bias=self.bias)
+        self.k_attn = nn.Linear(self.n_embd, self.kv_dim, bias=self.bias)
+        self.v_attn = nn.Linear(self.n_embd, self.kv_dim, bias=self.bias)
+        
+        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=self.bias)
+        
+        self.attn_dropout = nn.Dropout(self.dropout)
+        self.resid_dropout = nn.Dropout(self.dropout)
+
+        self.k_sparse = 4
+        self.qm = nn.Parameter(torch.ones(self.head_dim).normal_(mean=1, std=0.1))
+
+        self.fattn = SparseFlexAttention(block_size=32)
+        
+    def forward(self, x, causal=True):
+        B, T, C = x.size() 
+        
+        k_val = min(self.k_sparse, T // self.fattn.block_size)
+        k_val = max(1, k_val) # Clamp to at least 1 block
+
+        q = self.q_attn(x)
+        k = self.k_attn(x)
+        v = self.v_attn(x)
+        
+        # Reshape to standard 4D layout for Multi-Head / Grouped-Query Attention
+        # Shape: (B, H, T, D)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        # Apply learnable scaling parameter `qm` directly on Q
+        q = q * (math.log(T) * self.qm.view(1, 1, 1, self.head_dim))
+
+        # Repeat K and V across the query groups to match Q's head dimension 
+        # (This expands the KV heads to match the Q head count for flex_attention)
+        if self.num_queries_per_kv > 1:
+            k = k.repeat_interleave(self.num_queries_per_kv, dim=1)
+            v = v.repeat_interleave(self.num_queries_per_kv, dim=1)
+
+        # Execute block sparse flex attention
+        y = self.fattn(q, k, v, k_val)
+        
+        # Reshape back to original 3D sequence format
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
         

@@ -89,8 +89,9 @@ def get_random_baseline(env_name, total_steps=2000, eval_start=1000, num_actors=
     mean_reward_per_actor = rewards_history.mean(axis=0)
     overall_mean = mean_reward_per_actor.mean()
     overall_std = mean_reward_per_actor.std()
+    overall_max = mean_reward_per_actor.max()
     
-    return overall_mean, overall_std
+    return overall_mean, overall_std, overall_max
 def run_gym_task(brain, optimizer, device, batch_size, total_steps=2000, eval_start=1000, env_name="Pendulum-v1"):
     print(f"Initializing {batch_size} Agents on {device} for {env_name}...")
     
@@ -312,3 +313,25 @@ def visualize_gym_pygame(brain, sweep, fitness, env_name="Pendulum-v1", device="
             
     pygame.quit()
     env.close()
+
+
+def run_vis(TIME, ENVIRONMENT, brain, optimizer, sweep, device):
+    fitness, mean_dist, var_dist, agent_pos_hist, food_pos_hist, eval_start, brain = run_gym_task(
+        brain=brain,
+        optimizer=optimizer,
+        device=device,
+        batch_size=sweep.batch_size,
+        env_name=ENVIRONMENT,  
+        total_steps=TIME,
+        eval_start=1000
+    )
+    visualize_gym_pygame(
+        brain=brain,
+        sweep=sweep,
+        fitness=fitness,
+        env_name=ENVIRONMENT,
+        device=device,
+        max_steps=1500
+    )
+    
+    return fitness,mean_dist

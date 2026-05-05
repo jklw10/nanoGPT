@@ -560,45 +560,6 @@ class StandardNodeParams(nn.Module):
             self.speed = config.speed.view(-1, 1, 1, 1)
             self.width = config.width.view(-1, 1, 1, 1)
 
-class NodeParams2(nn.Module):
-    def __init__(self, batch_size, num_nodes, in_dim, out_dim, device):
-        super().__init__() 
-        self.in_dim = in_dim
-        self.out_dim = out_dim
-        self.device = device
-        
-        base_weight = torch.randn(batch_size, num_nodes, in_dim, out_dim, device=device) / math.sqrt(self.in_dim)
-        self.weight = nn.Parameter(base_weight)
-        
-        self.register_buffer('error_ema', 0.01 + 0.01 * torch.randn(batch_size, num_nodes, out_dim, device=device))
-        
-        self.untanh_slope = torch.tensor(1.0, device=device)
-        self.w_scale = torch.tensor(1.0, device=device)
-        self.ema_speed = torch.tensor(0.2, device=device)
-        self.rew_sens = torch.tensor(1.36, device=device)
-        self.n_scale = torch.tensor(0.0, device=device)
-        self.speed = torch.tensor(0.5, device=device)
-        self.width = torch.tensor(0.01, device=device)
-    def forward(self, x, step_counter):
-        norm_weight = F.normalize(self.weight, p=2, dim=-2) * self.w_scale
-        
-        raw_pred = torch.einsum('bnd,bnde->bne', x, norm_weight)
-        
-        bound = math.sqrt(2.0 + math.sqrt(2.0))
-        out = utils.buntanh(raw_pred, self.untanh_slope, bound)
-        
-        return out
-    
-    def apply_hyperparams(self, config):
-        self.untanh_slope = config.UNTANH.view(-1, 1, 1)
-        self.w_scale = config.w_scale.view(-1, 1, 1, 1)
-        
-        if hasattr(config, 'EMA_SPEED'):
-            self.ema_speed = config.EMA_SPEED.view(-1, 1, 1)
-            self.rew_sens = config.FIXED_REWARD_SENSITIVITY.view(-1, 1, 1, 1)
-            self.n_scale = config.NOISE_SCALE.view(-1, 1, 1)
-            self.speed = config.speed.view(-1, 1, 1, 1)
-            self.width = config.width.view(-1, 1, 1, 1)
 class StandardMultiHeadTriadNodeNet(nn.Module):
     """autograd compatible"""
     def __init__(self, batch_size, num_nodes, dim, device):
@@ -793,7 +754,130 @@ class StandardNodeNet(nn.Module):
 
         return total_loss
     
+
+class NodeParams2(nn.Module):
+    def __init__(self, batch_size, num_nodes, in_dim, out_dim, device):
+        super().__init__() 
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.device = device
+        
+        base_weight = torch.randn(batch_size, num_nodes, in_dim, out_dim, device=device) / math.sqrt(self.in_dim)
+        self.weight = nn.Parameter(base_weight)
+        
+        self.register_buffer('error_ema', 0.01 + 0.01 * torch.randn(batch_size, num_nodes, out_dim, device=device))
+        
+        self.untanh_slope = torch.tensor(1.0, device=device)
+        self.w_scale = torch.tensor(1.0, device=device)
+        self.ema_speed = torch.tensor(0.2, device=device)
+        self.rew_sens = torch.tensor(1.36, device=device)
+        self.n_scale = torch.tensor(0.0, device=device)
+        self.speed = torch.tensor(0.5, device=device)
+        self.width = torch.tensor(0.01, device=device)
+    def forward(self, x, step_counter):
+        norm_weight = F.normalize(self.weight, p=2, dim=-2) * self.w_scale
+        
+        raw_pred = torch.einsum('bnd,bnde->bne', x, norm_weight)
+        
+        bound = math.sqrt(2.0 + math.sqrt(2.0))
+        out = utils.buntanh(raw_pred, self.untanh_slope, bound)
+        
+        return out
     
+    def apply_hyperparams(self, config):
+        self.untanh_slope = config.UNTANH.view(-1, 1, 1)
+        self.w_scale = config.w_scale.view(-1, 1, 1, 1)
+        
+        if hasattr(config, 'EMA_SPEED'):
+            self.ema_speed = config.EMA_SPEED.view(-1, 1, 1)
+            self.rew_sens = config.FIXED_REWARD_SENSITIVITY.view(-1, 1, 1, 1)
+            self.n_scale = config.NOISE_SCALE.view(-1, 1, 1)
+            self.speed = config.speed.view(-1, 1, 1, 1)
+            self.width = config.width.view(-1, 1, 1, 1)  
+
+def s2route(router, num_nodes):
+    row_probs = torch.softmax(router, dim=-1) # Senders choosing receivers
+    col_probs = torch.softmax(router, dim=-2) # Receivers choosing senders
+
+    # Element-wise multiply. A route is only strong if BOTH sides agree!
+    route = row_probs * col_probs 
+
+    # Optional: Scale it so rows sum closer to 1
+    route = route / (route.sum(dim=-1, keepdim=True) + 1e-8)
+    return route, 0.0
+
+def lblroute(router, node_count):
+    route = torch.softmax(router, dim=-1)
+
+    # Calculate the fraction of total traffic each column is receiving
+    fraction_received = route.mean(dim=-2) # Shape: [B, N]
+
+    # We want each of the N columns to receive exactly 1/N of the traffic.
+    # The MoE load-balancing loss is the variance of the received fractions:
+    target_fraction = 1.0 / node_count
+    load_balance_loss = F.mse_loss(fraction_received, torch.full_like(fraction_received, target_fraction))
+    return route, load_balance_loss
+
+
+def sparsest_route_fail(router, node_count):
+    row_probs = torch.softmax(router, dim=-1) # Senders choosing receivers
+    col_probs = torch.softmax(router, dim=-2) # Receivers choosing senders
+    rs = router.shape
+    # Element-wise multiply. A route is only strong if BOTH sides agree!
+    probs = row_probs * col_probs 
+    probs = probs.reshape(rs[0],-1)
+    mask = quantizer.TopKHot.apply(probs, int(math.sqrt(node_count))*node_count)
+    route = mask * probs
+    route = route.reshape(rs)
+    #route = torch.softmax(route, dim=-1)
+    
+    
+    return route, 0.0
+
+def sparsest_route(router, node_count):
+    probs = torch.softmax(router, dim=-1) # Senders choosing receivers
+    #col_probs = torch.softmax(router, dim=-2) # Receivers choosing senders
+    
+    # Element-wise multiply. A route is only strong if BOTH sides agree!
+    #probs = row_probs * col_probs 
+    mask = quantizer.TopKHot.apply(router, int(math.sqrt(node_count)))
+    route = mask * probs
+    route = route / (route.sum(dim=-1, keepdim=True) + 1e-8)
+    #route = torch.softmax(route, dim=-1)
+    
+    
+    return route, 0.0
+
+def sparse_route(router, node_count):
+    # 1. Calculate continuous sparse routes (Top 4)
+    probs = torch.softmax(router, dim=-1)
+    mask = quantizer.TopKHot.apply(router, 4)#int(math.sqrt(node_count)))
+    sparse_probs = mask * probs
+    
+    # Re-normalize the sparse routes
+    sparse_probs = sparse_probs / (sparse_probs.sum(dim=-1, keepdim=True) + 1e-8)
+    
+    # 2. Calculate the "Flat" baseline
+    flat_probs = torch.ones_like(probs) / node_count
+    
+    # 3. The Sensory Leak: 80% Sparse, 20% Flat
+    route = (0.8 * sparse_probs) + (0.2 * flat_probs)
+    
+    return route, 0.0
+
+def sparse_route_broadcast(router, node_count):
+    # Softmax over DIM -2! (Senders pushing to receivers)
+    broadcast_probs = torch.softmax(router, dim=-2)
+    
+    # Top-K over dim=-2 (Each sender forces its signal to its K favorite receivers)
+    mask = quantizer.TopKHot.apply(broadcast_probs, 4)
+    sparse_broadcast = mask * broadcast_probs
+    
+    # Re-normalize over dim -1 so receivers maintain their magnitude!
+    route = sparse_broadcast / (sparse_broadcast.sum(dim=-1, keepdim=True) + 1e-8)
+    
+    return route, 0.0
+
 class StandardNodeNet2(nn.Module):
     def __init__(self, batch_size, num_nodes, dim, device):
         super().__init__()
@@ -808,11 +892,15 @@ class StandardNodeNet2(nn.Module):
         self.register_buffer('state', 1e-5 * torch.randn(batch_size, self.N, dim, device=device))
         self.register_buffer('output', 1e-5 * torch.randn(batch_size, self.N, dim, device=device))
 
-        self.current_input_nodes = 0
+        self.register_buffer('error_ema', torch.ones(batch_size, self.N, device=device))
+        self.register_buffer('lp_ema', torch.zeros(batch_size, self.N, device=device))
+
         self.register_buffer('step_counter', torch.tensor(0.0, device=device))
         
+        self.current_input_nodes = 0
         self.c_moment = 0.8
         self.a_variance = 0.0026
+        self.lp_alpha = 0.1 
 
     def apply_hyperparams(self, config):
         if hasattr(config, 'c_moment'):
@@ -826,31 +914,38 @@ class StandardNodeNet2(nn.Module):
         self.step_counter.add_(1.0)
         batch_size, input_dim = env_input.shape
 
-        wnll = self.wnll(self.state) 
+        #wnll = self.wnll(self.state.detach()) 
+        #boredom_scale = (1-wnll.detach()) / 2.0 
         
-        boredom_scale = (1-wnll.detach()) / 2.0 
-
         num_input_nodes = math.ceil(input_dim / self.D)
         
         prediction = self.w1(self.state, self.step_counter) 
         router = self.router(self.state, self.step_counter)
-        router = utils.rms_norm(router, dim=[-1]) 
+        #router = utils.rms_norm(router, dim=[-1]) 
         
-        DS_route = utils.sinkhorn_knopp(router)
-        sparse_route = quantizer.ThresHot.apply(DS_route)
-        route = utils.sinkhorn_knopp(sparse_route) 
+        #route = l2route(router)
+
+        #bias routes to self based on learning progress?
+        curiosity_bias = F.relu(self.lp_ema).unsqueeze(1) * 5.0 
+        route_logits=router+curiosity_bias
+        route, aux = sparse_route(route_logits, self.N)
+
+        #DS_route = utils.sinkhorn_knopp(router)
+        #sparse_route = quantizer.ThresHot.apply(DS_route)
+        #route = utils.sinkhorn_knopp(sparse_route) 
         
         current_var = route.var(dim=[-1], keepdim=True)
         vd = F.relu(self.a_variance - current_var)
         
         V = self.output
-        
         base_noise = torch.sqrt(vd) * torch.randn_like(V)
+        
+        boredom_scale = torch.exp(-50.0 * F.relu(self.lp_ema)).unsqueeze(-1) 
         boredom_noise = base_noise * boredom_scale
         
-        V = V + boredom_noise
+        #V = V + boredom_noise
         
-        target = torch.matmul(route, V) 
+        target = torch.matmul(route, V) + boredom_noise
         target = utils.softsign(target)
 
         pad_len = num_input_nodes * self.D - input_dim
@@ -868,8 +963,22 @@ class StandardNodeNet2(nn.Module):
 
         loss_w1 = F.mse_loss(prediction, target, reduction='none')
 
-        total_loss = (loss_w1).sum() + wnll.sum()
+        with torch.no_grad():
+            current_error = loss_w1.mean(dim=-1).detach()
+            
+            current_lp = self.error_ema - current_error
+            
+            self.error_ema = self.error_ema * (1.0 - self.lp_alpha) + current_error * self.lp_alpha
+            self.lp_ema = self.lp_ema * (1.0 - self.lp_alpha) + current_lp * self.lp_alpha
+
+        total_loss = (loss_w1).sum() + aux #+ wnll.sum()
         
+        boredom_scale = torch.exp(-50.0 * torch.relu(self.lp_ema)).unsqueeze(-1) 
+        errm = torch.sqrt(boredom_scale)*0.01
+        #errm = torch.sqrt(self.error_ema.unsqueeze(-1))*0.01
+        error_pass = torch.randn_like(target)*errm
+        target = target + error_pass
+
         self.output = prediction.detach()
         self.state = target.detach()
 
@@ -934,11 +1043,15 @@ class MemNodeNet(nn.Module):
         self.register_buffer('state', 1e-5 * torch.randn(batch_size, self.N, dim, device=device))
         self.register_buffer('output', 1e-5 * torch.randn(batch_size, self.N, dim, device=device))
 
+        self.register_buffer('error_ema', torch.ones(batch_size, self.N, device=device))
+        self.register_buffer('lp_ema', torch.zeros(batch_size, self.N, device=device))
+
         self.current_input_nodes = 0
         self.register_buffer('step_counter', torch.tensor(0.0, device=device))
         
         self.c_moment = 0.8
         self.a_variance = 0.0026
+        self.lp_alpha = 0.1 
 
     def apply_hyperparams(self, config):
         if hasattr(config, 'c_moment'):
@@ -952,8 +1065,6 @@ class MemNodeNet(nn.Module):
         self.step_counter.add_(1.0)
         batch_size, input_dim = env_input.shape
 
-        wnll = self.wnll(self.state) 
-        boredom_scale = (1-wnll.detach()) / 2.0 
 
         num_input_nodes = math.ceil(input_dim / self.D)
         
@@ -963,17 +1074,26 @@ class MemNodeNet(nn.Module):
         
         prediction = self.w1(state_aug, self.step_counter) 
         router = self.router(state_aug, self.step_counter)
-        router = utils.rms_norm(router, dim=[-1]) 
         
-        DS_route = utils.sinkhorn_knopp(router)
-        
-        sparse_route = quantizer.ThresHot.apply(DS_route) 
-        route = utils.sinkhorn_knopp(sparse_route) 
+        #route = l2route(router)
+
+        curiosity_bias = F.relu(self.lp_ema).unsqueeze(1) * 5.0 
+        route, aux = sparse_route(router+curiosity_bias,self.N)
+
+        #router = utils.rms_norm(router, dim=[-1]) 
+        #DS_route = utils.sinkhorn_knopp(router)
+        #sparse_route = quantizer.ThresHot.apply(DS_route) 
+        #route = utils.sinkhorn_knopp(sparse_route) 
         
         current_var = route.var(dim=[-1], keepdim=True)
         vd = F.relu(self.a_variance - current_var)
         
         V = self.output
+        
+        wnll = self.wnll(self.state) 
+        #boredom_scale = (1-wnll.detach()) / 2.0 
+        boredom_scale = torch.exp(-50.0 * F.relu(self.lp_ema)).unsqueeze(-1) 
+
         base_noise = torch.sqrt(vd) * torch.randn_like(V)
         boredom_noise = base_noise * boredom_scale
         V = V + boredom_noise
@@ -1005,8 +1125,129 @@ class MemNodeNet(nn.Module):
         
         loss_mint = (loss_validation * write_mask).sum()
 
-        total_loss = loss_w1.sum() + wnll.sum() + loss_future.sum() + loss_mint
         
+        with torch.no_grad():
+            current_error = loss_w1.mean(dim=-1).detach()
+            
+            current_lp = self.error_ema - current_error
+            
+            self.error_ema = self.error_ema * (1.0 - self.lp_alpha) + current_error * self.lp_alpha
+            self.lp_ema = self.lp_ema * (1.0 - self.lp_alpha) + current_lp * self.lp_alpha
+
+
+        total_loss = loss_w1.sum() + wnll.sum() + loss_future.sum() + loss_mint + aux
+        
+        self.output = prediction.detach()
+        self.state = target.detach()
+
+        return total_loss
+    
+
+class SwarmNodeNet(nn.Module):
+    def __init__(self, batch_size, num_nodes, dim, device):
+        super().__init__()
+        self.N = num_nodes
+        self.D = dim
+        self.device = device
+        
+        self.total_nodes = batch_size * num_nodes 
+        self.w1 = NodeParams2(batch_size, num_nodes, dim, dim, device)
+        
+        self.router = NodeParams2(batch_size, num_nodes, dim, self.total_nodes, device)
+        
+        # Assuming wnll is available in your utils
+        # self.wnll = utils.wnormlearnloss(dim)
+        
+        self.register_buffer('state', 1e-5 * torch.randn(batch_size, self.N, dim, device=device))
+        self.register_buffer('output', 1e-5 * torch.randn(batch_size, self.N, dim, device=device))
+
+        self.register_buffer('error_ema', torch.ones(batch_size, self.N, device=device))
+        self.register_buffer('lp_ema', torch.zeros(batch_size, self.N, device=device))
+
+        self.register_buffer('step_counter', torch.tensor(0.0, device=device))
+        
+        self.current_input_nodes = 0
+        self.c_moment = 0.8
+        self.a_variance = 0.0026
+        self.lp_alpha = 0.1 
+
+    def apply_hyperparams(self, config):
+        if hasattr(config, 'c_moment'):
+            self.c_moment = config.c_moment.view(-1, 1, 1, 1)
+        if hasattr(config, 'a_variance'):
+            self.a_variance = config.a_variance.view(-1, 1, 1)
+            
+        self.w1.apply_hyperparams(config)
+
+    def forward(self, env_input):
+        self.step_counter.add_(1.0)
+        batch_size, input_dim = env_input.shape
+
+        num_input_nodes = math.ceil(input_dim / self.D)
+        
+        prediction = self.w1(self.state, self.step_counter) 
+        router = self.router(self.state, self.step_counter)
+        
+        # --- SWARM MODIFICATION ---
+        # Bias routes to nodes based on their global learning progress
+        # lp_ema is [batch_size, num_nodes]. We flatten it to [total_nodes] 
+        global_lp_ema = self.lp_ema.view(self.total_nodes)
+        curiosity_bias = F.relu(global_lp_ema).view(1, 1, self.total_nodes) * 5.0 
+        
+        route_logits = router + curiosity_bias
+        route, aux = sparse_route(route_logits, self.total_nodes)
+        
+        current_var = route.var(dim=[-1], keepdim=True)
+        vd = F.relu(self.a_variance - current_var)
+        
+        # --- SWARM MODIFICATION ---
+        # V represents ALL nodes everywhere. Shape: [total_nodes, dim]
+        V_global = self.output.view(self.total_nodes, self.D)
+        
+        base_noise = torch.sqrt(vd) * torch.randn_like(self.output)
+        
+        boredom_scale = torch.exp(-50.0 * F.relu(self.lp_ema)).unsqueeze(-1) 
+        boredom_noise = base_noise * boredom_scale
+        
+        # matmul auto-broadcasts: 
+        # route [B, N, total_nodes] @ V_global [total_nodes, dim] -> Result [B, N, dim]
+        target = torch.matmul(route, V_global) + boredom_noise
+        
+        # Ensure utils is imported properly in your script
+        target = utils.softsign(target)
+
+        pad_len = num_input_nodes * self.D - input_dim
+        if pad_len > 0:
+            env_input_padded = F.pad(env_input, (0, pad_len))
+        else:
+            env_input_padded = env_input
+            
+        env_input_reshaped = env_input_padded.view(batch_size, num_input_nodes, self.D)
+        
+        if num_input_nodes < self.N:
+            target = torch.cat([env_input_reshaped, target[:, num_input_nodes:, :]], dim=1)
+        else:
+            target = env_input_reshaped
+
+        loss_w1 = F.mse_loss(prediction, target, reduction='none')
+
+        with torch.no_grad():
+            current_error = loss_w1.mean(dim=-1).detach()
+            
+            current_lp = self.error_ema - current_error
+            
+            self.error_ema = self.error_ema * (1.0 - self.lp_alpha) + current_error * self.lp_alpha
+            self.lp_ema = self.lp_ema * (1.0 - self.lp_alpha) + current_lp * self.lp_alpha
+
+        total_loss = (loss_w1).sum() + aux #+ wnll.sum()
+        
+        
+        boredom_scale = torch.exp(-50.0 * torch.relu(self.lp_ema)).unsqueeze(-1) 
+        errm = torch.sqrt(boredom_scale)*0.01
+        #errm = torch.sqrt(self.error_ema.unsqueeze(-1))*0.01
+        error_pass = torch.randn_like(target)*errm
+        target = target + error_pass
+
         self.output = prediction.detach()
         self.state = target.detach()
 

@@ -100,3 +100,17 @@ def run_tracking_task(brain, optimizer, device, batch_size, total_steps = 2000, 
     var_dist = dist_history.var(dim=0).cpu()
     fitness = torch.exp(-(mean_dist + var_dist))
     return fitness, mean_dist, var_dist, agent_pos_history, food_pos_history, eval_start, brain
+
+
+def run_vis(TIME, ENVIRONMENT, brain, optimizer, sweep, device):
+    fitness, mean_dist, var_dist, agent_pos_hist, food_pos_hist, eval_start, brain = run_tracking_task(
+        brain=brain,
+        optimizer=optimizer,
+        device=device,
+        batch_size=sweep.batch_size,
+        total_steps=TIME,
+        eval_start=1000
+    )
+    
+    visualize_best(sweep,fitness,mean_dist,var_dist,agent_pos_hist, food_pos_hist,eval_start)
+    return fitness, mean_dist

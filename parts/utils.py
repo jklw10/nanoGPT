@@ -1016,11 +1016,11 @@ class wnormlearnloss(nn.Module):
         super().__init__()
               
         self.head = nn.Sequential(
-                wn(nn.Linear(embed, embed*2),dim=None),
+                wn(nn.Linear(embed, embed*2, bias=False),dim=None),
                 nn.GELU(),
                 #wn(nn.Linear(config.n_embd*2, config.n_embd*2),dim=None),
                 #nn.GELU(),
-                wn(nn.Linear(embed*2, 1))
+                wn(nn.Linear(embed*2, 1, bias=False))
             )
 
     def forward(self, x):

@@ -44,6 +44,7 @@ qrot            = False
 diffac          = False
 rms_lnorm       = False
 #good in owt
+OU_proj         = False
 emb_OU_noise    = False
 emb_norm        = False
 wnHead          = False #
@@ -57,7 +58,7 @@ v_patt          = False
 v_patt_2        = False
 hcnvc           = False
 hcnHead         = False
-asdf            = True
+testing_mlp     = False
 
 #good in ssm
 posembless      = False
@@ -98,7 +99,8 @@ nmix            = False
 losspred        = False
 
 dynskip         = False
-k_atten         = False
+k_atten         = True
+h_k_atten       = False
 p_atten         = False
 sprs            = False
 wnll            = False
@@ -295,7 +297,7 @@ class MLP(nn.Module):
         #self.dac = utils.Psinrelu(config.n_embd*4)
 
     def forward(self, x):
-        if asdf:
+        if testing_mlp:
             return self.univ(x)
         if pattmlp:
             return (self.thing(x))
@@ -336,7 +338,9 @@ class Block(nn.Module):
         if(qrottention):
             self.attn = modules.SSM(config.n_embd,config.dropout,config.bias)
         elif k_atten:
-            self.attn = modules.Kattention(config)
+            self.attn = modules.FKattention(config)
+        elif h_k_atten:
+            self.attn = modules.HydraKattention(config)
         elif p_atten:
             self.attn = modules.Pattention(config,64)
         if residcomp:
@@ -515,11 +519,11 @@ class GPT(nn.Module):
         for pn, module in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(module, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
-        
-        init_proj = torch.randn(self.n_embd, self.n_embd) / math.sqrt(self.n_embd)
-        self.register_buffer('ou_proj', init_proj)
-        self.ema_alpha = 0.99999       
-        self.proj_strength  = 0.9   
+        if OU_proj:
+            init_proj = torch.randn(self.n_embd, self.n_embd) / math.sqrt(self.n_embd)
+            self.register_buffer('ou_proj', init_proj)
+            self.ema_alpha = 0.99999       
+            self.proj_strength  = 0.9   
         
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
@@ -535,20 +539,21 @@ class GPT(nn.Module):
         
         tok_emb = self.transformer.wte(idx)
 
-        if self.training:
-            fresh_proj = torch.randn(self.n_embd, self.n_embd, device=idx.device) / math.sqrt(self.n_embd)
-            
-            with torch.no_grad():
-                self.ou_proj.copy_(
-                    self.ema_alpha * self.ou_proj + 
-                    math.sqrt(1.0 - self.ema_alpha**2) * fresh_proj
-                )
-            
-            
-            #tok_emb =  (tok_emb @ self.ou_proj)
-        
-            scale = math.sqrt(1.0 - self.proj_strength **2)
-            tok_emb = scale * tok_emb + self.proj_strength  * (tok_emb @ self.ou_proj)
+        if OU_proj:
+            if self.training:
+                fresh_proj = torch.randn(self.n_embd, self.n_embd, device=idx.device) / math.sqrt(self.n_embd)
+
+                with torch.no_grad():
+                    self.ou_proj.copy_(
+                        self.ema_alpha * self.ou_proj + 
+                        math.sqrt(1.0 - self.ema_alpha**2) * fresh_proj
+                    )
+
+
+                #tok_emb =  (tok_emb @ self.ou_proj)
+
+                scale = math.sqrt(1.0 - self.proj_strength **2)
+                tok_emb = scale * tok_emb + self.proj_strength  * (tok_emb @ self.ou_proj)
         
         pos_emb = None
         if exposemb:

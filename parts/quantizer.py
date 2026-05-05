@@ -172,7 +172,33 @@ class DiscreteLookupFunction(torch.autograd.Function):
         grad_x = grad_x.view(B, T, H)
 
         return grad_x, grad_W
-    
+
+
+class TopKHotSM(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x,  k):
+        _, indices = torch.topk(x, k=k, dim=-1)
+        k_hot = torch.zeros_like(x).scatter_(-1, indices, 1.0)
+        
+        ctx.save_for_backward(x)
+        ctx.k = k
+        return k_hot
+
+    @staticmethod
+    def backward(ctx, g):
+        x, = ctx.saved_tensors
+        k = ctx.k
+
+        with torch.no_grad():
+            topk_vals, topk_indices = torch.topk(-g, k=k, dim=-1)
+
+            soft_weights = F.softmax(topk_vals, dim=-1)
+
+            soft_target = torch.zeros_like(x).scatter_(-1, topk_indices, soft_weights)
+
+        grad_x = F.softmax(x, dim=-1) - soft_target
+        return grad_x,  None
+
 class TopKHot(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x,  k):
@@ -191,6 +217,39 @@ class TopKHot(torch.autograd.Function):
             hard_target = torch.zeros_like(x).scatter_(-1, topk_indices, 1.0)
         grad_x = F.sigmoid(x) - hard_target
         return grad_x,  None
+
+
+class vmapTopKHot(torch.autograd.Function):
+    # Enable automatic vmap tracing so flex_attention can trace through it
+    generate_vmap_rule = True 
+
+    @staticmethod
+    def forward(x, k):
+        # 1. forward() does NOT accept `ctx` anymore
+        _, indices = torch.topk(x, k=k, dim=-1)
+        k_hot = torch.zeros_like(x).scatter_(-1, indices, 1.0)
+        return k_hot, x.view_as(x)
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        # 2. setup_context moves tensors and arguments into ctx
+        x, k = inputs
+        k_hot, x = output  # Unpack what we returned in forward()
+        
+        ctx.save_for_backward(x)
+        ctx.k = k
+
+    @staticmethod
+    def backward(ctx, g):
+        x, = ctx.saved_tensors
+        k = ctx.k
+        with torch.no_grad():
+            _, topk_indices = torch.topk(-g, k=k, dim=-1)
+            hard_target = torch.zeros_like(x).scatter_(-1, topk_indices, 1.0)
+            
+        # Using sigmoid for backward propagation (Straight-Through Estimation)
+        grad_x = torch.sigmoid(x) - hard_target
+        return grad_x, None
 
 class ThresHot(torch.autograd.Function):
     @staticmethod
