@@ -218,6 +218,12 @@ class TopKHot(torch.autograd.Function):
         grad_x = F.sigmoid(x) - hard_target
         return grad_x,  None
 
+def topkhotSTE(x,k):
+    probs = F.sigmoid(x)
+    _, indices = torch.topk(x, k=k, dim=-1)
+    hard_target = torch.zeros_like(x).scatter_(-1, indices, 1.0)
+
+    return hard_target + probs - probs.detach()
 
 class vmapTopKHot(torch.autograd.Function):
     # Enable automatic vmap tracing so flex_attention can trace through it

@@ -99,7 +99,7 @@ nmix            = False
 losspred        = False
 
 dynskip         = False
-k_atten         = True
+k_atten         = False
 h_k_atten       = False
 p_atten         = False
 sprs            = False
@@ -112,6 +112,7 @@ exposemb        = False
 
 residless       = False
 
+Non_causal      = True
 
 residcomp       = False
 mhc_lr          = 0.01
@@ -586,7 +587,7 @@ class GPT(nn.Module):
         
         
         for i, block in enumerate(self.transformer.h):
-            x = block(x) 
+            x = block(x, not Non_causal) 
         if isinstance(x,tuple):
             x = x[0]
         wnl = 0
@@ -598,7 +599,7 @@ class GPT(nn.Module):
         if targets is not None:
             logits = None# self.lm_head(x)
             reduce = 'mean'
-            if wnll:
+            if wnll or Non_causal:
                 reduce = 'none'
             if CCE:
                 loss = linear_cross_entropy(x.to(torch.bfloat16), 
@@ -614,7 +615,8 @@ class GPT(nn.Module):
             
             
             if self.training:
-                
+                if Non_causal:
+                    loss = loss[:,-1].mean()
                 if spl:
                     loss = loss+ self.transformer.h[0].spl(x)
                 if wnll:
@@ -624,7 +626,7 @@ class GPT(nn.Module):
                 if losspred:
                     loss = (loss + F.mse_loss(self.botl(self.lpb(x)).squeeze(-1), loss.detach()))/2.0
             else:
-                if wnll:
+                if wnll or Non_causal:
                     loss = loss.mean()
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position

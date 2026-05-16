@@ -51,12 +51,14 @@ memcheat    = False
 wnorm       = False
 genloss     = True
 resid       = True
-ael         = False
+ael         = True
 cce         = True
 winit       = True
 emb_wn      = False
-pattlin     = False
+pattlin     = True
 wnll        = True
+patt_AE     = True
+pattcount   = 256
 #todo, wnorm, midreset, lr on memory, memswizzle,
 #ablate hierarchy, add innerblocks, make hierarchical output generation
 
@@ -94,16 +96,19 @@ class Patcher(nn.Module):
         self.up_scan = modules.Block(outer_dim,4,0.0,False)
         self.up_proj = Linear(outer_dim, inner_dim, bias=False)
         if pattlin:
-            self.up_proj = modules.PattLayer(outer_dim, inner_dim, 4096)
+            self.up_proj = modules.PattLayer(outer_dim, inner_dim, pattcount)
         #self.up_proj = modules.Pattention(outer_dim,inner_dim,256)
         self.AE = modules.Autoencoder(
             inner_dim,inner_dim,inner_dim,inner_dim,
             quantizer.ThresHot.apply
             )
         
+        if patt_AE:
+            self.AE  = modules.PattLayer(inner_dim, inner_dim, pattcount)
+
         self.resid_up = Linear(outer_dim,inner_dim,bias= False)
         if pattlin:
-            self.resid_up = modules.PattLayer(outer_dim, inner_dim, 4096)
+            self.resid_up = modules.PattLayer(outer_dim, inner_dim, pattcount)
         self.resid_drop = nn.Dropout(dropout)
         self.down_drop = nn.Dropout(dropout)
         self.output_pos_emb = nn.Embedding(outer_seq, inner_dim)
@@ -113,7 +118,7 @@ class Patcher(nn.Module):
         self.down_scatter2 = modules.CombineBlock(outer_dim, 4, 0.0,False)
         self.down_proj = Linear(inner_dim,outer_dim,bias=False)
         if pattlin:
-            self.down_proj = modules.PattLayer(inner_dim, outer_dim, 256)
+            self.down_proj = modules.PattLayer(inner_dim, outer_dim, pattcount)
         #self.down_proj = modules.Pattention(inner_dim,outer_dim,256)
         self.down_scan = modules.Block(outer_dim,4,0.0,False)
         
@@ -151,14 +156,14 @@ class Patcher(nn.Module):
         gate = self.up_gate(gathered).squeeze(-1)
         gate = self.gate_norm(gate)
         gathered = utils.rms_norm(gathered)
-        gathered, _ = gather.RLMAXgbg3.apply(
+        gathered, _ = gather.RLMAXgbg4.apply(
             gate, 
             gathered, 
             self.inner_seq,
-            1.0,
+            0.1,
             #False,
             self.training,
-            #0.3
+            0.3
             )
         #noise =torch.randn_like(gathered,requires_grad=True)/(1.0+gathered.sum()) 
         #gsink = 
@@ -180,17 +185,23 @@ class Patcher(nn.Module):
         hot= None
         aux= 0.0
         if ael:
-            ae_up, hot = self.AE(up)
+            if patt_AE:
+                ae_up = self.AE(up)
+            else:
+                ae_up, hot = self.AE(up)
             aux = F.mse_loss(up, ae_up)
             up = ae_up
-        return up, [x, hot, gate, aux]
+        return up, [x, ae_up, hot, gate, aux]
     
     def abstract_down(self, x, residual, decaying =  None, conf=None):
-        residual, hot, gate, upaux = residual
+        residual, up, hot, gate, upaux = residual
         aux=0
         x = self.down_norm(x)
         if ael:
-            aux = F.binary_cross_entropy(self.AE.quant(x)[:,:-1,:], hot.detach()[:,1:,:])#ablate
+            if patt_AE:
+                aux = F.mse_loss(self.AE(x)[:,:-1,:], up[:,1:,:].detach())
+            else:
+                aux = F.binary_cross_entropy(self.AE.quant(x)[:,:-1,:], hot.detach()[:,1:,:])#ablate
         
         pos = torch.arange(0, self.outer_seq, dtype=torch.long, device=device) 
        

@@ -96,8 +96,6 @@ def run_validation(model, val_loader, device, num_batches=10, input_dim=28*28):
     model.train()
     return avg_loss, avg_perplexity, avg_k, avg_k_perplexity
 
-
-
 def whiteloss( x, y):
     w = utils.zca_newton_schulz(torch.cat((x,y),dim=0))
     #x,y = torch.chunk(w,2,dim=0)
@@ -120,7 +118,12 @@ class debugAutoencoder(nn.Module):
             Linear(input, hidden), 
             ac, 
             nn.Linear(hidden, qdim))
-        self.quantizer = Hotmod(quantizer, k)
+        
+        if 'forward' in inspect.signature(quantizer).parameters:
+            self.quantizer = Hotmod(quantizer, k)
+        else:
+            self.quantizer = quantizer
+
         self.codebook = nn.Linear(self.qdim, embed, bias=False)
         self.decoder = nn.Sequential(
             Linear(embed, hidden), 
@@ -192,8 +195,9 @@ def quantizer_run():
     models = {
         #"bthot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, BoltzmannThresHot, nn.LeakyReLU, 32),
         #"btkhot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, BoltzmannTopKHot, nn.LeakyReLU, 32),
-        #"tkhot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, TopKHot, nn.LeakyReLU, 32),
-        "thot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, quantizer.ThresHot, acmod(utils.dead_rat_relu), 32),
+        "tkhot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, quantizer.TopKHot, nn.LeakyReLU, 32),
+        "tkhot 2":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, quantizer.topkhotSTE, nn.LeakyReLU, 32),
+        #"thot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, quantizer.ThresHot, acmod(utils.dead_rat_relu), 32),
     }
     
     print("Compiling models...")
