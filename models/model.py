@@ -103,7 +103,7 @@ k_atten         = False
 h_k_atten       = False
 p_atten         = False
 sprs            = False
-wnll            = False
+wnll            = True
 
 csbr            = False
 
@@ -587,7 +587,11 @@ class GPT(nn.Module):
         
         
         for i, block in enumerate(self.transformer.h):
-            x = block(x, not Non_causal) 
+            if self.training:
+                x = block(x,not Non_causal) 
+            else:
+                x = block(x) 
+
         if isinstance(x,tuple):
             x = x[0]
         wnl = 0
@@ -615,8 +619,8 @@ class GPT(nn.Module):
             
             
             if self.training:
-                if Non_causal:
-                    loss = loss[:,-1].mean()
+                if Non_causal and not wnll:
+                    loss = loss.reshape(-1, logits.shape[-1])[:,-1].contiguous().mean()
                 if spl:
                     loss = loss+ self.transformer.h[0].spl(x)
                 if wnll:

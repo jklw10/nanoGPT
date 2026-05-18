@@ -127,6 +127,6 @@ def gym(model_class,run_vis, time = 3000, environment = None):
 if __name__ == "__main__":
     ENVIRONMENT = "MiniGrid-DoorKey-8x8-v0"
     model_class = nodenet.StandardNodeNet2
-    #gym(model_class, f8rv)
-    gym(model_class,run_vis,environment=ENVIRONMENT)
+    gym(model_class, f8rv)
+    #gym(model_class,run_vis,environment=ENVIRONMENT)
     ##figure8()

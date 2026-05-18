@@ -863,7 +863,7 @@ def sparse_route(router, node_count):
     # 3. The Sensory Leak: 80% Sparse, 20% Flat
     route = (0.8 * sparse_probs) + (0.2 * flat_probs)
     
-    return route, 0.0
+    return route, 0.0, mask
 
 def sparse_route_broadcast(router, node_count):
     # Softmax over DIM -2! (Senders pushing to receivers)
@@ -928,7 +928,7 @@ class StandardNodeNet2(nn.Module):
         #bias routes to self based on learning progress?
         curiosity_bias = F.relu(self.lp_ema).unsqueeze(1) * 5.0 
         route_logits=router+curiosity_bias
-        route, aux = sparse_route(route_logits, self.N)
+        route, aux, mask = sparse_route(route_logits, self.N)
 
         #DS_route = utils.sinkhorn_knopp(router)
         #sparse_route = quantizer.ThresHot.apply(DS_route)
@@ -945,6 +945,7 @@ class StandardNodeNet2(nn.Module):
         
         #V = V + boredom_noise
         
+        
         target = torch.matmul(route, V) + boredom_noise
         target = utils.softsign(target)
 
@@ -957,6 +958,7 @@ class StandardNodeNet2(nn.Module):
         env_input_reshaped = env_input_padded.view(batch_size, num_input_nodes, self.D)
         
         if num_input_nodes < self.N:
+            #todo check for correctness.
             target = torch.cat([env_input_reshaped, target[:, num_input_nodes:, :]], dim=1)
         else:
             target = env_input_reshaped
