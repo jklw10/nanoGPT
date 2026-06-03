@@ -5,10 +5,10 @@ import numpy as np
 
 import copy
 from models import nodenet
-from environments.figure8 import run_vis as f8rv
+from environments.figure8 import run_vis as f8_rv
 from training_tools.sweep import Sweep2D
-from environments.gym_runner import run_vis, get_random_baseline
-
+from environments.gym_env import run_vis as gym_rv, get_random_baseline
+from environments.text_env import run_vis as text_rv
 torch.set_float32_matmul_precision('high')
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Hardware: {DEVICE}")
@@ -45,23 +45,32 @@ def duplicate_best_initialization(model, best_idx, batch_size):
                 
     return new_model
 
-def gym(model_class,run_vis, time = 3000, environment = None):
+def gym(model_class, run_vis, time = 3000, environment = None, sample_random=False, do_sweep=True):
     optimizer = "adam"
     if optimizer is None:
         torch.set_grad_enabled(False)
     print(f"Executing on: {DEVICE}")
-    xswp = np.linspace(0.5, 0.9, 8)
-    yswp = np.linspace(0.6, 0.8, 8)
+    if do_sweep:
+        
+        xswp = np.linspace(0.4, 0.9, 8)
+        yswp = np.linspace(0.1, 0.9, 8)
+    else:
+        default_x = nodenet.defaults.get('UNTANH', 0.7)
+        default_y = nodenet.defaults.get('sprs', 0.5)
+        xswp = np.linspace(default_x, default_x, 8)
+        yswp = np.linspace(default_y, default_y, 8)
+
     sweep = Sweep2D(
         param_x_name='UNTANH', param_x_vals=xswp,
-        param_y_name='w_scale', param_y_vals=yswp,
+        param_y_name='sprs', param_y_vals=yswp,
         device=DEVICE
     )
+        
     
     config = sweep.get_config(nodenet.defaults, nodenet.param_space)
     
     torch.manual_seed(42) # Swap with NodeNet, TriadNodeNet, etc
-    constructor = get_model_constructor(model_class, config, num_nodes=16, dim=16,device =DEVICE)
+    constructor = get_model_constructor(model_class, config, num_nodes=64, dim=64, device =DEVICE)
     brain = constructor(batch_size=sweep.batch_size).to(DEVICE)
     brain = torch.compile(brain)
 
@@ -79,8 +88,8 @@ def gym(model_class,run_vis, time = 3000, environment = None):
     
     brain2 = duplicate_best_initialization(initial_snapshots, best_idx, sweep.batch_size)
     
-    ideal_x  = xswp[best_idx%8]
-    ideal_y  = xswp[best_idx//8]
+    ideal_x  = xswp[best_idx%len(xswp)]
+    ideal_y  = yswp[best_idx//len(xswp)]
     
     sweep2 = Sweep2D(
         param_x_name='UNTANH',  param_x_vals = [ideal_x for _ in range(0,8)],
@@ -103,7 +112,7 @@ def gym(model_class,run_vis, time = 3000, environment = None):
     torch.manual_seed(42)
     
     fitness2, mean_dist2 = run_vis(time, environment, brain2, optimizer2, sweep, device=DEVICE)
-    if environment is not None:
+    if sample_random:
         rand_mean, rand_std, rand_max = get_random_baseline(
             env_name=environment, 
             total_steps=time, 
@@ -126,7 +135,10 @@ def gym(model_class,run_vis, time = 3000, environment = None):
 
 if __name__ == "__main__":
     ENVIRONMENT = "MiniGrid-DoorKey-8x8-v0"
-    model_class = nodenet.StandardNodeNet2
-    gym(model_class, f8rv)
-    #gym(model_class,run_vis,environment=ENVIRONMENT)
+    dataset = "openwebtext" 
+    model_class = nodenet.StandardNodeNet3
+    #gym(model_class, f8_rv)
+    #gym(model_class, gym_rv, environment=ENVIRONMENT,time = 1000, sample_random=True)
+    
+    gym(model_class, text_rv, environment=dataset, time=10000, do_sweep=True)
     ##figure8()

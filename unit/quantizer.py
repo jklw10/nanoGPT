@@ -11,23 +11,35 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, random_split
 
 from parts import quantizer
-import parts.modules as modules
-import parts.optim as optim
 import parts.utils as utils
 
 class Hotmod(nn.Module):
     def __init__(self, hotfunc, k=None):
         super().__init__()
         self.hotfunc = hotfunc
-        params = inspect.signature(self.hotfunc.forward).parameters
-        self._needs_k = 'k' in params
         self.k = k
+        
+        # Check if it's a custom torch.autograd.Function class
+        if isinstance(self.hotfunc, type) and issubclass(self.hotfunc, torch.autograd.Function):
+            self.is_autograd = True
+            params = inspect.signature(self.hotfunc.forward).parameters
+        else:
+            self.is_autograd = False
+            # Fall back to checking if it's an nn.Module or standard python function
+            if hasattr(self.hotfunc, 'forward'):
+                params = inspect.signature(self.hotfunc.forward).parameters
+            else:
+                params = inspect.signature(self.hotfunc).parameters
+                
+        self._needs_k = 'k' in params
 
     def forward(self, x):
+        # Autograd Functions require .apply, standard functions don't
+        func = self.hotfunc.apply if self.is_autograd else self.hotfunc
         
         if self._needs_k:
-            return self.hotfunc.apply(x, self.k)
-        return self.hotfunc.apply(x)
+            return func(x, self.k)
+        return func(x)
 
 def acmod(ac):
     class Mod(nn.Module):
@@ -102,6 +114,7 @@ def whiteloss( x, y):
     x_w, y_w = w.split(x.size(0), dim=0)
     return utils.minmaxnorm(F.mse_loss(x_w , y_w,reduction="none")).sum()
 Linear = nn.Linear
+
 class debugAutoencoder(nn.Module):
     def __init__(self, input, hidden, embed, qdim, quantizer, Act , k = None):
         super().__init__()
@@ -119,10 +132,7 @@ class debugAutoencoder(nn.Module):
             ac, 
             nn.Linear(hidden, qdim))
         
-        if 'forward' in inspect.signature(quantizer).parameters:
-            self.quantizer = Hotmod(quantizer, k)
-        else:
-            self.quantizer = quantizer
+        self.quantizer = Hotmod(quantizer, k)
 
         self.codebook = nn.Linear(self.qdim, embed, bias=False)
         self.decoder = nn.Sequential(
@@ -159,14 +169,14 @@ class debugAutoencoder(nn.Module):
     def optimizer(self, LR):
         num_ae = sum(p.numel() for p in self.parameters())
         print(f"ae parameters: {num_ae}")
-        return optim.Grms(params=self.parameters(), 
-            lr=LR, 
-            #nesterov    = True, 
-            #momentum    = 0.9,
-            fused       = True,
-            #weight_decay= 0.01
-            )
-        #return torch.optim.adamw(params=self.parameters(), lr=LR, fused=True)
+        #return optim.Grms(params=self.parameters(), 
+        #    lr=LR, 
+        #    #nesterov    = True, 
+        #    #momentum    = 0.9,
+        #    fused       = True,
+        #    #weight_decay= 0.01
+        #    )
+        return torch.optim.AdamW(params=self.parameters(), lr=LR, fused=True)
     
 
 
@@ -195,9 +205,15 @@ def quantizer_run():
     models = {
         #"bthot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, BoltzmannThresHot, nn.LeakyReLU, 32),
         #"btkhot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, BoltzmannTopKHot, nn.LeakyReLU, 32),
-        "tkhot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, quantizer.TopKHot, nn.LeakyReLU, 32),
-        "tkhot 2":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, quantizer.topkhotSTE, nn.LeakyReLU, 32),
-        #"thot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, quantizer.ThresHot, acmod(utils.dead_rat_relu), 32),
+        #"tkhot 1":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, quantizer.TopKHot, nn.LeakyReLU, 32),
+        #"tkhot 2":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, quantizer.TopKHotSM, nn.LeakyReLU, 32),
+        "thot 1":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, quantizer.ThresHot, nn.LeakyReLU, 32),
+        "thot 2":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, quantizer.threshotSTE_sigmoid, nn.LeakyReLU, 32),
+        "thot 3":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, quantizer.threshotSTE_softmax, nn.LeakyReLU, 32),
+        
+        #"ahot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, quantizer.AvgHot, nn.LeakyReLU, 32),
+        #"thot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, quantizer.ThresHot, nn.LeakyReLU, 32),
+        #"thot 2":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, quantizer.ThresHot, acmod(utils.dead_rat_relu), 32),
     }
     
     print("Compiling models...")

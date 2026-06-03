@@ -6,10 +6,12 @@ from attr import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from parts.modules import HungryLinear, HungryPattLayer, PattLayer
 import parts.utils as utils
 torch._inductor.config.disable_cpp_codegen = True
 
-Linear          = nn.Linear 
+Linear          = HungryLinear
+Patt            = HungryPattLayer
 #dataset        = "shakespeare_char"
 dataset         = "openwebtext"
 data_dir        = os.path.join('data', dataset)
@@ -19,6 +21,8 @@ bias            = False
 
 batch_size      = 64
 block_size      = 64
+
+pattcount       = 512
 
 n_embd          = 256
 n_head          = 8
@@ -40,9 +44,11 @@ spl             = False
 soloblock       = False
 sspl            = False
 wnll            = True
-#config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-#train_logging = False
-#exec(open('training_tools/configurator.py').read()) # overrides from command line or config file
+patt            = True
+
+config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
+train_logging = False
+exec(open('training_tools/configurator.py').read()) # overrides from command line or config file
 
 def get_lr(it):
     
@@ -138,11 +144,12 @@ class MLP(nn.Module):
         self.c_proj  = Linear( up * config.n_embd, config.n_embd, bias=config.bias)
         
         self.dropout = nn.Dropout(config.dropout)
-        self.dac = utils.Puntan(config.n_embd*4)
-        self.univ = utils.Univfun(config.n_embd)
+        if patt:
+            self.patt = Patt(config.n_embd, config.n_embd, pattcount)
 
     def forward(self, x):
-        
+        if patt:
+            return self.patt(x)
         x = self.c_fc(x)
         x = self.gelu(x)
         x = self.c_proj(x)
@@ -254,9 +261,14 @@ class GPT(nn.Module):
             
             if self.training:
                 if wnll:
+                    #cumsum_wnl = torch.cumsum(wnl, dim=1)
+                    #indices = torch.arange(1, wnl.size(1) + 1, device=wnl.device).view(1, -1, 1)
+                    #cumulative_surprise_avg = cumsum_wnl / indices
+                    #wnl = cumulative_surprise_avg
                     mean_surprise = ((1.0-wnl.detach())/2.0).mean()*0.99
                     loss = loss / (1+ wnl.detach()*mean_surprise)
                     loss = (loss + wnl).mean()
+                    #loss = (loss * torch.exp(-wnl) + wnl).mean()
                 if spl:
                     if sspl:
                         self.transformer.h[1].block_input = x1
@@ -328,39 +340,45 @@ t0 = time.time()
 t1 = time.time()
 t2 = time.time()
 
-def eval(max_iters, eval_interval, get_batch, model, optimizer, t0,t1,t2, iter, decaying):
-    if iter % eval_interval == 0 or iter == max_iters - 1:
-        t2 = time.time()
-        model.eval()
-        losses = {}
-        for split in ['train', 'val']:
-            losses[split] = 0.0
-            for k in range(eval_iters):
-                X_val, Y_val = get_batch(split)
-                with torch.no_grad():
-                    _, loss = model(X_val, Y_val, decaying= decaying)
-                losses[split] += loss.detach().item()
-            losses[split] /= eval_iters
-        optimizer.zero_grad(set_to_none=True)
-        t1 = time.time()
-        print(f"step {iter:{len(str(max_iters))}d}: ",end="")
-        print(f"train loss: {losses['train']:.4f}, val loss: {losses['val']:.4f}, ",end="")
-        print(f"time: {(t2-t0)*1000:.0f} ms, Tval: {(t1-t2)*1000:.0f} ms")
-        model.train()
-        t0 = time.time()
+def eval(max_iters, get_batch, model, optimizer, t0,t1,t2, iter, decaying):
+    
+    t2 = time.time()
+    model.eval()
+    losses = {}
+    for split in ['train', 'val']:
+        losses[split] = 0.0
+        for k in range(eval_iters):
+            X_val, Y_val = get_batch(split)
+            with torch.no_grad():
+                _, loss = model(X_val, Y_val, decaying= decaying)
+            losses[split] += loss.detach().item()
+        losses[split] /= eval_iters
+    optimizer.zero_grad(set_to_none=True)
+    t1 = time.time()
+    print(f"step {iter:{len(str(max_iters))}d}: ",end="")
+    print(f"train loss: {losses['train']:.4f}, val loss: {losses['val']:.4f}, ",end="")
+    print(f"time: {(t2-t0)*1000:.0f} ms, Tval: {(t1-t2)*1000:.0f} ms")
+    model.train()
+    t0 = time.time()
     return t0, t1, t2
 
 for iter in range(max_iters):
+    
+    #if iter % 100 == 0:
+    #    for block in model.transformer.h:
+    #        block.mlp.patt.add_tokens(1, optimizer)
     lr = get_lr(iter)
     decaying = 1.0 - (iter / decay_iters)
     decaying = torch.tensor(decaying, device=device, dtype=torch.float32)
     decaying = torch.clamp(decaying, 0.0, 1.0)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
-    t0,t1,t2 =eval(max_iters, eval_interval, get_batch, model, optimizer, t0,t1,t2, iter, decaying)
+    torch.compiler.cudagraph_mark_step_begin()
     X, Y = get_batch('train')
     logits, loss = model(X, Y, decaying= decaying)
     loss.backward()
     optimizer.step()
+    if iter % eval_interval == 0 or iter == max_iters - 1:
+        t0,t1,t2 =eval(max_iters, get_batch, model, optimizer, t0,t1,t2, iter, decaying)
     optimizer.zero_grad(set_to_none=True)
     

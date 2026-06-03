@@ -218,6 +218,124 @@ class TopKHot(torch.autograd.Function):
         grad_x = F.sigmoid(x) - hard_target
         return grad_x,  None
 
+class IMLETopKFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, logits, k, noise_scale, lambda_scale, num_samples):
+        ctx.k = k
+        ctx.noise_scale = noise_scale
+        ctx.lambda_scale = lambda_scale
+        ctx.num_samples = num_samples
+        
+        device = logits.device
+        batch_size, num_features = logits.shape
+        
+        # 1. Hard discrete forward pass
+        _, indices = torch.topk(logits, k=k, dim=-1)
+        hard_target = torch.zeros_like(logits).scatter_(-1, indices, 1.0)
+        
+        # 2. Perturb-and-MAP
+        u = torch.rand(num_samples, batch_size, num_features, device=device)
+        gumbel_noise = -torch.log(-torch.log(u + 1e-20) + 1e-20)
+        
+        perturbed_logits = logits.unsqueeze(0) + (noise_scale * gumbel_noise)
+        _, perturbed_indices = torch.topk(perturbed_logits, k=k, dim=-1)
+        perturbed_targets = torch.zeros_like(perturbed_logits).scatter_(-1, perturbed_indices, 1.0)
+        
+        ctx.save_for_backward(logits, perturbed_targets, gumbel_noise)
+        return hard_target
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        logits, perturbed_targets, gumbel_noise = ctx.saved_tensors
+        noise_scale = ctx.noise_scale
+        lambda_scale = ctx.lambda_scale
+        k = ctx.k
+        
+        grad_expanded = grad_output.unsqueeze(0)
+        
+        # Pure paper formulation: Subtract the scaled gradient
+        # Bounding lambda_scale prevents the moving target from dominating the logits
+        shifted_logits = logits.unsqueeze(0) + (noise_scale * gumbel_noise) - (lambda_scale * grad_expanded)
+        
+        _, shifted_indices = torch.topk(shifted_logits, k=k, dim=-1)
+        shifted_targets = torch.zeros_like(shifted_logits).scatter_(-1, shifted_indices, 1.0)
+        
+        # Calculate decision boundary gradient
+        grad_logits = (perturbed_targets - shifted_targets).mean(dim=0)
+        
+        # Scale back by the noise parameter as per the paper's optimization rule
+        if noise_scale > 0:
+            grad_logits = grad_logits / noise_scale
+            
+        return grad_logits, None, None, None, None
+
+class IMLEGuidedSTEFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, logits, k, noise_scale, num_samples):
+        ctx.k = k
+        ctx.noise_scale = noise_scale
+        ctx.num_samples = num_samples
+        
+        device = logits.device
+        batch_size, num_features = logits.shape
+        
+        # 1. Base hard choice (where the model currently wants to go)
+        _, base_indices = torch.topk(logits, k=k, dim=-1)
+        base_targets = torch.zeros_like(logits).scatter_(-1, base_indices, 1.0)
+        
+        # 2. Perturb-and-MAP: Sample alternative structural pathways
+        u = torch.rand(num_samples, batch_size, num_features, device=device)
+        gumbel_noise = -torch.log(-torch.log(u + 1e-20) + 1e-20)
+        
+        perturbed_logits = logits.unsqueeze(0) + (noise_scale * gumbel_noise)
+        _, perturbed_indices = torch.topk(perturbed_logits, k=k, dim=-1)
+        perturbed_targets = torch.zeros_like(perturbed_logits).scatter_(-1, perturbed_indices, 1.0)
+        
+        # 3. Calculate the structural nudge bias:
+        # How much does noise change the optimal layout?
+        # This vector captures the 'shape' of the local decision boundaries.
+        nudge_bias = (perturbed_targets - base_targets.unsqueeze(0)).mean(dim=0)
+        
+        ctx.save_for_backward(logits, perturbed_targets, gumbel_noise)
+        
+        # Pass the nudge forward alongside the logits
+        return nudge_bias
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        logits, perturbed_targets, gumbel_noise = ctx.saved_tensors
+        noise_scale = ctx.noise_scale
+        k = ctx.k
+        
+        grad_expanded = grad_output.unsqueeze(0)
+        
+        # Standard paper formulation to update the I-MLE decision tracking
+        shifted_logits = logits.unsqueeze(0) + (noise_scale * gumbel_noise) - grad_expanded
+        _, shifted_indices = torch.topk(shifted_logits, k=k, dim=-1)
+        shifted_targets = torch.zeros_like(shifted_logits).scatter_(-1, shifted_indices, 1.0)
+        
+        grad_logits = (perturbed_targets - shifted_targets).mean(dim=0)
+        if noise_scale > 0:
+            grad_logits = grad_logits / noise_scale
+            
+        return grad_logits, None, None, None
+
+def topkhotIMLESTE(x,k,noise_scale=0.1,nudge_w=0.05,samples=16):
+    nudge = IMLEGuidedSTEFunction.apply(
+        x, k, noise_scale, samples
+    )
+    
+    guided_logits = x + (nudge_w * nudge)
+    
+    probs = F.sigmoid(guided_logits)
+    _, indices = torch.topk(guided_logits, k=k, dim=-1)
+    hard_target = torch.zeros_like(guided_logits).scatter_(-1, indices, 1.0)
+    
+    return hard_target + probs - probs.detach()
+
+def topkhotIMLE(x,k,scale=0.1,l_sca=0.1,samples=16):
+    x = torch.sigmoid(x)
+    return IMLETopKFunction.apply(x, k, scale, l_sca, samples)
 def topkhotSTE(x,k):
     probs = F.sigmoid(x)
     _, indices = torch.topk(x, k=k, dim=-1)
@@ -276,8 +394,21 @@ class ThresHot(torch.autograd.Function):
 
         grad_x = F.sigmoid(x) - hard_target
         return grad_x    
-
-
+def threshotSTE_softmax(x):
+    # 1. Forward Pass (Threshold based on Softmax)
+    probs_softmax = F.softmax(x, dim=-1)
+    k_hot = torch.where(probs_softmax >= (1.0 / x.shape[-1]), 1.0, 0.0)
+    
+    # 2. Backward Pass (Competitive gradients)
+    return k_hot + probs_softmax - probs_softmax.detach()
+def threshotSTE_sigmoid(x):
+    # 1. Forward Pass (Threshold based on Softmax)
+    probs_softmax = F.softmax(x, dim=-1)
+    k_hot = torch.where(probs_softmax >= (1.0 / x.shape[-1]), 1.0, 0.0)
+    
+    # 2. Backward Pass (Independent binary gradients)
+    probs_sigmoid = torch.sigmoid(x)
+    return k_hot + probs_sigmoid - probs_sigmoid.detach()
 class AdjThresHot(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, threshold_mult):
@@ -335,7 +466,7 @@ class ThresHot3(torch.autograd.Function):
         return grad_x
 
 
-class avgHot(torch.autograd.Function):
+class AvgHot(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
         k_hot = torch.where(x > x.mean(), 1.0, 0.0)
@@ -431,7 +562,7 @@ class RegenerativeLinear(nn.Module):
         if conf is not None:
             self.hungry_config['lookahead_alpha'] = conf.get('lr', 1e-2)
 
-        mask = avgHot.apply(self.scores)
+        mask = AvgHot.apply(self.scores)
 
         effective_weight = self.weight * mask
 

@@ -6,7 +6,10 @@ import torch.nn as nn
 from torch.nn import functional as F
 import parts.utils as utils
 import parts.quantizer as quantizer
-import torch.nn.utils.parametrizations as parametrizations
+
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+
+
 class HungryLinearFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input, weight, bias, config):
@@ -47,7 +50,7 @@ class HungryLinearFunc(torch.autograd.Function):
         return grad_input, grad_weight, grad_bias, None
 
 class HungryLinear(nn.Module):
-    def __init__(self, in_features, out_features, bias = False, lookahead=1e-2, noise=True, zero_init=True, g_norm =True):
+    def __init__(self, in_features, out_features, bias = False, lookahead=1e-5, noise=True, zero_init=True, g_norm =True):
         super().__init__()
         self.in_features = in_features
         
@@ -462,9 +465,6 @@ class HydraKattention(nn.Module):
         return y
 
 
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-
-
 class SparseFlexAttention(nn.Module):
     def __init__(self, block_size=64):
         super().__init__()
@@ -620,7 +620,192 @@ class PattLayer(nn.Module):
         self.num_tokens -= n
 
 
+class HungryApply(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, fn, config):
+        ctx.fn = fn
+        ctx.config = config
+        
+        # We execute the forward pass in a no_grad block because we will 
+        # manually compute the exact gradients in the backward pass.
+        with torch.no_grad():
+            out = fn(x, weight)
+            
+        ctx.save_for_backward(x, weight)
+        return out
 
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, weight = ctx.saved_tensors
+        fn = ctx.fn
+        conf = ctx.config
+        alpha = conf.get('lookahead_alpha', 0.001)
+
+        # 1. Noise injection (regularizing the weight gradient)
+        if conf.get('noise', False):
+            x_magnitude = x.abs().sum()
+            noise_x = torch.randn_like(x) / (1.0 + x_magnitude)
+            scale = conf.get('noise_scale', 0.01)
+            noise_x2 = torch.randn_like(x) * grad_output.std() * scale
+            x_noisy = x + noise_x + noise_x2
+        else:
+            x_noisy = x
+
+        # 2. Compute grad_weight on the noisy input
+        with torch.enable_grad():
+            x_g = x_noisy.detach()
+            weight_g = weight.detach().requires_grad_(True)
+            out_g = fn(x_g, weight_g)
+            grad_weight, = torch.autograd.grad(
+                out_g, weight_g, grad_output, 
+                retain_graph=False, allow_unused=True
+            )
+
+        if grad_weight is None:
+            grad_weight = torch.zeros_like(weight)
+
+        # 3. Lookahead update for the weights
+        g_w = grad_weight
+        if conf.get('g_norm', True) or conf.get('gnorm', True):
+            g_w = utils.rms_norm(g_w) # Assuming utils.rms_norm is globally defined
+        future_weight = weight - (g_w * alpha)
+
+        # 4. Compute grad_x using the lookahead weight
+        with torch.enable_grad():
+            x_g2 = x.detach().requires_grad_(True)
+            weight_g2 = future_weight.detach()
+            out_g2 = fn(x_g2, weight_g2)
+            grad_x, = torch.autograd.grad(
+                out_g2, x_g2, grad_output, 
+                retain_graph=False, allow_unused=True
+            )
+
+        if grad_x is None:
+            grad_x = torch.zeros_like(x)
+
+        return grad_x, grad_weight, None, None
+
+
+class HungryPattLayer(nn.Module):
+    def __init__(self, input_dim: int, output_dim: int, num_tokens: int, lookahead=1e-5, noise=True, zero_init=True, g_norm=True):
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.num_tokens = num_tokens
+
+        # Key projection: weight shape is [num_tokens, input_dim]
+        self.linear1 = HungryLinear(
+            in_features =input_dim,
+            out_features=num_tokens,
+            bias        =False,
+            lookahead   =lookahead,
+            noise       =noise,
+            zero_init   =zero_init,
+            g_norm      =g_norm
+        )
+
+        # Value projection: weight shape is [output_dim, num_tokens]
+        self.linear2 = HungryLinear(
+            in_features =num_tokens,
+            out_features=output_dim,
+            bias        =False,
+            lookahead   =lookahead,
+            noise       =noise,
+            zero_init   =zero_init,
+            g_norm      =g_norm
+        )
+
+    def forward(self, x: torch.Tensor, get_scores=False, conf=None) -> torch.Tensor:
+        scores = self.linear1(x, conf=conf)
+        #attn = tokenformer_theta(scores, dim=-1)
+        attn = scores * quantizer.topkhotSTE(scores, 4)
+        attn = attn / attn.sum(keepdim=True, dim=-1)
+        attn = utils.dead_rat_relu(attn)
+        #attn = tokenformer_theta(attn, dim=-1)
+        x_out = self.linear2(attn, conf=conf)
+        
+        if get_scores:
+            return x_out, scores
+        return x_out
+
+    def add_tokens(self, n: int, optimizer=None):
+        device = self.linear1.weight.device
+        dtype = self.linear1.weight.dtype
+
+        old_w1 = self.linear1.weight
+        old_w2 = self.linear2.weight
+
+        # 1. Grow key projection weights (dim 0)
+        new_keys = torch.zeros(n, self.input_dim, device=device, dtype=dtype)
+        self.linear1.weight = nn.Parameter(torch.cat([old_w1.data, new_keys], dim=0))
+
+        # 2. Grow value projection weights (dim 1)
+        new_vals = torch.empty(self.output_dim, n, device=device, dtype=dtype)
+        nn.init.kaiming_uniform_(new_vals, a=math.sqrt(5))
+        self.linear2.weight = nn.Parameter(torch.cat([old_w2.data, new_vals], dim=1))
+
+        self.num_tokens += n
+
+        # 3. Perform surgery on the optimizer's state if provided
+        if optimizer is not None:
+            # For linear1, append rows of zeros to match dim 0 growth
+            self._update_optimizer_state(
+                optimizer, 
+                old_w1, self.linear1.weight, 
+                lambda t: torch.cat([t, torch.zeros(n, t.shape[1], device=device, dtype=dtype)], dim=0)
+            )
+            # For linear2, append columns of zeros to match dim 1 growth
+            self._update_optimizer_state(
+                optimizer, 
+                old_w2, self.linear2.weight, 
+                lambda t: torch.cat([t, torch.zeros(t.shape[0], n, device=device, dtype=dtype)], dim=1)
+            )
+
+    def remove_tokens(self, n: int, optimizer=None):
+        if n >= self.num_tokens:
+            raise ValueError(f"Cannot remove {n} tokens, only have {self.num_tokens}")
+
+        old_w1 = self.linear1.weight
+        old_w2 = self.linear2.weight
+
+        # 1. Slice the weights
+        self.linear1.weight = nn.Parameter(old_w1.data[:-n])
+        self.linear2.weight = nn.Parameter(old_w2.data[:, :-n])
+
+        self.num_tokens -= n
+
+        # 2. Perform surgery on the optimizer's state if provided
+        if optimizer is not None:
+            # Slice key projection states (dim 0)
+            self._update_optimizer_state(optimizer, old_w1, self.linear1.weight, lambda t: t[:-n])
+            # Slice value projection states (dim 1)
+            self._update_optimizer_state(optimizer, old_w2, self.linear2.weight, lambda t: t[:, :-n])
+
+    def _update_optimizer_state(self, optimizer, old_param, new_param, resize_fn):
+        """Swaps parameter references in optimizer and resizes internal AdamW states."""
+        for group in optimizer.param_groups:
+            found_idx = None
+            for idx, p in enumerate(group['params']):
+                if p is old_param:
+                    found_idx = idx
+                    break
+
+            if found_idx is not None:
+                group['params'][found_idx] = new_param
+                state_key = None
+                for key in list(optimizer.state.keys()):
+                    if key is old_param:
+                        state_key = key
+                        break
+
+                if state_key is not None:
+                    state = optimizer.state.pop(state_key)
+                    if 'exp_avg' in state:
+                        state['exp_avg'] = resize_fn(state['exp_avg'])
+                    if 'exp_avg_sq' in state:
+                        state['exp_avg_sq'] = resize_fn(state['exp_avg_sq'])
+                    optimizer.state[new_param] = state
+                break
 
 class MHKPattLayer(nn.Module):
     def __init__(self, input_dim: int, output_dim: int, num_tokens: int, heads = 6):
@@ -863,7 +1048,11 @@ class SSM(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, n_embd,n_head,dropout,bias):
+    def __init__(self, config):
+        n_embd = config.n_embd
+        n_head = config.n_head
+        dropout = config.dropout
+        bias = config.bias
         super().__init__()
         assert n_embd % n_head == 0
         self.q_proj = Linear(n_embd, n_embd, bias=bias)
@@ -889,24 +1078,24 @@ class CrossAttention(nn.Module):
         mask = key_indices[None, :] > max_key_indices[:, None]
         return mask
     
-    def forward(self, x, sx, causal = False,conf=None):
-        B, T, C = x.size() 
-        sB, sT, sC = sx.size() 
+    def forward(self, x_kv, x_q, causal = False,conf=None):
+        B, T, C = x_kv.size() 
+        sB, sT, sC = x_q.size() 
         if isinstance(Linear, HungryLinear):
-            q = self.q_proj(sx,conf)
-            k = self.k_proj(x,conf)
-            v = self.v_proj(x,conf)
+            q = self.q_proj(x_q,conf)
+            k = self.k_proj(x_kv,conf)
+            v = self.v_proj(x_kv,conf)
         else:
-            q = self.q_proj(sx)
-            k = self.k_proj(x)#TODO: beware
-            v = self.v_proj(x)
+            q = self.q_proj(x_q)
+            k = self.k_proj(x_kv)#TODO: beware
+            v = self.v_proj(x_kv)
         q = q.view(B, sT, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, sT, hs)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         attn_mask=None
         if causal:
             if sT != T:
-                attn_mask = self._create_mask(sT, T, x.device)
+                attn_mask = self._create_mask(sT, T, x_kv.device)
                 causal = False
 
         y = torch.nn.functional.scaled_dot_product_attention(

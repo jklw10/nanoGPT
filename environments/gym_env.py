@@ -199,7 +199,9 @@ def visualize_gym_pygame(brain, sweep, fitness, env_name="Pendulum-v1", device="
     obs = reset_out[0] if isinstance(reset_out, tuple) else reset_out
     
     # Process Landscape details
+    
     perf_grid = sweep.to_2d_grid(fitness).cpu().numpy()
+    perf_grid = np.nan_to_num(perf_grid)
     rows, cols = perf_grid.shape
     max_r, max_c = np.unravel_index(np.argmax(perf_grid), perf_grid.shape)
     min_val, max_val = np.min(perf_grid), np.max(perf_grid)

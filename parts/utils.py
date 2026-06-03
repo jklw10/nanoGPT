@@ -364,6 +364,7 @@ class DeadRatRelu(torch.autograd.Function):
             grad_input[dead_mask] *= scale
             
         return grad_input
+    
 def dead_rat_relu(x):
      return DeadRatRelu.apply(x)
 
@@ -843,12 +844,14 @@ def k_hot_to_bitfield(k_hot_tensor):
   powers_of_2 = 2 ** torch.arange(num_classes, device=device, dtype=torch.long)
   bitfields = torch.sum(k_hot_tensor.long() * powers_of_2, dim=-1)
   return bitfields
+
 @torch.compile(backend='inductor', mode='max-autotune')
 def bitfield_to_k_hot(bitfield_tensor, num_classes):
   device = bitfield_tensor.device
   powers_of_2 = 2 ** torch.arange(num_classes, device=device, dtype=torch.long)
   k_hot = bitfield_tensor.unsqueeze(-1).bitwise_and(powers_of_2).ne(0).long()
   return k_hot
+
 @torch.compile(backend='inductor', mode='max-autotune')
 def quaternion_multiply(q, p):
     # q and p are tensors of shape [..., 4]
@@ -1026,6 +1029,7 @@ class wnormlearnloss(nn.Module):
     def forward(self, x):
         #TODO reconfigure, try rms, tanh
         loss = (torch.tanh(self.head(x)))#.mean()
+        #loss = self.head(x)
         return loss
 
 def get_boltzmann_mu(logits, target_k, steps=5):
@@ -1045,6 +1049,7 @@ def get_boltzmann_mu(logits, target_k, steps=5):
         mu = mu - delta
         
     return mu
+
 def k_from_hot(k_hot, max):
     return k_hot.sum(dim=-1, keepdim=True).clamp(1,max)
 
@@ -1860,7 +1865,7 @@ def get_get_batch(block_size, batch_size, dataset, device, always_byte=False,ski
         y = data[:, 1:size+1].contiguous()
 
         return x, y
-    def get_batch(split, size=None):
+    def get_batch(split, size=None, index=None):
         
         if size is None:
             size = block_size
@@ -1870,8 +1875,10 @@ def get_get_batch(block_size, batch_size, dataset, device, always_byte=False,ski
             return tok2byte(split, size)
         
         data = train_data if split =="train" else val_data
-        ix = torch.randint(len(data) - size, (batch_size,))
-        
+        if index is None:
+            ix = torch.randint(len(data) - size, (batch_size,))
+        else:
+            ix = index
         # torch.stack is faster here because it handles the memory copy directly 
         # from the tiny individual numpy views into the final Tensor.
         x = torch.stack([torch.from_numpy(data[i:i+size].astype(np.int64)) for i in ix])

@@ -40,7 +40,7 @@ spl             = False
 mix_squish      = False
 
 #good in owt-char
-qrot            = False
+qrot            = True
 diffac          = False
 rms_lnorm       = False
 #good in owt
@@ -103,7 +103,7 @@ k_atten         = False
 h_k_atten       = False
 p_atten         = False
 sprs            = False
-wnll            = True
+wnll            = False
 
 csbr            = False
 
@@ -112,7 +112,7 @@ exposemb        = False
 
 residless       = False
 
-Non_causal      = True
+Non_causal      = False
 
 residcomp       = False
 mhc_lr          = 0.01
@@ -267,7 +267,18 @@ class Attention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
 
         return y
+    
+class ShiftedReLU(nn.Module):
+    """ReLU with fixed per-neuron random shifts near zero (like weight init)."""
+    def __init__(self, num_neurons):
+        super().__init__()
+        # Shifts sampled once from N(0, 0.02), same as Linear weight init in this model
+        shifts = 0.02/torch.sqrt(torch.arange(0, num_neurons))
+        self.register_buffer('shift', shifts)  # non-trainable
 
+    def forward(self, x):
+        return F.relu(x - self.shift)
+    
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -293,7 +304,7 @@ class MLP(nn.Module):
             self.c_proj  = Linear( 2 * config.n_embd, config.n_embd, bias=config.bias)
         
         self.dropout = nn.Dropout(config.dropout)
-        self.dac = utils.Puntan(config.n_embd*4)
+        self.dac = ShiftedReLU(config.n_embd*4)
         self.univ = utils.Univfun(config.n_embd)
         #self.dac = utils.Psinrelu(config.n_embd*4)
 
@@ -324,7 +335,8 @@ class MLP(nn.Module):
         rotors, rotated = x_normalized.chunk(2, dim=2) # Split along n_embd dimension
             #xm,ym = x_norm.chunk(2, dim=2)
         x_rotated = utils.quaternion_multiply(rotors, rotated) 
-            #x_rotated = x_rotated*self.gaprelu(x_norm-2)#*torch.sigmoid(xm+ym)#
+            #x_rotated = x_rotated*self.gaprelu(x_norm-2)
+            # #*torch.sigmoid(xm+ym)#
         x = x_rotated.view(b, t, 2 * self.n_embd)
         x = self.c_proj(x)
         x = self.dropout(x)
