@@ -1,3 +1,5 @@
+# --- START OF FILE loopebm.py ---
+
 import math
 import time
 import numpy as np
@@ -9,6 +11,7 @@ from datasets import load_dataset
 
 from parts import quantizer  
 from parts import utils
+
 # Device configuration
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -47,9 +50,49 @@ class SolverConfig:
     c_moment: torch.Tensor = torch.tensor(0.8)
     a_variance: torch.Tensor = torch.tensor(0.0026)
 
-# Safe ASCII decoder helper
+
+# =====================================================================
+# 1. DECODING DIAGNOSTIC & UTF-8 SANITY CHECK
+# =====================================================================
+def run_decoding_diagnostic(custom_decode=None):
+    print("=== DECODING DIAGNOSTIC TEST ===")
+    test_str = "Question: Weng earns $12/hr. Smart quotes: ’“−”. How much? \nAnswer: $60."
+    
+    # Method A: Naive modulo ord (Old code)
+    ord_encoded = [ord(c) % 256 for c in test_str]
+    ord_decoded = "".join([chr(i) if 32 <= i < 127 or i == 10 else f"\\x{i:02x}" for i in ord_encoded])
+    
+    # Method B: True UTF-8 Bytes (New proposed code)
+    utf8_encoded = list(test_str.encode('utf-8', errors='ignore'))
+    utf8_decoded = bytes(utf8_encoded).decode('utf-8', errors='replace')
+    
+    print(f"Original Text:  {test_str}")
+    print(f"Method A (ord % 256) Decoded: {ord_decoded}")
+    print(f"Method B (UTF-8 Bytes) Decoded: {utf8_decoded}")
+    
+    if custom_decode is not None:
+        try:
+            custom_decoded = custom_decode(utf8_encoded)
+            print(f"Method C (utils.get_meta decode) Decoded: {custom_decoded}")
+        except Exception as e:
+            print(f"Method C (utils.get_meta decode) failed: {e}")
+            
+    is_ord_scuffed = ord_decoded != test_str
+    print(f"Is old method scuffed on non-ASCII characters? {'YES' if is_ord_scuffed else 'NO'}")
+    print("===============================\n")
+
+
+# Safe UTF-8 / Custom byte decoder
 def safe_decode(indices):
-    return "".join([chr(i) if 32 <= i < 127 or i == 10 else f"\\x{i:02x}" for i in indices])
+    # Lexically check if custom decode from get_meta is defined in __main__
+    if 'decode' in globals() and callable(decode):
+        try:
+            return decode(indices)
+        except Exception:
+            pass
+            
+    clean_indices = [max(0, min(255, int(i))) for i in indices]
+    return bytes(clean_indices).decode('utf-8', errors='replace')
 
 
 def sparse_route(router, node_count, spr):
@@ -400,6 +443,7 @@ class GSM8KSolverEBM(nn.Module):
         self.wte.weight = self.lm_head.weight
         
         self.gate_head = nn.Linear(config.n_embd, 2, bias=config.bias)
+        
     def forward(self, idx, prefix_lens, targets=None):
         B, T = idx.size()
         x = self.wte(idx)
@@ -423,15 +467,19 @@ class GSM8KSolverEBM(nn.Module):
             pred_embs = []
             node_losses = []
             for t in range(T):
-                env_input = x[:, t, :]
+                # Detaching the input prevents the MSE loss inside NodeNet from shaping the embedding layers.
+                # If you want embeddings to be shaped by both CE and NodeNet's MSE, remove the `.detach()`.
+                env_input = x[:, t, :].detach()
                 node_loss = self.node_net(env_input)
                 node_losses.append(node_loss)
                 pred_embs.append(self.node_net.output[:, 0, :])
                 
             pred_embs = torch.stack(pred_embs, dim=1)
             
-            # Integrate raw sequence features with EBM predictive transitions
-            x = x + pred_embs
+            # INTEGRATION BYPASS: We detach the accumulated pred_embs.
+            # This completely stops downstream Cross-Entropy, ACT gating, and loop losses 
+            # from propagating gradients back into the NodeNet parameters.
+            x = x + pred_embs.detach()
             
             # Process representation using prefix attention blocks
             for block in self.blocks:
@@ -449,6 +497,7 @@ class GSM8KSolverEBM(nn.Module):
             cycle_logits_list.append(cycle_logits)
             
             # Weighted transition loss representation over active computational graphs
+            # (NodeNet's parameters are updated strictly and internally by this MSE transition loss)
             cycle_node_loss = sum(node_losses) / T
             total_node_loss = total_node_loss + cycle_node_loss * active_mask.mean()
             
@@ -499,6 +548,8 @@ class GSM8KSolverEBM(nn.Module):
             loss = sum(ce_losses) / len(ce_losses)
             
             # Combine the cross entropy target loss and EBM transition parameter alignment loss
+            # Since pred_embs was detached, the CE part of this combined gradient only shapes self.wte and Blocks,
+            # while the 0.01 * total_node_loss shapes NodeParams3 parameters.
             loss = loss + 0.01 * (total_node_loss / len(cycle_logits_list))
             
             # ACT resource allocation loss
@@ -556,7 +607,7 @@ class GSM8KSolverEBM(nn.Module):
         return torch.optim.AdamW(optim_groups, lr=lr, betas=(0.9, 0.999))
 
 # =====================================================================
-# 6. HUGGING FACE GSM8K DATASET LOADER (WITH PROMPT CONSTRAINTS)
+# 6. TRAINING DATASETS (DYNAMIC LOADER UTILIZING CUSTOM META AND BATCH GETTERS)
 # =====================================================================
 
 class HuggingFaceGSM8KDataset:
@@ -588,24 +639,26 @@ class HuggingFaceGSM8KDataset:
             # Format structure
             prompt = f"Question: {question}\nAnswer: "
             
-            # Capping prompt character size prevents prefix length out-of-bound conditions
-            max_prompt_len = self.block_size - self.workspace_size - 64
-            if len(prompt) > max_prompt_len:
-                prompt = "Question: ... " + prompt[-(max_prompt_len - 14):]
+            # Convert segments to UTF-8 bytes to prevent unicode size/mod scuffing
+            prompt_bytes = prompt.encode('utf-8', errors='ignore')
+            workspace_bytes = b"#" * self.workspace_size
+            answer_bytes = answer.encode('utf-8', errors='ignore')
             
-            workspace = "#" * self.workspace_size  # Non-causal middle thinking buffer
-            answer_text = answer
+            # Maximum bytes allowed for the prompt
+            max_prompt_bytes = self.block_size - self.workspace_size - 64
+            if len(prompt_bytes) > max_prompt_bytes:
+                prompt_bytes = b"Question: ... " + prompt_bytes[-max_prompt_bytes:]
             
-            full_seq = prompt + workspace + answer_text
-            encoded = [ord(c) % 256 for c in full_seq]
+            full_seq_bytes = prompt_bytes + workspace_bytes + answer_bytes
+            encoded = list(full_seq_bytes)
             
-            # Truncate or pad to fix length matching block_size
+            # Pad or truncate in byte-space
             if len(encoded) < self.block_size:
-                encoded = encoded + [32] * (self.block_size - len(encoded))
+                encoded = encoded + [32] * (self.block_size - len(encoded)) # 0x20 space byte
             else:
                 encoded = encoded[:self.block_size]
                 
-            prefix_len = len(prompt) + self.workspace_size
+            prefix_len = len(prompt_bytes) + self.workspace_size
             target = encoded[1:] + [32]
             
             x_batch.append(torch.tensor(encoded, dtype=torch.long))
@@ -626,15 +679,16 @@ class HuggingFaceGSM8KDataset:
 def generate_math_solution(model, prompt, workspace_size=32, max_new_tokens=128, temperature=0.7):
     model.eval()
     
-    # Boundary constraints matching block size constraints
-    max_prompt_len = model.config.block_size - workspace_size - max_new_tokens
-    if len(prompt) > max_prompt_len:
-        prompt = "Question: ... " + prompt[-(max_prompt_len - 14):]
-        
-    workspace = "#" * workspace_size
-    full_prompt = prompt + workspace
+    # Boundary constraints using UTF-8 bytes
+    prompt_bytes = prompt.encode('utf-8', errors='ignore')
+    workspace_bytes = b"#" * workspace_size
     
-    indices = [ord(c) % 256 for c in full_prompt]
+    max_prompt_len = model.config.block_size - workspace_size - max_new_tokens
+    if len(prompt_bytes) > max_prompt_len:
+        prompt_bytes = b"Question: ... " + prompt_bytes[-max_prompt_len:]
+        
+    full_prompt_bytes = prompt_bytes + workspace_bytes
+    indices = list(full_prompt_bytes)
     x = torch.tensor([indices], dtype=torch.long, device=device)
     
     # Prefix length represents the fixed boundary
@@ -642,7 +696,6 @@ def generate_math_solution(model, prompt, workspace_size=32, max_new_tokens=128,
     prefix_lens_tensor = torch.tensor([prefix_len_val], dtype=torch.long, device=device)
     
     for _ in range(max_new_tokens):
-        # We pass prefix_lens as a batch of size 1
         logits, _ = model(x, prefix_lens=prefix_lens_tensor)
         
         next_token_logits = logits[:, -1, :] / temperature
@@ -650,7 +703,7 @@ def generate_math_solution(model, prompt, workspace_size=32, max_new_tokens=128,
         next_token = torch.multinomial(probs, num_samples=1)
         
         x = torch.cat((x, next_token), dim=1)
-        if next_token.item() == 10:  # Newline (\n) used as stop criterion
+        if next_token.item() == 10:  # Stop on newline (\n)
             break
             
     generated_indices = x[0, prefix_len_val:].tolist()
@@ -661,33 +714,58 @@ def generate_math_solution(model, prompt, workspace_size=32, max_new_tokens=128,
 # =====================================================================
 
 if __name__ == "__main__":
+    # Load raw OpenWebText dataset from HF
+    dataset = "openwebtext"
+    decode, vocab_size = utils.get_meta(dataset, always_byte=True)
+    owt_get_batch = utils.get_get_batch(block_size, batch_size, dataset, device, always_byte=True)
+    
+    # Run diagnostic with the newly loaded custom decoder
+    run_decoding_diagnostic(custom_decode=decode)
+    
+    # Override configuration parameters with extracted meta vocab_size
     gptconf = SolverConfig()
+    gptconf.vocab_size = vocab_size
+    
     model = GSM8KSolverEBM(gptconf).to(device)
     optimizer = model.configure_optimizers(lr=3e-4, wd=1e-1)
     
-    # Initialize real dataset loaders
-    train_dataset = HuggingFaceGSM8KDataset(block_size=block_size, workspace_size=32, device=device, split="train")
+    # Initialize the downstream GSM8K dataset
+    gsm8k_dataset = HuggingFaceGSM8KDataset(block_size=block_size, workspace_size=32, device=device, split="train")
     
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     
-    print("Beginning GSM8K training workflow on real data...")
+    print("Beginning training loop...")
     t0 = time.time()
-    for step in range(501):
-        X, Y, prefix_lens = train_dataset.get_batch(batch_size=batch_size)
-        
+    
+    # Run the pretrain-to-finetune stream sequence
+    total_steps = 35000
+    
+    for step in range(total_steps):
+        # Swap streams at step 30,000
+        if step < 30000:
+            # Defensive validation check on signature input variations
+            
+            X, Y = owt_get_batch('train')
+            # Causal pretraining uses prefix length of 1
+            prefix_lens = torch.ones(X.size(0), dtype=torch.long, device=device)
+            phase_name = "OWT Pretrain"
+        else:
+            X, Y, prefix_lens = gsm8k_dataset.get_batch(batch_size=batch_size)
+            phase_name = "GSM8K Finetune"
+            
         logits, loss = model(X, prefix_lens, Y)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         
-        if step % 100 == 0:
-            print(f"Step {step:4d} | Target Loss: {loss.item():.4f} | Batch Avg Prefix: {prefix_lens.float().mean().item():.1f} | Step Time: {(time.time() - t0)*1000:.0f}ms")
+        if step % 100 == 0 or step == 29999 or step == 30000:
+            print(f"Step {step:5d} | Phase: {phase_name:<14s} | Target Loss: {loss.item():.4f} | Batch Avg Prefix: {prefix_lens.float().mean().item():.1f} | Step Time: {(time.time() - t0)*1000:.0f}ms")
             t0 = time.time()
 
-    # Inference evaluation with a real test question
-    print("\n[Inference Test]")
+    # Post-training evaluation
+    print("\n[Final Post-Training Evaluation]")
     sample_question = "Question: Weng earns $12 an hour for babysitting. Yesterday, she babysat for 5 hours. How much did she earn?\nAnswer: "
     solution = generate_math_solution(model, sample_question, workspace_size=32, max_new_tokens=64)
     print(f"Prompt:\n{sample_question}")

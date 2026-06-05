@@ -43,31 +43,20 @@ class CUDAProfiler:
 class HyperParamsConfig:
     def __init__(self, device):
         self.device = device
-        self.params = {
-            'untanh':       0.862396,
-            'w_scale':      1.169223,
-            'ema_speed':    0.120148,
-            'rew_sens':     1.147007,
-            'noise_scale':  0.021769,
-            'speed':        1.177348,
-            'width':        0.100000,
-            'sprs':         0.408533,
-            'c_moment':     0.801097,
-            'a_variance':   0.050000
-        }
+        self.param_count = 10
         self.cfg = type('Config', (), {})()
         self.cfg.device = self.device
-        self.cfg.UNTANH      = torch.tensor(self.params['untanh'], device=self.device).detach().clone()
-        self.cfg.w_scale     = torch.tensor(self.params['w_scale'], device=self.device).detach().clone()
-        self.cfg.EMA_SPEED   = torch.tensor(self.params['ema_speed'], device=self.device).detach().clone()
-        self.cfg.rew_sens    = torch.tensor(self.params['rew_sens'], device=self.device).detach().clone()
-        self.cfg.NOISE_SCALE = torch.tensor(self.params['noise_scale'], device=self.device).detach().clone()
-        self.cfg.speed       = torch.tensor(self.params['speed'], device=self.device).detach().clone()
-        self.cfg.width       = torch.tensor(self.params['width'], device=self.device).detach().clone()
-        self.cfg.sprs        = torch.tensor(self.params['sprs'], device=self.device).detach().clone()
-        self.cfg.c_moment    = torch.tensor(self.params['c_moment'], device=self.device).detach().clone()
-        self.cfg.a_variance  = torch.tensor(self.params['a_variance'], device=self.device).detach().clone()
-        
+        self.cfg.UNTANH         = nn.Parameter(torch.tensor(0.740565, device=self.device))
+        self.cfg.w_scale        = nn.Parameter(torch.tensor(0.622592, device=self.device))
+        self.cfg.EMA_SPEED      = nn.Parameter(torch.tensor(0.180527, device=self.device))
+        self.cfg.REW_SENS       = nn.Parameter(torch.tensor(1.343345, device=self.device))
+        self.cfg.NOISE_SCALE    = nn.Parameter(torch.tensor(0.000000, device=self.device))
+        self.cfg.speed          = nn.Parameter(torch.tensor(1.343435, device=self.device))
+        self.cfg.width          = nn.Parameter(torch.tensor(0.100000, device=self.device))
+        self.cfg.sprs           = nn.Parameter(torch.tensor(0.511729, device=self.device))
+        self.cfg.c_moment       = nn.Parameter(torch.tensor(0.744751, device=self.device))
+        self.cfg.a_variance     = nn.Parameter(torch.tensor(0.011537, device=self.device))
+
     def to_tensor_config(self):
         return self.cfg
 
@@ -75,13 +64,13 @@ class HyperParamsConfig:
 class ExecutionConfig:
     def __init__(self):
         self.batch_size = 64
-        self.num_nodes = 8
+        self.num_nodes = 32
         self.dim = 16
         
         self.maze_size = 10
         self.max_episode_steps = 40
         
-        self.gd_lr = 0.01
+        self.gd_lr = 0.001
         self.gd_total_steps = 500
         
         self.es_lr = 0.03
@@ -91,7 +80,7 @@ class ExecutionConfig:
         self.es_generations = 40
 
 
-def sparse_route(router, node_count, spr):
+def sparse_route_batched(router, node_count, spr, step = 0):
     probs = torch.sigmoid(router)
     mask = quantizer.topkhotSTE(router, int(math.sqrt(node_count)))
     sparse_probs = mask * probs
@@ -99,11 +88,12 @@ def sparse_route(router, node_count, spr):
     sparse_probs = sparse_probs / (sparse_probs.sum(dim=-1, keepdim=True) + 1e-8)
     
     flat_probs = torch.ones_like(probs) / node_count
-    ratio = spr #* (0.999 ** step) 
+    ratio = spr 
 
     route = ((1.0-ratio) * sparse_probs) + (ratio * flat_probs)
     
     return route, 0.0, mask
+
 
 # ==========================================
 # VECTORIZED ENVIRONMENT TRANSITIONS
@@ -131,7 +121,6 @@ def step_kernel(agent_pos, food_grid, hunger, steps, actions, grid, size):
     next_food_grid = food_grid.clone()
     next_food_grid[batch_idx, next_x, next_y] = 0.0
     
-    # Check if the step enters a goal tile dynamically (represented by 2.0 on the grid)
     is_goal = (grid[batch_idx, next_x, next_y] == 2.0)
     next_hunger = torch.where(is_goal, torch.zeros_like(next_hunger), next_hunger)
     
@@ -227,11 +216,9 @@ def get_obs_kernel(agent_pos, hunger, grid, food_grid, size):
         ray_type
     ], dim=1)
     
-    # Apply hunger-dependent noise directly to the spatial channels (base_obs)
     spatial_noise = torch.randn_like(base_obs) * (hunger * 0.20).unsqueeze(1)
     base_obs_noisy = base_obs + spatial_noise
     
-    # Separate channels for traditional noise channels
     noise_std = (hunger * 0.5).unsqueeze(1)
     noise = torch.randn(batch_size, 10, device=agent_pos.device) * noise_std
     
@@ -245,41 +232,24 @@ class MazeEnvTensor:
         self.device = device
         self.food_density = food_density
         
-        if grid is not None:
-            self.grid = grid.clone().to(device)
-            if self.grid.dim() == 2:
-                self.grid = self.grid.unsqueeze(0).expand(batch_size, -1, -1)
-        else:
-            self.grid = torch.zeros(batch_size, size, size, device=device)
-            for b in range(batch_size):
-                single_maze = self._generate_solvable_maze_cpu()
-                self.grid[b].copy_(single_maze)
-                
-        empty_mask = (self.grid == 0.0).float()
-        random_mask = (torch.rand(self.grid.shape, device=device) < self.food_density).float()
-        self.initial_food_grid = empty_mask * random_mask
+        self.grid = torch.zeros(batch_size, size, size, device=device)
+        self.food_grid = torch.zeros(batch_size, size, size, device=device)
         
-        # Clear food on the start position (center) and goals dynamically
-        self.initial_food_grid[:, size // 2, size // 2] = 0.0
-        for b in range(batch_size):
-            goal_idx = torch.nonzero(self.grid[b] == 2.0)
-            if len(goal_idx) > 0:
-                gr, gc = goal_idx[0]
-                self.initial_food_grid[b, gr, gc] = 0.0
-                        
-        # Initialize agent directly in the center of the grid
         self.agent_pos = torch.full((batch_size, 2), size // 2, dtype=torch.long, device=device)
-        self.food_grid = self.initial_food_grid.clone()
         self.hunger = torch.full((batch_size,), 0.5, device=device)
         self.steps = torch.zeros(batch_size, dtype=torch.long, device=device)
         
         self.last_food_eaten = torch.zeros(batch_size, dtype=torch.bool, device=device)
         self.last_at_goal = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        self.needs_reset = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        
+        self.reset()
+        if grid is not None:
+            self.grid.copy_(grid)
 
     def _generate_solvable_maze_cpu(self):
         start_pos = (self.size // 2, self.size // 2)
         while True:
-            # Randomize goal position across the board, excluding the center start position
             goal_pos = (random.randint(0, self.size - 1), random.randint(0, self.size - 1))
             if goal_pos == start_pos:
                 continue
@@ -290,7 +260,7 @@ class MazeEnvTensor:
                     if (r, c) == start_pos or (r, c) == goal_pos:
                         continue
                     if random.random() < 0.20:
-                        temp_grid[r, c] = 1.0
+                        temp_grid[r, c] = 1.0  # Wall
             
             queue = [start_pos]
             visited = {start_pos}
@@ -307,30 +277,49 @@ class MazeEnvTensor:
                             visited.add((nr, nc))
                             queue.append((nr, nc))
             if solvable:
-                temp_grid[goal_pos[0], goal_pos[1]] = 2.0
+                temp_grid[goal_pos[0], goal_pos[1]] = 2.0  # Goal
                 return temp_grid
 
     def reset(self, indices=None):
         if indices is None:
-            self.agent_pos.fill_(self.size // 2)
-            self.food_grid.copy_(self.initial_food_grid)
-            self.hunger.fill_(0.5)
-            self.steps.zero_()
-            self.last_food_eaten.zero_()
-            self.last_at_goal.zero_()
-        else:
-            self.agent_pos[indices] = self.size // 2
-            self.food_grid[indices] = self.initial_food_grid[indices]
-            self.hunger[indices] = 0.5
-            self.steps[indices] = 0
-            self.last_food_eaten[indices] = False
-            self.last_at_goal[indices] = False
+            indices = torch.arange(self.batch_size, device=self.device)
+            
+        self.agent_pos[indices] = self.size // 2
+        self.hunger[indices] = 0.5
+        self.steps[indices] = 0
+        self.last_food_eaten[indices] = False
+        self.last_at_goal[indices] = False
+        self.needs_reset[indices] = False
+        
+        for idx in indices:
+            i = idx.item()
+            single_maze = self._generate_solvable_maze_cpu()
+            self.grid[i].copy_(single_maze)
+            
+        for idx in indices:
+            i = idx.item()
+            empty_mask = (self.grid[i] == 0.0).float()
+            random_mask = (torch.rand(self.size, self.size, device=self.device) < self.food_density).float()
+            new_food = empty_mask * random_mask
+            
+            new_food[self.size // 2, self.size // 2] = 0.0
+            goal_idx = torch.nonzero(self.grid[i] == 2.0)
+            if len(goal_idx) > 0:
+                gr, gc = goal_idx[0]
+                new_food[gr, gc] = 0.0
+                
+            self.food_grid[i].copy_(new_food)
+            
         return self._get_obs()
 
     def _get_obs(self):
         return get_obs_kernel(self.agent_pos, self.hunger, self.grid, self.food_grid, self.size)
 
     def step(self, actions):
+        if self.needs_reset.any():
+            reset_idx = torch.nonzero(self.needs_reset).squeeze(-1)
+            self.reset(indices=reset_idx)
+            
         batch_idx = torch.arange(self.batch_size, device=self.device)
         old_food_grid = self.food_grid.clone()
         
@@ -340,29 +329,30 @@ class MazeEnvTensor:
         
         self.last_food_eaten = (old_food_grid[batch_idx, self.agent_pos[:, 0], self.agent_pos[:, 1]] == 1.0)
         self.last_at_goal = (self.grid[batch_idx, self.agent_pos[:, 0], self.agent_pos[:, 1]] == 2.0)
-        
-        dones = (self.steps >= 40)
-        if dones.any():
-            done_idx = torch.nonzero(dones).squeeze(-1)
-            self.reset(indices=done_idx)
+        self.needs_reset = (self.steps >= 40) | self.last_at_goal
             
         return self._get_obs()
 
     def get_state(self):
-        return (self.agent_pos.clone(), self.food_grid.clone(), self.hunger.clone(), self.steps.clone())
+        return (self.agent_pos.clone(), self.food_grid.clone(), self.hunger.clone(), self.steps.clone(), self.grid.clone(), self.needs_reset.clone())
 
     def restore_state(self, state):
         self.agent_pos.copy_(state[0])
         self.food_grid.copy_(state[1])
         self.hunger.copy_(state[2])
         self.steps.copy_(state[3])
+        self.grid.copy_(state[4])
+        if len(state) > 5:
+            self.needs_reset.copy_(state[5])
+        else:
+            self.needs_reset.fill_(False)
 
 
 # ==========================================
 # NEURAL NETWORK ARCHITECTURE
 # ==========================================
 class NodeParams3(nn.Module):
-    def __init__(self, batch_size, num_nodes, in_dim, out_dim, device):
+    def __init__(self, num_nodes, in_dim, out_dim, device):
         super().__init__() 
         self.in_dim = in_dim
         self.out_dim = out_dim
@@ -374,55 +364,48 @@ class NodeParams3(nn.Module):
         self.untanh_slope = torch.tensor(0.5, device=device)
         self.w_scale = torch.tensor(0.8, device=device)
 
-    def forward(self, x, step_counter, pop_weights=None):
+    def forward(self, x, pop_weights=None):
         if pop_weights is not None:
-            norm_weight = F.normalize(pop_weights, p=2, dim=-2) * self.w_scale.view(-1, 1, 1)
-            raw_pred = torch.einsum('pbni,pnio->pbno', x, norm_weight)
+            P = pop_weights.shape[0]
+            B = x.shape[0] // P
+            w = pop_weights.repeat_interleave(B, dim=0)
         else:
-            norm_weight = F.normalize(self.weight, p=2, dim=-2) * self.w_scale
-            raw_pred = torch.einsum('bnd,nde->bne', x, norm_weight)
+            w = self.weight.unsqueeze(0).expand(x.shape[0], -1, -1, -1)
+            
+        norm_weight = F.normalize(w, p=2, dim=-2) * self.w_scale
+        raw_pred = torch.einsum('bni,bnio->bno', x, norm_weight)
             
         bound = math.sqrt(2.0 + math.sqrt(2.0))
-        out = utils.buntanh(raw_pred, self.untanh_slope, bound)
-        return out
+        return utils.buntanh(raw_pred, self.untanh_slope, bound)
     
     def apply_hyperparams(self, config):
         self.untanh_slope = config.UNTANH.view(-1, 1, 1)
         self.w_scale = config.w_scale.view(-1, 1, 1)
 
 
-class StandardNodeNet3(nn.Module):
-    def __init__(self, batch_size, num_nodes, dim, device):
+class StatelessNodeNet3(nn.Module):
+    def __init__(self, num_nodes, dim, device, input_dim=32):
         super().__init__()
         self.N = num_nodes
         self.D = dim
         self.device = device
+        self.num_input_nodes = math.ceil(input_dim / dim)
         
-        self.w1 = NodeParams3(batch_size, num_nodes, dim, dim, device)
-        self.router = NodeParams3(batch_size, num_nodes, dim, num_nodes, device)
+        self.w1 = NodeParams3(num_nodes, dim, dim, device)
+        self.router = NodeParams3(num_nodes, dim, num_nodes, device)
         self.wnll = utils.wnormlearnloss(dim)
-        
-        self.register_buffer('state', 1e-5 * torch.randn(batch_size, self.N, dim, device=device))
-        self.register_buffer('output', 1e-5 * torch.randn(batch_size, self.N, dim, device=device))
-        self.register_buffer('error_ema', torch.ones(batch_size, self.N, device=device))
-        self.register_buffer('lp_ema', torch.zeros(batch_size, self.N, device=device))
-        self.register_buffer('step_counter', torch.tensor(0.0, device=device))
-        
-        self.state_pop = None
-        self.output_pop = None
-        self.error_ema_pop = None
-        self.lp_ema_pop = None
         
         self.c_moment = 0.8
         self.a_variance = 0.05
         self.lp_alpha = 0.1 
         self.sprs = 0.5
-    
-    def init_vectorized_states(self, P, B):
-        self.state_pop = 1e-5 * torch.randn(P, B, self.N, self.D, device=self.device)
-        self.output_pop = 1e-5 * torch.randn(P, B, self.N, self.D, device=self.device)
-        self.error_ema_pop = torch.ones(P, B, self.N, device=self.device)
-        self.lp_ema_pop = torch.zeros(P, B, self.N, device=self.device)
+
+    def init_states(self, batch_size):
+        state = 1e-5 * torch.randn(batch_size, self.N, self.D, device=self.device)
+        output = 1e-5 * torch.randn(batch_size, self.N, self.D, device=self.device)
+        error_ema = torch.ones(batch_size, self.N, device=self.device)
+        lp_ema = torch.zeros(batch_size, self.N, device=self.device)
+        return state, output, error_ema, lp_ema
 
     def apply_hyperparams(self, config):
         if hasattr(config, 'sprs'):
@@ -434,139 +417,75 @@ class StandardNodeNet3(nn.Module):
         self.w1.apply_hyperparams(config)
         self.router.apply_hyperparams(config)
 
-    def forward(self, env_input, pop_weights=None):
-        self.step_counter.add_(1.0)
+    def get_action_logits(self, state, count, voters=4):
+        num_out_nodes = math.ceil(count / self.D) * voters
+        latent_nodes = state[:, -num_out_nodes:, :]
+        return latent_nodes.sum(dim=1)[:, :count]
+
+    def forward(self, env_input, state, output, error_ema, lp_ema, pop_weights=None):
+        PB = env_input.shape[0]
+        input_dim = env_input.shape[1]
         
-        if pop_weights is not None:
-            # Cleanly retrieve population size P dynamically from object-identity keyed dict
-            P = next(iter(pop_weights.values())).shape[0]
-            B = env_input.shape[0] // P
-            input_dim = env_input.shape[1]
-            num_input_nodes = math.ceil(input_dim / self.D)
-            
-            # Map batched model parameter values cleanly using parameter identity keys
-            prediction = self.w1(self.state_pop, self.step_counter, pop_weights.get(self.w1.weight))
-            router_logits = self.router(self.state_pop, self.step_counter, pop_weights.get(self.router.weight))
-            
-            curiosity_bias = F.relu(self.lp_ema_pop).unsqueeze(2) * 5.0
-            route_logits = router_logits + curiosity_bias
-            route, aux, mask = sparse_route(route_logits, self.N, self.sprs)
-            
-            current_var = route.var(dim=[-1], keepdim=True)
-            vd = F.relu(self.a_variance.unsqueeze(0) - current_var)
-            
-            V = self.output_pop
-            base_noise = torch.sqrt(vd) * torch.randn_like(V)
-            
-            boredom_scale = torch.exp(-50.0 * F.relu(self.lp_ema_pop)).unsqueeze(-1)
-            boredom_noise = base_noise * boredom_scale
-            
-            target = torch.matmul(route, V) + boredom_noise
-            target = utils.softsign(target)
-            
-            pad_len = num_input_nodes * self.D - input_dim
-            if pad_len > 0:
-                env_input_padded = F.pad(env_input, (0, pad_len))
-            else:
-                env_input_padded = env_input
-                
-            env_input_reshaped = env_input_padded.view(P, B, num_input_nodes, self.D)
-            
-            if num_input_nodes < self.N:
-                target = torch.cat([env_input_reshaped, target[:, :, num_input_nodes:, :]], dim=2)
-            else:
-                target = env_input_reshaped
-                
-            loss_w1 = F.mse_loss(prediction, target, reduction='none')
-            
-            with torch.no_grad():
-                current_error = loss_w1.mean(dim=-1).detach()
-                current_lp = self.error_ema_pop - current_error
-                self.error_ema_pop = self.error_ema_pop * (1.0 - self.lp_alpha) + current_error * self.lp_alpha
-                self.lp_ema_pop = self.lp_ema_pop * (1.0 - self.lp_alpha) + current_lp * self.lp_alpha
-                
-            total_loss = ((loss_w1).sum() + aux) / (P * B)
-            
-            boredom_scale = torch.exp(-50.0 * torch.relu(self.lp_ema_pop)).unsqueeze(-1)
-            errm = torch.sqrt(boredom_scale) * 0.01
-            error_pass = torch.randn_like(target) * errm
-            target = target + error_pass
-            
-            self.output_pop = prediction.detach()
-            self.state_pop = target.detach()
-            
-            candidate_losses = loss_w1.mean(dim=[1, 2, 3])
-            return total_loss, candidate_losses
-            
+        w1_p = pop_weights.get(self.w1.weight) if pop_weights is not None else None
+        router_p = pop_weights.get(self.router.weight) if pop_weights is not None else None
+        
+        prediction = self.w1(state, w1_p)
+        router_logits = self.router(state, router_p)
+        
+        curiosity_bias = F.relu(lp_ema).unsqueeze(1) * 5.0
+        route_logits = router_logits + curiosity_bias
+        route, aux, mask = sparse_route_batched(route_logits, self.N, self.sprs)
+        
+        current_var = route.var(dim=[-1], keepdim=True)
+        vd = F.relu(self.a_variance - current_var)
+        
+        base_noise = torch.sqrt(vd) * torch.randn_like(output)
+        boredom_scale = torch.exp(-50.0 * F.relu(lp_ema)).unsqueeze(-1)
+        boredom_noise = base_noise * boredom_scale
+        
+        target = torch.matmul(route, output) + boredom_noise
+        target = utils.softsign(target)
+        
+        pad_len = self.num_input_nodes * self.D - input_dim
+        if pad_len > 0:
+            env_input_padded = F.pad(env_input, (0, pad_len))
         else:
-            batch_size, input_dim = env_input.shape
-            num_input_nodes = math.ceil(input_dim / self.D)
+            env_input_padded = env_input
             
-            prediction = self.w1(self.state, self.step_counter) 
-            route_logits = self.router(self.state, self.step_counter)
+        env_input_reshaped = env_input_padded.view(PB, self.num_input_nodes, self.D)
+        
+        if self.num_input_nodes < self.N:
+            target = torch.cat([env_input_reshaped, target[:, self.num_input_nodes:, :]], dim=1)
+        else:
+            target = env_input_reshaped
             
-            curiosity_bias = F.relu(self.lp_ema).unsqueeze(1) * 5.0 
-            route_logits = route_logits + curiosity_bias
-            route, aux, mask = sparse_route(route_logits, self.N, self.sprs)
+        loss_w1 = F.mse_loss(prediction, target, reduction='none')
+        
+        with torch.no_grad():
+            current_error = loss_w1.mean(dim=-1).detach()
+            current_lp = error_ema - current_error
+            next_error_ema = error_ema * (1.0 - self.lp_alpha) + current_error * self.lp_alpha
+            next_lp_ema = lp_ema * (1.0 - self.lp_alpha) + current_lp * self.lp_alpha
             
-            current_var = route.var(dim=[-1], keepdim=True)
-            vd = F.relu(self.a_variance - current_var)
-            
-            V = self.output
-            base_noise = torch.sqrt(vd) * torch.randn_like(V)
-            
-            boredom_scale = torch.exp(-50.0 * F.relu(self.lp_ema)).unsqueeze(-1) 
-            boredom_noise = base_noise * boredom_scale
-            
-            target = torch.matmul(route, V) + boredom_noise
-            target = utils.softsign(target)
-
-            pad_len = num_input_nodes * self.D - input_dim
-            if pad_len > 0:
-                env_input_padded = F.pad(env_input, (0, pad_len))
-            else:
-                env_input_padded = env_input
-                
-            env_input_reshaped = env_input_padded.view(batch_size, num_input_nodes, self.D)
-            
-            if num_input_nodes < self.N:
-                target = torch.cat([env_input_reshaped, target[:, num_input_nodes:, :]], dim=1)
-            else:
-                target = env_input_reshaped
-
-            loss_w1 = F.mse_loss(prediction, target, reduction='none')
-
-            with torch.no_grad():
-                current_error = loss_w1.mean(dim=-1).detach()
-                current_lp = self.error_ema - current_error
-                self.error_ema = self.error_ema * (1.0 - self.lp_alpha) + current_error * self.lp_alpha
-                self.lp_ema = self.lp_ema * (1.0 - self.lp_alpha) + current_lp * self.lp_alpha
-
-            total_loss = ((loss_w1).sum() + aux) / batch_size
-            
-            boredom_scale = torch.exp(-50.0 * torch.relu(self.lp_ema)).unsqueeze(-1) 
-            errm = torch.sqrt(boredom_scale) * 0.01
-            error_pass = torch.randn_like(target) * errm
-            target = target + error_pass
-
-            self.output = prediction.detach()
-            self.state = target.detach()
-
-            return total_loss
+        total_loss = ((loss_w1).sum() + aux) / PB
+        
+        boredom_scale = torch.exp(-50.0 * torch.relu(next_lp_ema)).unsqueeze(-1)
+        errm = torch.sqrt(boredom_scale) * 0.01
+        error_pass = torch.randn_like(target) * errm
+        target = target + error_pass
+        
+        next_output = prediction.detach()
+        next_state = target.detach()
+        
+        return total_loss, next_state, next_output, next_error_ema, next_lp_ema, loss_w1
 
 
 # ==========================================
 # STATE UTILITIES & EXTRINSICS
 # ==========================================
-def reset_model_buffers(model):
-    model.state.copy_(1e-5 * torch.randn_like(model.state))
-    model.output.copy_(1e-5 * torch.randn_like(model.output))
-    model.error_ema.copy_(torch.ones_like(model.error_ema))
-    model.lp_ema.copy_(torch.zeros_like(model.lp_ema))
-    model.step_counter.zero_()
-
-
-def generate_low_rank_noise(shape, rank=4, device='cuda'):
+def generate_low_rank_noise(shape, rank=4, device=None):
+    if device is None:
+        device = torch.device('cpu')
     if len(shape) < 2:
         return torch.randn(shape, device=device)
     if len(shape) == 2:
@@ -583,35 +502,226 @@ def generate_low_rank_noise(shape, rank=4, device='cuda'):
 
 
 # ==========================================
-# TRAINING PROCEDURES & OPTIMIZERS
+# DECOUPLED ROLLOUT ENGINE
 # ==========================================
-def run_gradient_descent_training(model, env, exec_config):
-    print("--- Training via Step-level Adam Backpropagation ---")
-    start_time = time.perf_counter()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=exec_config.gd_lr, weight_decay=1e-4)
-    reset_model_buffers(model)
+def model_and_env_step(model, env, obs, state, output, error_ema, lp_ema, pop_weights=None):
+    loss, next_state, next_output, next_error_ema, next_lp_ema, loss_w1 = model(
+        obs, state, output, error_ema, lp_ema, pop_weights=pop_weights
+    )
+    logits = model.get_action_logits(next_state, 4)
+    actions = torch.argmax(logits, dim=-1)
+    next_obs = env.step(actions)
+    return loss, next_state, next_output, next_error_ema, next_lp_ema, loss_w1, actions, next_obs
+
+
+def run_rollout(model, env, num_steps, state_tuple=None, pop_weights=None, step_callback=None, collect_trajectories=False):
+    if state_tuple is None:
+        state, output, error_ema, lp_ema = model.init_states(env.batch_size)
+    else:
+        state, output, error_ema, lp_ema = state_tuple
+        
+    obs = env._get_obs()
     
-    obs = env.reset()
-    losses = []
+    total_losses = []
+    total_loss_w1 = []
+    actions_list = []
     
-    for step in range(exec_config.gd_total_steps):
-        loss = model(obs)
+    current_paths = [[] for _ in range(env.batch_size)]
+    sample_grids = [env.grid[i].clone() for i in range(env.batch_size)] if collect_trajectories else None
+    sample_food_grids = [env.food_grid[i].clone() for i in range(env.batch_size)] if collect_trajectories else None
+    sample_paths = [[] for _ in range(env.batch_size)] if collect_trajectories else None
+    has_completed = [False] * env.batch_size if collect_trajectories else None
+    
+    for t in range(num_steps):
+        if collect_trajectories:
+            pos_cpu = env.agent_pos.cpu().numpy()
+            for i in range(env.batch_size):
+                current_paths[i].append((int(pos_cpu[i, 0]), int(pos_cpu[i, 1])))
+                
+        loss, state, output, error_ema, lp_ema, loss_w1, actions, obs = model_and_env_step(
+            model, env, obs, state, output, error_ema, lp_ema, pop_weights=pop_weights
+        )
         
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        total_losses.append(loss)
+        total_loss_w1.append(loss_w1)
+        actions_list.append(actions)
         
-        losses.append(loss)
-        
-        logits = model.state.sum(dim=1)[:, :4]
-        actions = torch.argmax(logits, dim=-1)
-        obs = env.step(actions)
+        if step_callback is not None:
+            step_callback(loss, state, output, error_ema, lp_ema)
             
-    end_time = time.perf_counter()
-    elapsed = end_time - start_time
-    print(f"GD Training completed in {elapsed:.2f} seconds ({elapsed/exec_config.gd_total_steps*1000:.2f} ms/step).")
-    print(f"Initial 10-step average loss: {sum(losses[:10])/10:.4f}")
-    print(f"Final 10-step average loss:   {sum(losses[-10:])/10:.4f}\n")
+        if collect_trajectories:
+            at_goal = env.last_at_goal
+            for i in range(env.batch_size):
+                if at_goal[i].item():
+                    sample_grids[i] = env.grid[i].clone()
+                    sample_food_grids[i] = env.food_grid[i].clone()
+                    sample_paths[i] = list(current_paths[i])
+                    has_completed[i] = True
+                    current_paths[i] = []
+                elif env.needs_reset[i].item():
+                    if not has_completed[i]:
+                        sample_grids[i] = env.grid[i].clone()
+                        sample_food_grids[i] = env.food_grid[i].clone()
+                        sample_paths[i] = list(current_paths[i])
+                    current_paths[i] = []
+                    
+    if collect_trajectories:
+        for i in range(env.batch_size):
+            if len(sample_paths[i]) == 0:
+                sample_paths[i] = list(current_paths[i])
+                
+    next_state_tuple = (state.detach(), output.detach(), error_ema.detach(), lp_ema.detach())
+    
+    return {
+        'losses': total_losses,
+        'loss_w1': total_loss_w1,
+        'actions': actions_list,
+        'state_tuple': next_state_tuple,
+        'grids': sample_grids,
+        'food_grids': sample_food_grids,
+        'paths': sample_paths
+    }
+
+
+# ==========================================
+# TRAINING OPTIMIZERS
+# ==========================================
+class GradientOptimizer:
+    """
+    Handles both pure Gradient Descent and Interspersed Hybrid optimization styles.
+    """
+    def __init__(self, model, exec_config, use_es_lookahead=False, lr=0.01):
+        self.model = model
+        self.exec_config = exec_config
+        self.use_es_lookahead = use_es_lookahead
+        self.optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+        self.profiler = CUDAProfiler()
+        self.state_tuple = model.init_states(exec_config.batch_size)
+        
+        # Hyperparameters for interspersed ES lookahead search
+        self.es_sigma = 0.03
+        self.es_pop_size = 4
+        self.es_rank = 4
+        self.es_check_interval = 10
+
+    def step(self, env, step_idx):
+        self.profiler.start("GD Step")
+        
+        losses = []
+        def step_callback(loss, s, o, e, l):
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            losses.append(loss.item())
+            
+        rollout_results = run_rollout(
+            self.model, env, 
+            num_steps=1, 
+            state_tuple=self.state_tuple, 
+            step_callback=step_callback
+        )
+        self.state_tuple = rollout_results['state_tuple']
+        current_loss = losses[0]
+        
+        self.profiler.stop("GD Step")
+        
+        if self.use_es_lookahead and step_idx % self.es_check_interval == 0 and step_idx > 0:
+            self.profiler.start("Parallel Lookahead Search")
+            best_fitness, best_params = self._search_lookahead(env)
+            if best_params is not None:
+                for p, param_val in best_params.items():
+                    p.data.copy_(param_val)
+                self.optimizer.state.clear()
+            self.profiler.stop("Parallel Lookahead Search")
+                
+        return current_loss
+
+    def _evaluate_rollout(self, env, P, pop_weights=None):
+        B = env.batch_size
+        device = env.device
+        
+        if pop_weights is not None:
+            grid_tiled = env.grid[:B].repeat(P, 1, 1)
+            vec_env = MazeEnvTensor(batch_size=P * B, size=env.size, grid=grid_tiled, food_density=env.food_density, device=device)
+            vec_env.restore_state((
+                env.agent_pos.repeat(P, 1),
+                env.food_grid.repeat(P, 1, 1),
+                env.hunger.repeat(P),
+                env.steps.repeat(P),
+                env.grid.repeat(P, 1, 1),
+                env.needs_reset.repeat(P)
+            ))
+            eval_batch_size = P * B
+        else:
+            vec_env = MazeEnvTensor(batch_size=B, size=env.size, grid=env.grid, food_density=env.food_density, device=device)
+            vec_env.restore_state(env.get_state())
+            eval_batch_size = B
+            P = 1
+            
+        total_food_eaten = torch.zeros(P, device=device)
+        reached_goal_count = torch.zeros(P, device=device)
+        total_hunger = torch.zeros(P, device=device)
+        steps_evaluated = 15
+        
+        def eval_callback(loss, s, o, e, l):
+            nonlocal total_food_eaten, reached_goal_count, total_hunger
+            total_food_eaten += vec_env.last_food_eaten.view(P, B).sum(dim=1).float()
+            total_hunger += vec_env.hunger.view(P, B).sum(dim=1)
+            batch_idx_vec = torch.arange(eval_batch_size, device=device)
+            at_goal = (vec_env.grid[batch_idx_vec, vec_env.agent_pos[:, 0], vec_env.agent_pos[:, 1]] == 2.0)
+            reached_goal_count += at_goal.view(P, B).sum(dim=1).float()
+            
+        rollout_data = run_rollout(
+            self.model, vec_env, 
+            num_steps=steps_evaluated, 
+            pop_weights=pop_weights,
+            step_callback=eval_callback
+        )
+        
+        stacked_losses = torch.stack(rollout_data['loss_w1'], dim=0)
+        avg_pred_loss = stacked_losses.view(steps_evaluated, P, B, self.model.N, self.model.D).mean(dim=[0, 2, 3, 4])
+        
+        avg_phys_success = ((total_food_eaten * 2.5) + (reached_goal_count * 15.0) - (total_hunger * 0.05)) / B
+        composite_fitnesses = -avg_pred_loss + 0.20 * avg_phys_success
+        return composite_fitnesses
+
+    def _search_lookahead(self, env):
+        P = self.es_pop_size
+        half_P = P // 2
+        
+        self.profiler.start("Setup & Noise Generation")
+        master_params = {p: p.clone() for p in self.model.parameters() if p.requires_grad}
+        
+        noise_dict = {}
+        pop_weights = {}
+        for p, param_val in master_params.items():
+            noise = torch.stack([
+                generate_low_rank_noise(param_val.shape, self.es_rank, device=param_val.device)
+                for _ in range(half_P)
+            ], dim=0)
+            noise_dict[p] = noise
+            
+            w_pos = param_val.unsqueeze(0) + self.es_sigma * noise
+            w_neg = param_val.unsqueeze(0) - self.es_sigma * noise
+            pop_weights[p] = torch.cat([w_pos, w_neg], dim=0)
+        self.profiler.stop("Setup & Noise Generation")
+        
+        self.profiler.start("Rollout Loop")
+        candidate_fitnesses = self._evaluate_rollout(env, P, pop_weights=pop_weights)
+        baseline_fitness = self._evaluate_rollout(env, 1, pop_weights=None).item()
+        self.profiler.stop("Rollout Loop")
+                
+        self.profiler.start("Reduce & State Restorations")
+        best_candidate_idx = torch.argmax(candidate_fitnesses).item()
+        best_fitness = candidate_fitnesses[best_candidate_idx].item()
+        self.profiler.stop("Reduce & State Restorations")
+        
+        if best_fitness > baseline_fitness:
+            best_p = {}
+            for p in master_params.keys():
+                best_p[p] = pop_weights[p][best_candidate_idx]
+            return best_fitness, best_p
+        return baseline_fitness, None
 
 
 class EGGROLLSurpriseOptimizer:
@@ -622,7 +732,6 @@ class EGGROLLSurpriseOptimizer:
         
         device = next(model.parameters()).device
         
-        # Keep master parameters indexed cleanly by Parameter object references
         self.master_param_map = {
             p: nn.Parameter(p.clone().to(device), requires_grad=True) 
             for p in model.parameters() if p.requires_grad
@@ -638,7 +747,7 @@ class EGGROLLSurpriseOptimizer:
         for p, master_p in self.master_param_map.items():
             p.data.copy_(master_p.data)
 
-    def step_generation(self, env):
+    def step(self, env, step_idx=0):
         P = self.exec_config.es_pop_size
         half_P = P // 2
         B = self.exec_config.batch_size
@@ -656,39 +765,27 @@ class EGGROLLSurpriseOptimizer:
             w_pos = master_p.unsqueeze(0) + self.exec_config.es_sigma * noise
             w_neg = master_p.unsqueeze(0) - self.exec_config.es_sigma * noise
             
-            # Map batched parameters cleanly using Parameter instance identity keys
             pop_weights[p] = torch.cat([w_pos, w_neg], dim=0)
         self.profiler.stop("1. Low-Rank Noise Generation")
             
         self.profiler.start("2. Vectorized Environment Init")
         grid_tiled = env.grid[:B].repeat(P, 1, 1)
         vec_env = MazeEnvTensor(batch_size=P * B, size=env.size, grid=grid_tiled, food_density=env.food_density, device=env.device)
-        self.model.init_vectorized_states(P, B)
-        obs = vec_env.reset()
+        vec_env.reset()
         self.profiler.stop("2. Vectorized Environment Init")
         
-        candidate_surprises = torch.zeros(P, device=env.device)
-        
         self.profiler.start("3. Complete Rollout Loop")
-        with torch.no_grad():
-            for _ in range(self.exec_config.max_episode_steps):
-                self.profiler.start("3a. Model Forward Pass (Batched)")
-                _, step_surprises = self.model(obs, pop_weights=pop_weights)
-                self.profiler.stop("3a. Model Forward Pass (Batched)")
-                
-                candidate_surprises += step_surprises
-                
-                self.profiler.start("3b. Action Extraction")
-                logits = self.model.state_pop.sum(dim=2)[:, :, :4]
-                actions = torch.argmax(logits, dim=-1).view(-1)
-                self.profiler.stop("3b. Action Extraction")
-                
-                self.profiler.start("3c. Vectorized Environment Step")
-                obs = vec_env.step(actions)
-                self.profiler.stop("3c. Vectorized Environment Step")
+        rollout_data = run_rollout(
+            self.model, vec_env, 
+            num_steps=self.exec_config.max_episode_steps, 
+            pop_weights=pop_weights
+        )
         self.profiler.stop("3. Complete Rollout Loop")
 
         self.profiler.start("4. Parameter Update & Math Reduction")
+        stacked_losses = torch.stack(rollout_data['loss_w1'], dim=0)
+        candidate_surprises = stacked_losses.view(self.exec_config.max_episode_steps, P, B, self.model.N, self.model.D).mean(dim=[0, 2, 3, 4])
+        
         surprises_pos = candidate_surprises[:half_P]
         surprises_neg = candidate_surprises[half_P:]
         
@@ -713,222 +810,42 @@ class EGGROLLSurpriseOptimizer:
         self._apply_master_to_model()
         self.profiler.stop("4. Parameter Update & Math Reduction")
         
-        return mean_s.detach()
+        return mean_s.item()
 
 
-class InterspersedHybridOptimizer:
-    def __init__(self, model, exec_config, lr=0.01, es_sigma=0.03, es_pop_size=4, es_rank=4):
-        self.model = model
-        self.exec_config = exec_config
-        self.es_sigma = es_sigma
-        self.es_pop_size = es_pop_size
-        self.es_rank = es_rank
-        self.optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-        self.profiler = CUDAProfiler()
-
-    def step(self, obs, env, step_idx, es_check_interval=10):
-        self.profiler.start("Hybrid 1. Standard GD Backprop Step")
-        loss = self.model(obs)
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        current_loss = loss
-        self.profiler.stop("Hybrid 1. Standard GD Backprop Step")
-        
-        if step_idx % es_check_interval == 0 and step_idx > 0:
-            self.profiler.start("Hybrid 2. Parallel Lookahead Search")
-            best_fitness, best_params = self._evaluate_vectorized_lookahead(env)
-            if best_params is not None:
-                for p, param_val in best_params.items():
-                    p.data.copy_(param_val)
-                self.optimizer.state.clear()
-            self.profiler.stop("Hybrid 2. Parallel Lookahead Search")
-                
-        return current_loss
-
-    def _evaluate_vectorized_lookahead(self, env):
-        P = self.es_pop_size
-        half_P = P // 2
-        B = env.batch_size
-        
-        self.profiler.start("Hybrid 2a. Setup & Noise Generation")
-        master_params = {p: p.clone() for p in self.model.parameters() if p.requires_grad}
-        
-        noise_dict = {}
-        pop_weights = {}
-        for p, param_val in master_params.items():
-            noise = torch.stack([
-                generate_low_rank_noise(param_val.shape, self.es_rank, device=param_val.device)
-                for _ in range(half_P)
-            ], dim=0)
-            noise_dict[p] = noise
-            
-            w_pos = param_val.unsqueeze(0) + self.es_sigma * noise
-            w_neg = param_val.unsqueeze(0) - self.es_sigma * noise
-            pop_weights[p] = torch.cat([w_pos, w_neg], dim=0)
-            
-        grid_tiled = env.grid[:B].repeat(P, 1, 1)
-        vec_env = MazeEnvTensor(batch_size=P * B, size=env.size, grid=grid_tiled, food_density=env.food_density, device=env.device)
-        vec_env.restore_state((
-            env.agent_pos.repeat(P, 1),
-            env.food_grid.repeat(P, 1, 1),
-            env.hunger.repeat(P),
-            env.steps.repeat(P)
-        ))
-        
-        state_backup = self.model.state.clone()
-        output_backup = self.model.output.clone()
-        error_ema_backup = self.model.error_ema.clone()
-        lp_ema_backup = self.model.lp_ema.clone()
-        step_counter_backup = self.model.step_counter.clone()
-        
-        self.model.init_vectorized_states(P, B)
-        obs = vec_env._get_obs()
-        self.profiler.stop("Hybrid 2a. Setup & Noise Generation")
-        
-        total_prediction_losses = torch.zeros(P, device=env.device)
-        total_food_eaten = torch.zeros(P, device=env.device)
-        reached_goal_count = torch.zeros(P, device=env.device)
-        total_hunger = torch.zeros(P, device=env.device)
-        steps_evaluated = 15
-        
-        self.profiler.start("Hybrid 2b. Rollout Loop (15 steps)")
-        with torch.no_grad():
-            for _ in range(steps_evaluated):
-                self.profiler.start("Hybrid 2b1. Model Forward Pass")
-                _, candidate_losses = self.model(obs, pop_weights=pop_weights)
-                self.profiler.stop("Hybrid 2b1. Model Forward Pass")
-                
-                total_prediction_losses += candidate_losses
-                
-                self.profiler.start("Hybrid 2b2. Action Selection")
-                logits = self.model.state_pop.sum(dim=2)[:, :, :4]
-                actions = torch.argmax(logits, dim=-1).view(-1)
-                self.profiler.stop("Hybrid 2b2. Action Selection")
-                
-                self.profiler.start("Hybrid 2b3. Vectorized Env Step")
-                food_before = (vec_env.food_grid == 0.0).view(P, B, -1).sum(dim=[1, 2]).float()
-                obs = vec_env.step(actions)
-                food_after = (vec_env.food_grid == 0.0).view(P, B, -1).sum(dim=[1, 2]).float()
-                self.profiler.stop("Hybrid 2b3. Vectorized Env Step")
-                
-                total_food_eaten += (food_after - food_before)
-                total_hunger += vec_env.hunger.view(P, B).sum(dim=1)
-                
-                batch_idx_vec = torch.arange(P * B, device=vec_env.device)
-                at_goal = (vec_env.grid[batch_idx_vec, vec_env.agent_pos[:, 0], vec_env.agent_pos[:, 1]] == 2.0)
-                reached_goal_count += at_goal.view(P, B).sum(dim=1).float()
-        self.profiler.stop("Hybrid 2b. Rollout Loop (15 steps)")
-                
-        self.profiler.start("Hybrid 2c. Reduce & State Restorations")
-        self.model.state.copy_(state_backup)
-        self.model.output.copy_(output_backup)
-        self.model.error_ema.copy_(error_ema_backup)
-        self.model.lp_ema.copy_(lp_ema_backup)
-        self.model.step_counter.copy_(step_counter_backup)
-        
-        avg_pred_loss = total_prediction_losses / steps_evaluated
-        avg_phys_success = ((total_food_eaten * 2.5) + (reached_goal_count * 15.0) - (total_hunger * 0.05)) / B
-        composite_fitnesses = -avg_pred_loss + 0.20 * avg_phys_success
-        
-        baseline_fitness = self._evaluate_single_fitness(env)
-        
-        best_candidate_idx = torch.argmax(composite_fitnesses)
-        best_fitness = composite_fitnesses[best_candidate_idx]
-        self.profiler.stop("Hybrid 2c. Reduce & State Restorations")
-        
-        if best_fitness > baseline_fitness:
-            best_p = {}
-            for p in master_params.keys():
-                best_p[p] = pop_weights[p][best_candidate_idx]
-            return best_fitness, best_p
-        return baseline_fitness, None
-
-    def _evaluate_single_fitness(self, env):
-        state_backup = self.model.state.clone()
-        output_backup = self.model.output.clone()
-        error_ema_backup = self.model.error_ema.clone()
-        lp_ema_backup = self.model.lp_ema.clone()
-        step_counter_backup = self.model.step_counter.clone()
-        
-        env_state = env.get_state()
-        obs = env._get_obs()
-        
-        total_pred_loss = 0.0
-        total_food_eaten = 0.0
-        reached_goal_count = 0.0
-        total_hunger = 0.0
-        steps_evaluated = 15
-        
-        batch_idx = torch.arange(env.batch_size, device=env.device)
-        
-        with torch.no_grad():
-            for _ in range(steps_evaluated):
-                loss = self.model(obs)
-                total_pred_loss += loss
-                
-                logits = self.model.state.sum(dim=1)[:, :4]
-                actions = torch.argmax(logits, dim=-1)
-                
-                food_before = (env.food_grid == 0.0).sum()
-                obs = env.step(actions)
-                food_after = (env.food_grid == 0.0).sum()
-                
-                total_food_eaten += (food_after - food_before)
-                total_hunger += env.hunger.sum()
-                
-                at_goal = (env.grid[batch_idx, env.agent_pos[:, 0], env.agent_pos[:, 1]] == 2.0)
-                reached_goal_count += at_goal.sum()
-                
-        self.model.state.copy_(state_backup)
-        self.model.output.copy_(output_backup)
-        self.model.error_ema.copy_(error_ema_backup)
-        self.model.lp_ema.copy_(lp_ema_backup)
-        self.model.step_counter.copy_(step_counter_backup)
-        env.restore_state(env_state)
-        
-        avg_pred_loss = total_pred_loss / steps_evaluated
-        avg_phys_success = ((total_food_eaten * 2.5) + (reached_goal_count * 15.0) - (total_hunger * 0.05)) / env.batch_size
-        return -avg_pred_loss + 0.20 * avg_phys_success
-
-
-def run_interspersed_hybrid_training(model, env, exec_config):
-    print("--- Training via Interspersed Hybrid (GD with Parallel ES Lookaheads) ---")
+# ==========================================
+# TRAINING COORDINATOR
+# ==========================================
+def run_training(optimizer, env, total_steps, label):
+    print(f"--- Training via {label.upper()} ---")
     start_time = time.perf_counter()
+    env.reset()
     
-    hybrid_opt = InterspersedHybridOptimizer(
-        model, 
-        exec_config, 
-        lr=exec_config.gd_lr, 
-        es_sigma=0.03,
-        es_pop_size=4,
-        es_rank=4
-    )
-    reset_model_buffers(model)
-    
-    obs = env.reset()
+    is_es = isinstance(optimizer, EGGROLLSurpriseOptimizer)
     losses = []
     
-    for step in range(exec_config.gd_total_steps):
-        loss_val = hybrid_opt.step(obs, env, step, es_check_interval=10)
+    for step in range(total_steps):
+        loss_val = optimizer.step(env, step)
         losses.append(loss_val)
         
-        logits = model.state.sum(dim=1)[:, :4]
-        actions = torch.argmax(logits, dim=-1)
-        obs = env.step(actions)
+        if is_es:
+            gen = step + 1
+            if gen % 10 == 0 or gen == 1:
+                print(f"Generation {gen:02d} | Cumulative Surprise: {loss_val:.2f}")
                 
-    end_time = time.perf_counter()
-    elapsed = end_time - start_time
-    print(f"Hybrid Interspersed Training completed in {elapsed:.2f} seconds ({elapsed/exec_config.gd_total_steps*1000:.2f} ms/step).")
-    print(f"Initial 10-step average loss: {sum(losses[:10])/10:.4f}")
-    print(f"Final 10-step average loss:   {sum(losses[-10:])/10:.4f}\n")
+    elapsed = time.perf_counter() - start_time
     
-    hybrid_opt.profiler.print_report("HYBRID OPTIMIZATION BREAKDOWN")
+    # Unified reporting
+    if not is_es:
+        print(f"{label.upper()} Training completed in {elapsed:.2f} seconds ({elapsed/total_steps*1000:.2f} ms/step).")
+        print(f"Initial 10-step average loss: {sum(losses[:10])/10:.4f}")
+        print(f"Final 10-step average loss:   {sum(losses[-10:])/10:.4f}\n")
+    else:
+        print(f"ES Training completed in {elapsed:.2f} seconds.\n")
+        
+    optimizer.profiler.print_report(f"{label.upper()} OPTIMIZATION BREAKDOWN")
 
 
-# ==========================================
-# EXPANDED HYPERPARAMETER TUNER
-# ==========================================
 class HyperParamTuner:
     def __init__(self, device, exec_config, generations=3, pop_size=16, sigma=0.08):
         self.device = device
@@ -938,82 +855,62 @@ class HyperParamTuner:
         self.sigma = sigma
         self.base_cfg = HyperParamsConfig(device)
         
-        # Instantiate model once
-        self.eval_model = StandardNodeNet3(batch_size=16, num_nodes=8, dim=16, device=self.device).to(self.device)
-        
-        # 1. Warm up and collect a static offline transition dataset once
-        print("Collecting static offline transition dataset for benchmarking...")
-        self.offline_dataset = self._collect_static_dataset(steps=40)
-        print(f"Dataset collected. Shape: {self.offline_dataset.shape} (Steps, Batch, Obs_Dim)\n")
-
-    def _collect_static_dataset(self, steps=40):
-        # We collect observations from a standard environment step sequence
-        env = MazeEnvTensor(batch_size=16, size=self.exec_config.maze_size, food_density=0.15, device=self.device)
-        obs = env.reset()
-        dataset = [obs.clone()]
-        
-        for _ in range(steps):
-            # Take random exploratory actions to generate a diverse transition map
-            actions = torch.randint(0, 4, (16,), device=self.device)
-            obs = env.step(actions)
-            dataset.append(obs.clone())
-            
-        return torch.stack(dataset, dim=0) # Shape: [Steps+1, 16, Obs_Dim]
+        self.eval_model = StatelessNodeNet3(num_nodes=8, dim=16, device=self.device).to(self.device)
 
     def _evaluate_config_offline(self, hyper_cfg):
-        """
-        Blazing fast offline evaluation. Measures how quickly the world model 
-        minimizes transition prediction error on the static GPU dataset.
-        """
-        # Apply updated hyperparameters
         self.eval_model.apply_hyperparams(hyper_cfg.to_tensor_config())
-        reset_model_buffers(self.eval_model)
-        
-        # Optimize with a simple, high-speed optimizer over the static sequence
         optimizer = torch.optim.AdamW(self.eval_model.parameters(), lr=0.01)
         
-        total_loss = 0.0
-        steps_evaluated = len(self.offline_dataset) - 1
+        env = MazeEnvTensor(batch_size=16, size=self.exec_config.maze_size, food_density=0.15, device=self.device)
+        env.reset()
         
-        # We run 3 fast optimization passes over the static sequence
+        state_tuple = self.eval_model.init_states(16)
+        steps_evaluated = 40
+        total_loss = 0.0
+        
         for epoch in range(2):
-            for t in range(steps_evaluated):
-                obs = self.offline_dataset[t]
-                target = self.offline_dataset[t + 1]
-                
-                # Model forward pass
-                loss = self.eval_model(obs)
-                
+            losses = []
+            def tuner_callback(loss, s, o, e, l):
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                losses.append(loss.item())
                 
-                if epoch == 1: # Record loss on the second epoch to measure learning speed
-                    total_loss += loss.detach()
+            rollout_results = run_rollout(
+                self.eval_model, env, 
+                num_steps=steps_evaluated, 
+                state_tuple=state_tuple, 
+                step_callback=tuner_callback
+            )
+            state_tuple = rollout_results['state_tuple']
+            if epoch == 1: 
+                total_loss += sum(losses)
                     
-        # Return a fitness score (lower predictive loss is better)
-        return - (total_loss.item() / steps_evaluated)
+        return - (total_loss / steps_evaluated)
 
     def tune(self):
         print("=== Tuning Architectural Hyperparameters via Offline Benchmark ===")
-        keys = list(self.base_cfg.params.keys())
+        
+        keys = [
+            'UNTANH', 'w_scale', 'EMA_SPEED', 'REW_SENS', 'NOISE_SCALE',
+            'speed', 'width', 'sprs', 'c_moment', 'a_variance'
+        ]
         
         best_overall_score = -float('inf')
-        best_overall_params = dict(self.base_cfg.params)
-        
+        best_overall_params = {k: getattr(self.base_cfg.cfg, k).item() for k in keys}
+
         start_time = time.perf_counter()
         
         for gen in range(1, self.generations + 1):
             noises = []
             scores = []
             
-            # Evaluate base configuration
             base_score = self._evaluate_config_offline(self.base_cfg)
             print(f"Gen {gen:02d} | Base Config Score (Neg Pred Loss): {base_score:.4f}")
             
             if base_score > best_overall_score:
                 best_overall_score = base_score
-                best_overall_params = dict(self.base_cfg.params)
+                best_overall_params = {k: getattr(self.base_cfg.cfg, k).item() for k in keys}
                 
             for _ in range(self.pop_size):
                 noise = {k: random.normalvariate(0, 1) for k in keys}
@@ -1021,31 +918,32 @@ class HyperParamTuner:
                 
                 perturbed_cfg = HyperParamsConfig(self.device)
                 for k in keys:
-                    val = self.base_cfg.params[k] + self.sigma * noise[k]
-                    # Clamp constraints
-                    if k in ['untanh', 'w_scale', 'speed', 'rew_sens']:
+                    base_val = getattr(self.base_cfg.cfg, k).item()
+                    val = base_val + self.sigma * noise[k]
+                    
+                    if k in ['UNTANH', 'w_scale', 'speed', 'REW_SENS']:
                         val = max(0.1, min(val, 3.0))
-                    elif k in ['ema_speed', 'sprs', 'c_moment']:
+                    elif k in ['EMA_SPEED', 'sprs', 'c_moment']:
                         val = max(0.01, min(val, 0.99))
-                    elif k == 'noise_scale':
+                    elif k == 'NOISE_SCALE':
                         val = max(0.0, min(val, 0.5))
                     elif k == 'width':
                         val = max(0.001, min(val, 0.1))
                     elif k == 'a_variance':
                         val = max(0.0001, min(val, 0.05))
-                    perturbed_cfg.params[k] = val
+                    
+                    getattr(perturbed_cfg.cfg, k).data.fill_(val)
                     
                 score = self._evaluate_config_offline(perturbed_cfg)
                 scores.append(score)
                 
                 if score > best_overall_score:
                     best_overall_score = score
-                    best_overall_params = dict(perturbed_cfg.params)
+                    best_overall_params = {k: getattr(perturbed_cfg.cfg, k).item() for k in keys}
                 
             mean_score = sum(scores) / len(scores)
             std_score = math.sqrt(sum((s - mean_score)**2 for s in scores) + 1e-8)
             
-            # Apply parameter updates
             for k in keys:
                 grad = 0.0
                 for i in range(self.pop_size):
@@ -1053,38 +951,40 @@ class HyperParamTuner:
                     grad += norm_fitness * noises[i][k]
                 grad /= (self.pop_size * self.sigma)
                 
-                self.base_cfg.params[k] += 0.05 * grad
+                current_val = getattr(self.base_cfg.cfg, k).item()
+                new_val = current_val + 0.05 * grad
                 
-                # Apply boundary clamps
-                if k in ['untanh', 'w_scale', 'speed', 'rew_sens']:
-                    self.base_cfg.params[k] = max(0.1, min(self.base_cfg.params[k], 3.0))
-                elif k in ['ema_speed', 'sprs', 'c_moment']:
-                    self.base_cfg.params[k] = max(0.01, min(self.base_cfg.params[k], 0.99))
-                elif k == 'noise_scale':
-                    self.base_cfg.params[k] = max(0.0, min(self.base_cfg.params[k], 0.5))
+                if k in ['UNTANH', 'w_scale', 'speed', 'REW_SENS']:
+                    new_val = max(0.1, min(new_val, 3.0))
+                elif k in ['EMA_SPEED', 'sprs', 'c_moment']:
+                    new_val = max(0.01, min(new_val, 0.99))
+                elif k == 'NOISE_SCALE':
+                    new_val = max(0.0, min(new_val, 0.5))
                 elif k == 'width':
-                    self.base_cfg.params[k] = max(0.001, min(self.base_cfg.params[k], 0.1))
+                    new_val = max(0.001, min(new_val, 0.1))
                 elif k == 'a_variance':
-                    self.base_cfg.params[k] = max(0.0001, min(self.base_cfg.params[k], 0.05))
+                    new_val = max(0.0001, min(new_val, 0.05))
+                    
+                getattr(self.base_cfg.cfg, k).data.fill_(new_val)
 
         elapsed = time.perf_counter() - start_time
         print(f"\nTuning completed in {elapsed:.2f} seconds!")
         print("--- Optimized Hyperparameters Found ---")
-        self.base_cfg.params = best_overall_params
-        for k, v in self.base_cfg.params.items():
+        
+        for k, v in best_overall_params.items():
+            getattr(self.base_cfg.cfg, k).data.fill_(v)
             print(f"  {k:15s}: {v:.6f}")
+            
         print(f"  Best evaluation score reached: {best_overall_score:.4f}")
         print("========================================\n")
         return self.base_cfg
 
+
 # ==========================================
 # VISUALIZATION & EVALUATION FUNCTIONS
 # ==========================================
-def render_trajectory_tensor(env, path, batch_idx=0):
-    grid = env.grid[batch_idx].cpu()
-    food_grid = env.food_grid[batch_idx].cpu()
-    size = env.size
-    
+def render_trajectory_tensor(grid, food_grid, path):
+    size = grid.shape[0]
     output_grid = []
     for r in range(size):
         row = []
@@ -1105,90 +1005,65 @@ def render_trajectory_tensor(env, path, batch_idx=0):
     print("\n".join(output_grid))
 
 
-def find_best_path(paths, env):
-    best_idx = 0
-    best_score = (float('inf'), float('inf'))
-    
-    for i, path in enumerate(paths):
-        # Dynamically fetch the random goal location of batch element i
-        goal_idx = torch.nonzero(env.grid[i] == 2.0)
-        goal_pos = (int(goal_idx[0, 0]), int(goal_idx[0, 1]))
-        
-        reached = False
-        min_dist = float('inf')
-        steps_to_reach = float('inf')
-        
-        for step_idx, pos in enumerate(path):
-            dist = abs(pos[0] - goal_pos[0]) + abs(pos[1] - goal_pos[1])
-            if dist < min_dist:
-                min_dist = dist
-            if dist == 0 and not reached:
-                reached = True
-                steps_to_reach = step_idx + 1
-        
-        score = (min_dist, steps_to_reach)
-        if score < best_score:
-            best_score = score
-            best_idx = i
-            
-    return best_idx
+def select_sample_to_render(eval_results):
+    goals = eval_results['goals_reached']
+    return int(goals.argmax())
 
 
 def run_evaluation(model, env, exec_config, label):
-    """Runs a single clean 40-step evaluation episode and records exact positions."""
     print(f"=== Final Evaluation for {label} ===")
-    reset_model_buffers(model)
-    obs = env.reset()
+    env.reset()
     
     total_food_eaten = torch.zeros(env.batch_size, device=env.device)
     goals_reached = torch.zeros(env.batch_size, device=env.device)
     ever_reached_goal = torch.zeros(env.batch_size, dtype=torch.bool, device=env.device)
     
-    paths = [[] for _ in range(env.batch_size)]
+    def eval_metric_callback(loss, s, o, e, l):
+        nonlocal total_food_eaten, ever_reached_goal, goals_reached
+        total_food_eaten += env.last_food_eaten.float()
+        ever_reached_goal = ever_reached_goal | env.last_at_goal
+        goals_reached += env.last_at_goal.float()
+        
+    rollout_data = run_rollout(
+        model, env, 
+        num_steps=exec_config.max_episode_steps, 
+        step_callback=eval_metric_callback,
+        collect_trajectories=True
+    )
     
-    with torch.no_grad():
-        for _ in range(exec_config.max_episode_steps):
-            pos_cpu = env.agent_pos.cpu().numpy()
-            for i in range(env.batch_size):
-                paths[i].append((int(pos_cpu[i, 0]), int(pos_cpu[i, 1])))
-                
-            _ = model(obs)
-            logits = model.state.sum(dim=1)[:, :4]
-            actions = torch.argmax(logits, dim=-1)
-            
-            obs = env.step(actions)
-            
-            total_food_eaten += env.last_food_eaten.float()
-            ever_reached_goal = ever_reached_goal | env.last_at_goal
-            goals_reached += env.last_at_goal.float()
-            
-    avg_food = total_food_eaten.mean()
-    success_rate = ever_reached_goal.float().mean() * 100.0
-    avg_goals = goals_reached.mean()
+    avg_food = total_food_eaten.mean().item()
+    success_rate = ever_reached_goal.float().mean().item() * 100.0
+    avg_goals = goals_reached.mean().item()
+    max_goals = goals_reached.max().item()
+    min_goals = goals_reached.min().item()
     
     print(f"  Avg Food Eaten per Episode:        {avg_food:.2f}")
     print(f"  Goal Success Rate (Exit Reached):  {success_rate:.1f}%")
-    print(f"  Avg Goal Reaches per Episode:      {avg_goals:.2f}\n")
-    return paths
+    print(f"  Avg Goal Reaches per Episode:      {avg_goals:.2f} (Max: {int(max_goals)}, Min: {int(min_goals)})\n")
+    
+    return {
+        'grids': rollout_data['grids'],
+        'food_grids': rollout_data['food_grids'],
+        'paths': rollout_data['paths'],
+        'goals_reached': goals_reached.cpu().numpy()
+    }
 
 
 # ==========================================
 # EXECUTION ENTRYPOINT
 # ==========================================
 if __name__ == "__main__":
-    torch.set_float32_matmul_precision('high')
+    random.seed(42)
+    torch.manual_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}\n")
-    
+    torch.set_float32_matmul_precision('high')
     exec_config = ExecutionConfig()
     
-    # --- STEP A: Tuning Architectural Hyperparameters via JIT-Compiled ES ---
     tuner = HyperParamTuner(device, exec_config, generations=3, pop_size=16)
-    optimized_hyper_config = tuner.tune()#exec_config.maze_size)
+    optimized_hyper_config = tuner.tune()
     tensor_hyper_config = optimized_hyper_config.to_tensor_config()
     
-    # --- STEP B: Initialize Batched GPU Environments ---
-    # Use standard 15% sparse food layouts for trials
     ref_env = MazeEnvTensor(batch_size=1, size=exec_config.maze_size, food_density=0.15, device=device)
     ref_grid = ref_env.grid[0]
     grid_batched = ref_grid.unsqueeze(0).expand(exec_config.batch_size, -1, -1)
@@ -1197,66 +1072,87 @@ if __name__ == "__main__":
     envs_es = MazeEnvTensor(batch_size=exec_config.batch_size, size=exec_config.maze_size, grid=grid_batched, food_density=0.15, device=device)
     envs_hybrid = MazeEnvTensor(batch_size=exec_config.batch_size, size=exec_config.maze_size, grid=grid_batched, food_density=0.15, device=device)
     
-    # --- TRIAL 1: Backpropagation (AdamW in High-speed Eager Mode) ---
-    model_gd = StandardNodeNet3(
-        batch_size=exec_config.batch_size, 
+    # ------------------------------------------
+    # 1. GRADIENT DESCENT (TRIAL 1)
+    # ------------------------------------------
+    model_gd = StatelessNodeNet3(
         num_nodes=exec_config.num_nodes, 
         dim=exec_config.dim, 
         device=device
     ).to(device)
     model_gd.apply_hyperparams(tensor_hyper_config)
     
-    run_gradient_descent_training(model_gd, envs_gd, exec_config)
-    gd_eval_paths = run_evaluation(model_gd, envs_gd, exec_config, "Gradient Descent (Trial 1)")
+    optimizer_gd = GradientOptimizer(
+        model_gd, 
+        exec_config, 
+        use_es_lookahead=False, 
+        lr=exec_config.gd_lr
+    )
     
-    best_gd_idx = find_best_path(gd_eval_paths, envs_gd)
-    print(f"Rendering Best Path for GD (Batch Element {best_gd_idx + 1}):")
-    render_trajectory_tensor(envs_gd, gd_eval_paths[best_gd_idx], batch_idx=best_gd_idx)
-    print()
+    run_training(optimizer_gd, envs_gd, total_steps=exec_config.gd_total_steps, label="GD")
+    gd_eval_results = run_evaluation(model_gd, envs_gd, exec_config, "Gradient Descent (Trial 1)")
     
+    best_gd_idx = select_sample_to_render(gd_eval_results)
+    print(f"Rendering Last Completed Maze for GD (Batch Element {best_gd_idx + 1}):")
+    render_trajectory_tensor(
+        gd_eval_results['grids'][best_gd_idx].cpu(),
+        gd_eval_results['food_grids'][best_gd_idx].cpu(),
+        gd_eval_results['paths'][best_gd_idx]
+    )
     print("\n" + "="*50 + "\n")
     
-    # --- TRIAL 2: Parallel EGGROLL ES Evolution (with Profiler) ---
-    model_es = StandardNodeNet3(
-        batch_size=exec_config.batch_size, 
+    # ------------------------------------------
+    # 2. EGGROLL ES (TRIAL 2)
+    # ------------------------------------------
+    model_es = StatelessNodeNet3(
         num_nodes=exec_config.num_nodes, 
         dim=exec_config.dim, 
         device=device
     ).to(device)
     model_es.apply_hyperparams(tensor_hyper_config)
     
-    es_opt = EGGROLLSurpriseOptimizer(model_es, exec_config)
-    es_start = time.perf_counter()
-    for gen in range(1, exec_config.es_generations + 1):
-        mean_surprise = es_opt.step_generation(envs_es)
-        if gen % 10 == 0 or gen == 1:
-            print(f"Generation {gen:02d} | Cumulative Surprise: {mean_surprise:.2f}")
-    es_elapsed = time.perf_counter() - es_start
-    print(f"ES Training completed in {es_elapsed:.2f} seconds.\n")
+    optimizer_es = EGGROLLSurpriseOptimizer(
+        model_es, 
+        exec_config
+    )
     
-    es_opt.profiler.print_report("EGGROLL ES OPTIMIZATION BREAKDOWN")
-            
-    es_eval_paths = run_evaluation(model_es, envs_es, exec_config, "EGGROLL ES (Trial 2)")
-    best_es_idx = find_best_path(es_eval_paths, envs_es)
-    print(f"Rendering Best Path for ES (Batch Element {best_es_idx + 1}):")
-    render_trajectory_tensor(envs_es, es_eval_paths[best_es_idx], batch_idx=best_es_idx)
-    print()
-        
+    run_training(optimizer_es, envs_es, total_steps=exec_config.es_generations, label="ES")
+    es_eval_results = run_evaluation(model_es, envs_es, exec_config, "EGGROLL ES (Trial 2)")
+    
+    best_es_idx = select_sample_to_render(es_eval_results)
+    print(f"Rendering Last Completed Maze for ES (Batch Element {best_es_idx + 1}):")
+    render_trajectory_tensor(
+        es_eval_results['grids'][best_es_idx].cpu(),
+        es_eval_results['food_grids'][best_es_idx].cpu(),
+        es_eval_results['paths'][best_es_idx]
+    )
     print("\n" + "="*50 + "\n")
-    
-    # --- TRIAL 3: Interspersed Hybrid (GD with Parallel ES Lookaheads) ---
-    model_hybrid = StandardNodeNet3(
-        batch_size=exec_config.batch_size, 
+        
+    # ------------------------------------------
+    # 3. INTERSPERSED HYBRID (TRIAL 3)
+    # ------------------------------------------
+    model_hybrid = StatelessNodeNet3(
         num_nodes=exec_config.num_nodes, 
         dim=exec_config.dim, 
         device=device
     ).to(device)
     model_hybrid.apply_hyperparams(tensor_hyper_config)
     
-    run_interspersed_hybrid_training(model_hybrid, envs_hybrid, exec_config)
-    hybrid_eval_paths = run_evaluation(model_hybrid, envs_hybrid, exec_config, "Interspersed Hybrid (Trial 3)")
+    optimizer_hybrid = GradientOptimizer(
+        model_hybrid, 
+        exec_config, 
+        use_es_lookahead=True, 
+        lr=exec_config.gd_lr
+    )
     
-    best_hybrid_idx = find_best_path(hybrid_eval_paths, envs_hybrid)
-    print(f"Rendering Best Path for Hybrid (Batch Element {best_hybrid_idx + 1}):")
-    render_trajectory_tensor(envs_hybrid, hybrid_eval_paths[best_hybrid_idx], batch_idx=best_hybrid_idx)
+    run_training(optimizer_hybrid, envs_hybrid, total_steps=exec_config.gd_total_steps, label="Hybrid")
+    hybrid_eval_results = run_evaluation(model_hybrid, envs_hybrid, exec_config, "Interspersed Hybrid (Trial 3)")
+    
+    best_hybrid_idx = select_sample_to_render(hybrid_eval_results)
+    print(f"Rendering Last Completed Maze for Hybrid (Batch Element {best_hybrid_idx + 1}):")
+    render_trajectory_tensor(
+        hybrid_eval_results['grids'][best_hybrid_idx].cpu(),
+        hybrid_eval_results['food_grids'][best_hybrid_idx].cpu(),
+        hybrid_eval_results['paths'][best_hybrid_idx]
+    )
     print()

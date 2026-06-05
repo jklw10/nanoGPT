@@ -13,10 +13,6 @@ class MenuAction(Enum):
 	jump    = 5
 
 class Menu():
-	"""
-	 A menu base class you can make a menu tree easily from.
-      see PyGameMenu for reference
-	"""	    
 	def __init__(self, menu_items, draw_f, input_f, on_exit=None, draw_ctx=None):
 		self.menu_items = menu_items
 		self.selected 	= 0
