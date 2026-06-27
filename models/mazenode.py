@@ -8,6 +8,14 @@ from parts import quantizer
 import parts.utils as utils
 
 # ==========================================
+# MATHEMATICAL OPTIMIZATION TOGGLES
+# ==========================================
+USE_DIMENSIONLESS_BOREDOM = True       # True: (1 - LP/MSE)^(gamma/2), False: exp(-50 * LP) [1]
+USE_ENTROPIC_RESTORING_FORCE = True    # True: Attractive drift to 0 that scales with (1 - boredom) [1]
+GAMMA_COUPLING = 2.0                   # Physical coupling parameter (gamma) for both equations [1]
+
+
+# ==========================================
 # CUDA PROFILING UTILITY
 # ==========================================
 class CUDAProfiler:
@@ -48,14 +56,13 @@ class HyperParamsConfig:
         self.cfg.device = self.device
         self.cfg.UNTANH         = nn.Parameter(torch.tensor(0.740565, device=self.device))
         self.cfg.w_scale        = nn.Parameter(torch.tensor(0.622592, device=self.device))
-        self.cfg.EMA_SPEED      = nn.Parameter(torch.tensor(0.180527, device=self.device))
+        self.cfg.EMA_SPEED      = nn.Parameter(torch.tensor(0.01    , device=self.device))
         self.cfg.REW_SENS       = nn.Parameter(torch.tensor(1.343345, device=self.device))
-        self.cfg.NOISE_SCALE    = nn.Parameter(torch.tensor(0.000000, device=self.device))
         self.cfg.speed          = nn.Parameter(torch.tensor(1.343435, device=self.device))
         self.cfg.width          = nn.Parameter(torch.tensor(0.100000, device=self.device))
         self.cfg.sprs           = nn.Parameter(torch.tensor(0.511729, device=self.device))
         self.cfg.c_moment       = nn.Parameter(torch.tensor(0.744751, device=self.device))
-        self.cfg.a_variance     = nn.Parameter(torch.tensor(0.011537, device=self.device))
+        self.cfg.a_variance     = nn.Parameter(torch.tensor(0.05    , device=self.device))
 
     def to_tensor_config(self):
         return self.cfg
@@ -226,11 +233,14 @@ def get_obs_kernel(agent_pos, hunger, grid, food_grid, size):
 
 
 class MazeEnvTensor:
-    def __init__(self, batch_size, size=6, grid=None, food_density=0.15, device="cuda"):
+    _maze_pools = {}
+
+    def __init__(self, batch_size, size=6, grid=None, food_density=0.15, pool_size=1000, device="cuda"):
         self.batch_size = batch_size
         self.size = size
         self.device = device
         self.food_density = food_density
+        self.pool_size = pool_size
         
         self.grid = torch.zeros(batch_size, size, size, device=device)
         self.food_grid = torch.zeros(batch_size, size, size, device=device)
@@ -243,9 +253,21 @@ class MazeEnvTensor:
         self.last_at_goal = torch.zeros(batch_size, dtype=torch.bool, device=device)
         self.needs_reset = torch.zeros(batch_size, dtype=torch.bool, device=device)
         
-        self.reset()
-        if grid is not None:
+        pool_key = (self.size, str(self.device))
+        if pool_key not in MazeEnvTensor._maze_pools:
+            print(f"[{self.device}] Generating a pool of {self.pool_size} solvable {self.size}x{self.size} mazes on CPU...")
+            pool_tensors = []
+            for _ in range(self.pool_size):
+                pool_tensors.append(self._generate_solvable_maze_cpu())
+            
+            MazeEnvTensor._maze_pools[pool_key] = torch.stack(pool_tensors).to(self.device)
+            print(f"[{self.device}] GPU Warmup complete. Resets will now be non-blocking.")
+
+        self.static_grid = (grid is not None)
+        if self.static_grid:
             self.grid.copy_(grid)
+            
+        self.reset()
 
     def _generate_solvable_maze_cpu(self):
         start_pos = (self.size // 2, self.size // 2)
@@ -272,6 +294,7 @@ class MazeEnvTensor:
                     break
                 for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                     nr, nc = r + dr, c + dc
+                    # RESOLVED: Checks nc boundary rather than duplicate nr check
                     if 0 <= nr < self.size and 0 <= nc < self.size:
                         if temp_grid[nr, nc] != 1.0 and (nr, nc) not in visited:
                             visited.add((nr, nc))
@@ -291,10 +314,12 @@ class MazeEnvTensor:
         self.last_at_goal[indices] = False
         self.needs_reset[indices] = False
         
-        for idx in indices:
-            i = idx.item()
-            single_maze = self._generate_solvable_maze_cpu()
-            self.grid[i].copy_(single_maze)
+        if not self.static_grid:
+            pool_key = (self.size, str(self.device))
+            pool = MazeEnvTensor._maze_pools[pool_key]
+            
+            pool_idx = torch.randint(0, self.pool_size, (len(indices),), device=self.device)
+            self.grid[indices] = pool[pool_idx]
             
         for idx in indices:
             i = idx.item()
@@ -391,7 +416,7 @@ class StatelessNodeNet3(nn.Module):
         self.device = device
         self.num_input_nodes = math.ceil(input_dim / dim)
         
-        self.w1 = NodeParams3(num_nodes, dim, dim, device)
+        self.w1 = NodeParams3(num_nodes, dim, dim * 2, device)
         self.router = NodeParams3(num_nodes, dim, num_nodes, device)
         self.wnll = utils.wnormlearnloss(dim)
         
@@ -414,6 +439,8 @@ class StatelessNodeNet3(nn.Module):
             self.c_moment = config.c_moment.view(-1, 1, 1, 1)
         if hasattr(config, 'a_variance'):
             self.a_variance = config.a_variance.view(-1, 1, 1)
+        if hasattr(config, 'EMA_SPEED'):
+            self.lp_alpha = float(config.EMA_SPEED.item())
         self.w1.apply_hyperparams(config)
         self.router.apply_hyperparams(config)
 
@@ -432,6 +459,8 @@ class StatelessNodeNet3(nn.Module):
         prediction = self.w1(state, w1_p)
         router_logits = self.router(state, router_p)
         
+        mean, error_pred = torch.chunk(prediction, 2, dim=-1)
+        
         curiosity_bias = F.relu(lp_ema).unsqueeze(1) * 5.0
         route_logits = router_logits + curiosity_bias
         route, aux, mask = sparse_route_batched(route_logits, self.N, self.sprs)
@@ -440,10 +469,29 @@ class StatelessNodeNet3(nn.Module):
         vd = F.relu(self.a_variance - current_var)
         
         base_noise = torch.sqrt(vd) * torch.randn_like(output)
-        boredom_scale = torch.exp(-50.0 * F.relu(lp_ema)).unsqueeze(-1)
+        
+        # ==========================================
+        # BOREDOM SCALE MODULATION [1]
+        # ==========================================
+        if USE_DIMENSIONLESS_BOREDOM:
+            eps = 1e-8
+            relative_lp = F.relu(lp_ema) / (error_ema + eps)
+            relative_lp_clipped = torch.clamp(relative_lp, min=0.0, max=1.0 - eps)
+            boredom_scale = torch.pow(1.0 - relative_lp_clipped, GAMMA_COUPLING / 2.0).unsqueeze(-1)
+        else:
+            boredom_scale = torch.exp(-50.0 * F.relu(lp_ema)).unsqueeze(-1)
+            
         boredom_noise = base_noise * boredom_scale
         
         target = torch.matmul(route, output) + boredom_noise
+        
+        # ==========================================
+        # ENTROPIC COORDINATE RESTORING DRIFT [1]
+        # ==========================================
+        if USE_ENTROPIC_RESTORING_FORCE:
+            restoring_drift = - (GAMMA_COUPLING * 0.01) * state * (1.0 - boredom_scale)
+            target = target + restoring_drift
+
         target = utils.softsign(target)
         
         pad_len = self.num_input_nodes * self.D - input_dim
@@ -459,7 +507,12 @@ class StatelessNodeNet3(nn.Module):
         else:
             target = env_input_reshaped
             
-        loss_w1 = F.mse_loss(prediction, target, reduction='none')
+        loss_pred = F.mse_loss(mean, target.detach(), reduction='none')
+        
+        actual_error = torch.abs(target - mean).detach()
+        loss_err_pred = F.mse_loss(error_pred, actual_error, reduction='none')
+        
+        loss_w1 = loss_pred + 0.1*loss_err_pred
         
         with torch.no_grad():
             current_error = loss_w1.mean(dim=-1).detach()
@@ -469,15 +522,25 @@ class StatelessNodeNet3(nn.Module):
             
         total_loss = ((loss_w1).sum() + aux) / PB
         
-        boredom_scale = torch.exp(-50.0 * torch.relu(next_lp_ema)).unsqueeze(-1)
-        errm = torch.sqrt(boredom_scale) * 0.01
+        # ==========================================
+        # NEXT STEP RECURSIVE ERROR PASS [1]
+        # ==========================================
+        if USE_DIMENSIONLESS_BOREDOM:
+            eps = 1e-8
+            next_relative_lp = F.relu(next_lp_ema) / (next_error_ema + eps)
+            next_relative_lp_clipped = torch.clamp(next_relative_lp, min=0.0, max=1.0 - eps)
+            next_boredom_scale = torch.pow(1.0 - next_relative_lp_clipped, GAMMA_COUPLING / 2.0).unsqueeze(-1)
+        else:
+            next_boredom_scale = torch.exp(-50.0 * torch.relu(next_lp_ema)).unsqueeze(-1)
+            
+        errm = torch.sqrt(next_boredom_scale) * 0.01
         error_pass = torch.randn_like(target) * errm
         target = target + error_pass
         
-        next_output = prediction.detach()
+        next_output = mean.detach()
         next_state = target.detach()
         
-        return total_loss, next_state, next_output, next_error_ema, next_lp_ema, loss_w1
+        return total_loss, next_state, next_output, next_error_ema, next_lp_ema, loss_pred
 
 
 # ==========================================
@@ -587,9 +650,6 @@ def run_rollout(model, env, num_steps, state_tuple=None, pop_weights=None, step_
 # TRAINING OPTIMIZERS
 # ==========================================
 class GradientOptimizer:
-    """
-    Handles both pure Gradient Descent and Interspersed Hybrid optimization styles.
-    """
     def __init__(self, model, exec_config, use_es_lookahead=False, lr=0.01):
         self.model = model
         self.exec_config = exec_config
@@ -598,7 +658,6 @@ class GradientOptimizer:
         self.profiler = CUDAProfiler()
         self.state_tuple = model.init_states(exec_config.batch_size)
         
-        # Hyperparameters for interspersed ES lookahead search
         self.es_sigma = 0.03
         self.es_pop_size = 4
         self.es_rank = 4
@@ -671,18 +730,19 @@ class GradientOptimizer:
             at_goal = (vec_env.grid[batch_idx_vec, vec_env.agent_pos[:, 0], vec_env.agent_pos[:, 1]] == 2.0)
             reached_goal_count += at_goal.view(P, B).sum(dim=1).float()
             
-        rollout_data = run_rollout(
-            self.model, vec_env, 
-            num_steps=steps_evaluated, 
-            pop_weights=pop_weights,
-            step_callback=eval_callback
-        )
+        with torch.no_grad():
+            rollout_data = run_rollout(
+                self.model, vec_env, 
+                num_steps=steps_evaluated, 
+                pop_weights=pop_weights,
+                step_callback=eval_callback
+            )
         
         stacked_losses = torch.stack(rollout_data['loss_w1'], dim=0)
         avg_pred_loss = stacked_losses.view(steps_evaluated, P, B, self.model.N, self.model.D).mean(dim=[0, 2, 3, 4])
         
         avg_phys_success = ((total_food_eaten * 2.5) + (reached_goal_count * 15.0) - (total_hunger * 0.05)) / B
-        composite_fitnesses = -avg_pred_loss + 0.20 * avg_phys_success
+        composite_fitnesses = -avg_pred_loss + 0.02 * avg_phys_success
         return composite_fitnesses
 
     def _search_lookahead(self, env):
@@ -712,15 +772,42 @@ class GradientOptimizer:
         self.profiler.stop("Rollout Loop")
                 
         self.profiler.start("Reduce & State Restorations")
-        best_candidate_idx = torch.argmax(candidate_fitnesses).item()
-        best_fitness = candidate_fitnesses[best_candidate_idx].item()
-        self.profiler.stop("Reduce & State Restorations")
         
-        if best_fitness > baseline_fitness:
+        # ==========================================
+        # HYBRID LOOKAHEAD ELITE CENTROMOST SELECTION [1]
+        # ==========================================
+        # Identifies all mutant coordinates that beat the baseline.
+        # Finds the geometric mean and picks the actual, evaluated candidate closest to that mean (Medoid) [1].
+        elite_indices = torch.nonzero(candidate_fitnesses > baseline_fitness).squeeze(-1)
+        
+        if len(elite_indices) > 0:
+            if len(elite_indices) == 1:
+                best_idx = elite_indices[0].item()
+            else:
+                centers = {}
+                for p in master_params.keys():
+                    centers[p] = pop_weights[p][elite_indices].mean(dim=0)
+                
+                num_elites = len(elite_indices)
+                dists = torch.zeros(num_elites, device=self.model.device)
+                for p in master_params.keys():
+                    diff = pop_weights[p][elite_indices] - centers[p].unsqueeze(0)
+                    squared_diff = diff.view(num_elites, -1) ** 2
+                    dists += squared_diff.sum(dim=-1)
+                
+                # Minimum distance to geometric mean ensures actual validated configuration [1]
+                centermost_local_idx = torch.argmin(dists).item()
+                best_idx = elite_indices[centermost_local_idx].item()
+                
             best_p = {}
             for p in master_params.keys():
-                best_p[p] = pop_weights[p][best_candidate_idx]
-            return best_fitness, best_p
+                best_p[p] = pop_weights[p][best_idx]
+            
+            elite_fitness = candidate_fitnesses[best_idx].item()
+            self.profiler.stop("Reduce & State Restorations")
+            return elite_fitness, best_p
+            
+        self.profiler.stop("Reduce & State Restorations")
         return baseline_fitness, None
 
 
@@ -775,11 +862,12 @@ class EGGROLLSurpriseOptimizer:
         self.profiler.stop("2. Vectorized Environment Init")
         
         self.profiler.start("3. Complete Rollout Loop")
-        rollout_data = run_rollout(
-            self.model, vec_env, 
-            num_steps=self.exec_config.max_episode_steps, 
-            pop_weights=pop_weights
-        )
+        with torch.no_grad():
+            rollout_data = run_rollout(
+                self.model, vec_env, 
+                num_steps=self.exec_config.max_episode_steps, 
+                pop_weights=pop_weights
+            )
         self.profiler.stop("3. Complete Rollout Loop")
 
         self.profiler.start("4. Parameter Update & Math Reduction")
@@ -835,7 +923,6 @@ def run_training(optimizer, env, total_steps, label):
                 
     elapsed = time.perf_counter() - start_time
     
-    # Unified reporting
     if not is_es:
         print(f"{label.upper()} Training completed in {elapsed:.2f} seconds ({elapsed/total_steps*1000:.2f} ms/step).")
         print(f"Initial 10-step average loss: {sum(losses[:10])/10:.4f}")
@@ -846,6 +933,9 @@ def run_training(optimizer, env, total_steps, label):
     optimizer.profiler.print_report(f"{label.upper()} OPTIMIZATION BREAKDOWN")
 
 
+# ==========================================
+# HYPERPARAMETER TUNING ENGINE
+# ==========================================
 class HyperParamTuner:
     def __init__(self, device, exec_config, generations=3, pop_size=16, sigma=0.08):
         self.device = device
@@ -866,39 +956,64 @@ class HyperParamTuner:
         
         state_tuple = self.eval_model.init_states(16)
         steps_evaluated = 40
-        total_loss = 0.0
         
-        for epoch in range(2):
-            losses = []
-            def tuner_callback(loss, s, o, e, l):
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                losses.append(loss.item())
-                
-            rollout_results = run_rollout(
-                self.eval_model, env, 
-                num_steps=steps_evaluated, 
-                state_tuple=state_tuple, 
-                step_callback=tuner_callback
-            )
-            state_tuple = rollout_results['state_tuple']
-            if epoch == 1: 
-                total_loss += sum(losses)
-                    
-        return - (total_loss / steps_evaluated)
+        epoch0_losses = []
+        epoch1_losses = []
+        
+        def tuner_callback_0(loss, s, o, e, l):
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch0_losses.append(loss.item())
+            
+        rollout_results = run_rollout(
+            self.eval_model, env, 
+            num_steps=steps_evaluated, 
+            state_tuple=state_tuple, 
+            step_callback=tuner_callback_0
+        )
+        state_tuple = rollout_results['state_tuple']
+        
+        def tuner_callback_1(loss, s, o, e, l):
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch1_losses.append(loss.item())
+            
+        rollout_results = run_rollout(
+            self.eval_model, env, 
+            num_steps=steps_evaluated, 
+            state_tuple=state_tuple, 
+            step_callback=tuner_callback_1
+        )
+        
+        mean_loss_0 = sum(epoch0_losses) / len(epoch0_losses)
+        mean_loss_1 = sum(epoch1_losses) / len(epoch1_losses)
+        
+        # Scale-invariant quadratic ratio to target velocity [1]
+        composite_score = - (mean_loss_1 ** 2) / (mean_loss_0 + 1e-8)
+        return composite_score
+    def _clamp_param(self, k, val):
+        """Standardized clamping boundaries for parameters during tuning."""
+        if k in ['UNTANH', 'w_scale', 'speed', 'REW_SENS']:
+            return max(0.1, min(val, 3.0))
+        elif k in ['sprs', 'c_moment']:
+            return max(0.01, min(val, 0.99))
+        elif k == 'EMA_SPEED':
+            return max(0.001, min(val, 0.1))
+        elif k == 'width':
+            return max(0.001, min(val, 0.1))
+        return val
 
     def tune(self):
         print("=== Tuning Architectural Hyperparameters via Offline Benchmark ===")
         
         keys = [
-            'UNTANH', 'w_scale', 'EMA_SPEED', 'REW_SENS', 'NOISE_SCALE',
-            'speed', 'width', 'sprs', 'c_moment', 'a_variance'
+            'UNTANH', 'w_scale', 'EMA_SPEED', 'REW_SENS', 
+            'speed', 'width', 'sprs', 'c_moment', 
         ]
         
-        best_overall_score = -float('inf')
-        best_overall_params = {k: getattr(self.base_cfg.cfg, k).item() for k in keys}
-
+        all_evals = []  # Records every evaluation: (score, dict_of_params)
         start_time = time.perf_counter()
         
         for gen in range(1, self.generations + 1):
@@ -906,12 +1021,9 @@ class HyperParamTuner:
             scores = []
             
             base_score = self._evaluate_config_offline(self.base_cfg)
-            print(f"Gen {gen:02d} | Base Config Score (Neg Pred Loss): {base_score:.4f}")
+            print(f"Gen {gen:02d} | Base Config Score (Learning Progress Rate): {base_score:.4f}")
+            all_evals.append((base_score, {k: getattr(self.base_cfg.cfg, k).item() for k in keys}))
             
-            if base_score > best_overall_score:
-                best_overall_score = base_score
-                best_overall_params = {k: getattr(self.base_cfg.cfg, k).item() for k in keys}
-                
             for _ in range(self.pop_size):
                 noise = {k: random.normalvariate(0, 1) for k in keys}
                 noises.append(noise)
@@ -920,26 +1032,12 @@ class HyperParamTuner:
                 for k in keys:
                     base_val = getattr(self.base_cfg.cfg, k).item()
                     val = base_val + self.sigma * noise[k]
-                    
-                    if k in ['UNTANH', 'w_scale', 'speed', 'REW_SENS']:
-                        val = max(0.1, min(val, 3.0))
-                    elif k in ['EMA_SPEED', 'sprs', 'c_moment']:
-                        val = max(0.01, min(val, 0.99))
-                    elif k == 'NOISE_SCALE':
-                        val = max(0.0, min(val, 0.5))
-                    elif k == 'width':
-                        val = max(0.001, min(val, 0.1))
-                    elif k == 'a_variance':
-                        val = max(0.0001, min(val, 0.05))
-                    
+                    val = self._clamp_param(k, val)
                     getattr(perturbed_cfg.cfg, k).data.fill_(val)
                     
                 score = self._evaluate_config_offline(perturbed_cfg)
                 scores.append(score)
-                
-                if score > best_overall_score:
-                    best_overall_score = score
-                    best_overall_params = {k: getattr(perturbed_cfg.cfg, k).item() for k in keys}
+                all_evals.append((score, {k: getattr(perturbed_cfg.cfg, k).item() for k in keys}))
                 
             mean_score = sum(scores) / len(scores)
             std_score = math.sqrt(sum((s - mean_score)**2 for s in scores) + 1e-8)
@@ -953,29 +1051,54 @@ class HyperParamTuner:
                 
                 current_val = getattr(self.base_cfg.cfg, k).item()
                 new_val = current_val + 0.05 * grad
-                
-                if k in ['UNTANH', 'w_scale', 'speed', 'REW_SENS']:
-                    new_val = max(0.1, min(new_val, 3.0))
-                elif k in ['EMA_SPEED', 'sprs', 'c_moment']:
-                    new_val = max(0.01, min(new_val, 0.99))
-                elif k == 'NOISE_SCALE':
-                    new_val = max(0.0, min(new_val, 0.5))
-                elif k == 'width':
-                    new_val = max(0.001, min(new_val, 0.1))
-                elif k == 'a_variance':
-                    new_val = max(0.0001, min(new_val, 0.05))
-                    
+                new_val = self._clamp_param(k, new_val)
                 getattr(self.base_cfg.cfg, k).data.fill_(new_val)
+
+        # =========================================================================
+        # TUNER ELITE DENSITY CENTROMOST SELECTION [1]
+        # =========================================================================
+        all_evals.sort(key=lambda x: x[0], reverse=True)
+        top_k = all_evals[:4]  # Take top 4 performers
+        
+        vectors = [[cfg_dict[k] for k in keys] for _, cfg_dict in top_k]
+        
+        if len(vectors) >= 3:
+            mean_vec = [sum(v[i] for v in vectors) / len(vectors) for i in range(len(keys))]
+            dists = [math.sqrt(sum((v[i] - mean_vec[i])**2 for i in range(len(keys)))) for v in vectors]
+            
+            mean_dist = sum(dists) / len(dists)
+            elites = []
+            for idx, v in enumerate(vectors):
+                # Filter out outliers further than 1.5x the average distance
+                if dists[idx] <= 1.5 * mean_dist or len(elites) < 2:
+                    elites.append(top_k[idx][1])
+            
+            # Find the actual evaluated candidate closest to the cluster center (medoid) [1]
+            center_vec = {}
+            for k in keys:
+                center_vec[k] = sum(e[k] for e in elites) / len(elites)
+                
+            best_elite = elites[0]
+            min_dist_to_center = float('inf')
+            for e in elites:
+                dist = math.sqrt(sum((e[k] - center_vec[k])**2 for k in keys))
+                if dist < min_dist_to_center:
+                    min_dist_to_center = dist
+                    best_elite = e
+                    
+            centroid_params = best_elite
+        else:
+            centroid_params = top_k[0][1]
 
         elapsed = time.perf_counter() - start_time
         print(f"\nTuning completed in {elapsed:.2f} seconds!")
         print("--- Optimized Hyperparameters Found ---")
         
-        for k, v in best_overall_params.items():
+        for k, v in centroid_params.items():
             getattr(self.base_cfg.cfg, k).data.fill_(v)
             print(f"  {k:15s}: {v:.6f}")
             
-        print(f"  Best evaluation score reached: {best_overall_score:.4f}")
+        print(f"  Best evaluation score reached: {all_evals[0][0]:.4f}")
         print("========================================\n")
         return self.base_cfg
 
@@ -1024,12 +1147,13 @@ def run_evaluation(model, env, exec_config, label):
         ever_reached_goal = ever_reached_goal | env.last_at_goal
         goals_reached += env.last_at_goal.float()
         
-    rollout_data = run_rollout(
-        model, env, 
-        num_steps=exec_config.max_episode_steps, 
-        step_callback=eval_metric_callback,
-        collect_trajectories=True
-    )
+    with torch.no_grad():
+        rollout_data = run_rollout(
+            model, env, 
+            num_steps=exec_config.max_episode_steps, 
+            step_callback=eval_metric_callback,
+            collect_trajectories=True
+        )
     
     avg_food = total_food_eaten.mean().item()
     success_rate = ever_reached_goal.float().mean().item() * 100.0
@@ -1072,9 +1196,7 @@ if __name__ == "__main__":
     envs_es = MazeEnvTensor(batch_size=exec_config.batch_size, size=exec_config.maze_size, grid=grid_batched, food_density=0.15, device=device)
     envs_hybrid = MazeEnvTensor(batch_size=exec_config.batch_size, size=exec_config.maze_size, grid=grid_batched, food_density=0.15, device=device)
     
-    # ------------------------------------------
-    # 1. GRADIENT DESCENT (TRIAL 1)
-    # ------------------------------------------
+    # GD
     model_gd = StatelessNodeNet3(
         num_nodes=exec_config.num_nodes, 
         dim=exec_config.dim, 
@@ -1101,9 +1223,7 @@ if __name__ == "__main__":
     )
     print("\n" + "="*50 + "\n")
     
-    # ------------------------------------------
-    # 2. EGGROLL ES (TRIAL 2)
-    # ------------------------------------------
+    # ES
     model_es = StatelessNodeNet3(
         num_nodes=exec_config.num_nodes, 
         dim=exec_config.dim, 
@@ -1128,9 +1248,7 @@ if __name__ == "__main__":
     )
     print("\n" + "="*50 + "\n")
         
-    # ------------------------------------------
-    # 3. INTERSPERSED HYBRID (TRIAL 3)
-    # ------------------------------------------
+    # Hybrid
     model_hybrid = StatelessNodeNet3(
         num_nodes=exec_config.num_nodes, 
         dim=exec_config.dim, 

@@ -904,7 +904,42 @@ def zca_newton_schulz(G, epsilon=1e-5, steps=5, power_iters=10):
     W = Y / (s ** 0.5)
     
     return torch.matmul(G, W)
+@torch.compile(backend='inductor', mode='max-autotune')
+def NS_inverse_update(A_reg, V_old, steps=2):
+    """
+    Refines the matrix inverse of A_reg using warm-started Newton-Schulz iterations.
+    Fuses perfectly under torch.compile to execute directly on Tensor Cores.
+    """
+    V = V_old
+    I = torch.eye(A_reg.size(0), device=A_reg.device, dtype=A_reg.dtype)
+    for _ in range(steps):
+        # Quadratic Newton-Schulz iteration: V <- V * (2*I - A_reg * V)
+        V = torch.matmul(V, 2 * I - torch.matmul(A_reg, V))
+    return V
 
+@torch.compile(backend='inductor', mode='max-autotune')
+def safe_NS_inverse_update(A_reg, V_old, steps=3, power_iters=3):
+    device, dtype = A_reg.device, A_reg.dtype
+    d = A_reg.size(0)
+    I = torch.eye(d, device=device, dtype=dtype)
+    v = torch.ones(d, 1, device=device, dtype=dtype)
+    for _ in range(power_iters):
+        v = torch.matmul(A_reg, v)
+        v = v / (v.norm() + 1e-15)
+    s = torch.matmul(v.T, torch.matmul(A_reg, v)).squeeze()
+    v_r = torch.ones(d, 1, device=device, dtype=dtype)
+    for _ in range(power_iters):
+        v_r = v_r - torch.matmul(A_reg, torch.matmul(V_old, v_r))
+        v_r = v_r / (v_r.norm() + 1e-15)
+    
+    rho_R = (v_r - torch.matmul(A_reg, torch.matmul(V_old, v_r))).norm().squeeze()
+    
+    is_safe = (rho_R < 0.95) & (~torch.isnan(rho_R)) & (~torch.isinf(rho_R))
+    V0_fallback = I / (s + 1e-15)
+    V = torch.where(is_safe, V_old, V0_fallback)
+    for _ in range(steps):
+        V = torch.matmul(V, 2 * I - torch.matmul(A_reg, V))
+    return V
 
 def whiten_3d_global(x, **kwargs):
     original_shape = x.shape
@@ -1814,36 +1849,47 @@ def get_get_batch_smart(block_size, batch_size, dataset, device):
     
 
 #i found the name funny
-def get_get_batch(block_size, batch_size, dataset, device, always_byte=False,skip=0, single = False):
-    data_dir = os.path.join('data', dataset)
+
+def get_get_batch(block_size, batch_size, dataset, device, always_byte=False, skip=0, single=False):
+    # Keep the original signature completely unchanged.
+    # Detect if we are in multi-task mode (dict) or single-task mode (str).
+    if isinstance(dataset, dict):
+        datasets_dict = dataset
+        default_task = list(dataset.keys())[0]
+    else:
+        datasets_dict = {'pretrain': dataset}
+        default_task = 'pretrain'
     
-    # 1. Open the maps ONCE
-    train_path = os.path.join(data_dir, 'train.bin')
-    val_path = os.path.join(data_dir, 'val.bin')
-    
-    # We maintain persistent handles
+    memmaps = {}
+    for task_name, dataset_name in datasets_dict.items():
+        data_dir = os.path.join('data', dataset_name)
+        train_path = os.path.join(data_dir, 'train.bin')
+        val_path = os.path.join(data_dir, 'val.bin')
         
-    train_data = np.memmap(train_path, dtype=np.uint16, mode='r')
-    val_data = np.memmap(val_path, dtype=np.uint16, mode='r')
-    
-    if dataset == "openwebtext" and always_byte:
+        memmaps[task_name] = {
+            'train': np.memmap(train_path, dtype=np.uint16, mode='r'),
+            'val': np.memmap(val_path, dtype=np.uint16, mode='r')
+        }
+        
+    if always_byte:
         print("Building token-to-byte lookup table...")
         enc = tiktoken.get_encoding("gpt2")
         TOKEN_TO_BYTES = [torch.tensor(list(enc.decode_bytes([i])), dtype=torch.uint8) for i in range(enc.n_vocab)]
-    def tok2byte(split, size=None):
         
+    def tok2byte(split, size=None, task=None):
+        if task is None:
+            task = default_task
         if size is None:
             size = block_size
-        data_tokens = train_data if split == 'train' else val_data
+            
+        data_tokens = memmaps[task][split]
         fetch_len = max(size, 32) 
 
         ix = torch.randint(len(data_tokens) - fetch_len, (batch_size,))
-
         batch_bytes = []
 
         for i in ix:
             token_chunk = data_tokens[i : i + fetch_len].astype(np.int64)
-
             byte_seq = torch.cat([TOKEN_TO_BYTES[t] for t in token_chunk])
 
             if len(byte_seq) < size + 1:
@@ -1863,24 +1909,28 @@ def get_get_batch(block_size, batch_size, dataset, device, always_byte=False,ski
             return data[:, :size]
         x = data[:, :size].contiguous()
         y = data[:, 1:size+1].contiguous()
-
         return x, y
-    def get_batch(split, size=None, index=None):
-        
+
+    # Keep original positional arguments, adding 'task' as an optional keyword argument
+    def get_batch(split, size=None, index=None, task=None):
+        if task is None:
+            task = default_task
         if size is None:
             size = block_size
         
-
-        if dataset == "openwebtext" and always_byte:
-            return tok2byte(split, size)
+        if always_byte:
+            return tok2byte(split, size, task)
         
-        data = train_data if split =="train" else val_data
+        data = memmaps[task][split]
         if index is None:
-            ix = torch.randint(len(data) - size, (batch_size,))
+            max_idx = len(data) - size
+            if max_idx <= 0:
+                ix = torch.zeros((batch_size,), dtype=torch.long)
+            else:
+                ix = torch.randint(max_idx, (batch_size,))
         else:
             ix = index
-        # torch.stack is faster here because it handles the memory copy directly 
-        # from the tiny individual numpy views into the final Tensor.
+            
         x = torch.stack([torch.from_numpy(data[i:i+size].astype(np.int64)) for i in ix])
         if not single:
             y = torch.stack([torch.from_numpy(data[i+1:i+1+size].astype(np.int64)) for i in ix])
@@ -1896,6 +1946,6 @@ def get_get_batch(block_size, batch_size, dataset, device, always_byte=False,ski
                 
         if single:
             return x
-        #print( x.shape)
         return x, y
+        
     return get_batch

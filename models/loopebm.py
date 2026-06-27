@@ -41,8 +41,8 @@ class SolverConfig:
     gate_penalty: float = gate_penalty
     
     # EBM hyper-parameters
-    untanh_slope: float = 1.03
-    w_scale: float      = 0.63
+    untanh_slope: float = 0.8
+    w_scale: float      = 0.8
     sprs: float         = 0.5
     
     # StandardNodeNet3 hyper-parameters

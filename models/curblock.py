@@ -2,53 +2,57 @@ import math
 import os
 import time
 
-from cut_cross_entropy import linear_cross_entropy
-import pickle
+from attr import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import parts.modules as modules
+from parts.modules import HungryLinear, HungryPattLayer, PattLayer
 import parts.utils as utils
-
-dataset = "openwebtext"
-data_dir = os.path.join('data', dataset)
-batch_size = 64
-block_size = 64
-n_embed = 256
-n_head = 8
-n_layer = 4
-
-dropout = 0.0
-max_iters = 50000
-eval_interval = 1000
-learning_rate = 1e-3
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-device_type = 'cuda'
-warmup_iters = 200
-lr_decay_iters = 30000
-min_lr = learning_rate/10
-beta2 = 0.999 
-weight_decay = 0.1
-
+import numpy as np
 torch._inductor.config.disable_cpp_codegen = True
 
+Linear          = HungryLinear
+Patt            = HungryPattLayer
+#dataset        = "shakespeare_char"
+dataset         = "openwebtext"
+data_dir        = os.path.join('data', dataset)
 
-idk_enabled = False
-cl          = False
-mem         = False
-gradlog     = False
-gen         = False
-wnorm       = False
-genloss     = True
-qkhwn       = True
+device          = 'cuda' if torch.cuda.is_available() else 'cpu'
+bias            = False
 
-#todo, wnorm, midreset, lr on memory, memswizzle,
-#ablate hierarchy, add innerblocks, make hierarchical output generation
+batch_size      = 64
+block_size      = 64
 
-wn = torch.nn.utils.parametrizations.weight_norm
+pattcount       = 512
+
+n_embd          = 256
+n_head          = 8
+n_layer         = 4
+dropout         = 0.0
+weight_decay    = 1e-1
+
+eval_interval   = 1000
+eval_iters      = 200
+warmup_iters    = 100
+max_iters       = 50000
+lr_decay_iters  = 30000
+decay_iters     = 5000
+
+learning_rate   = 5e-4
+min_lr          = 5e-5
+
+spl             = False
+soloblock       = False
+sspl            = False
+wnll            = True
+patt            = True
+always_byte     = True
+
+config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
+train_logging = False
+exec(open('training_tools/configurator.py').read()) # overrides from command line or config file
 
 def get_lr(it):
-    
     if it < warmup_iters:
         return learning_rate * (it + 1) / (warmup_iters + 1)
     
@@ -59,355 +63,499 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) 
     return min_lr + coeff * (learning_rate - min_lr)
 
+# Pass a dictionary containing task mappings to the 'dataset' parameter
+dataset_config = {
+    'pretrain': 'openwebtext',
+    'sft': 'sft',
+    'cot': 'cot'
+}
 
-decode, vocab_size = utils.get_meta(dataset,always_byte=True)
-get_batch = utils.get_get_batch(block_size,batch_size,dataset,device,always_byte=True)
+task_probs = {
+    'pretrain': 0.40,
+    'sft': 0.30,
+    'cot': 0.30
+}
+tasks = list(task_probs.keys())
+probs = list(task_probs.values())
 
-# ==========================================
-# 2-STAGE COGNITIVE CURIOSITY SYSTEM
-# ==========================================
-class Stage2HashedCuriosity(nn.Module):
-    def __init__(self, embed, num_nodes=256, lp_alpha=0.01):
+# Call signature remains identical to your original code
+decode, vocab_size = utils.get_meta('openwebtext', always_byte=always_byte)
+get_batch = utils.get_get_batch(
+    block_size, 
+    batch_size, 
+    dataset_config, # Passing the dictionary here
+    device, 
+    always_byte=always_byte
+)
+
+@dataclass
+class GPTConfig:
+    block_size: int = 1024
+    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    n_layer: int    = 12
+    n_head: int     = 12
+    n_embd: int     = 768
+    dropout: float  = 0.0
+    bias: bool      = False # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    
+    device          = 'cuda'
+    optimizer: str  = 'adam'
+    batch_size      = 64
+    step            = 0
+    
+    # Active Inference Settings
+    num_orders: int = 8         # 3 orders = smoothed error, velocity (LP), acceleration
+    lp_alpha: float = 0.01       # EMA decay multiplier
+    gamma_coupling: float = utils.phi  # Gamma coupling factor for boredom scaling
+
+
+class LayerNorm(nn.Module):
+    def __init__(self, config):
         super().__init__()
-        self.num_nodes = num_nodes
-        self.lp_alpha = lp_alpha
-        
-        # Auto-hash router using weight-normalized linear layers
-        self.router = nn.Sequential(
-            wn(nn.Linear(embed, embed * 2, bias=False), dim=None),
-            nn.GELU(),
-            wn(nn.Linear(embed * 2, num_nodes, bias=False), dim=-1)
-        )
-        
-        # Persistent conceptual buffers
-        self.register_buffer('error_ema', torch.ones(num_nodes))
-        self.register_buffer('lp_ema', torch.zeros(num_nodes))
-
-    def forward(self, x, L_stage1, L_stage2):
-        # x: [B, T, embed] - representations right before the lookahead stage (e.g., g2_emb)
-        # L_stage1: [B, T] - causal prediction losses (aligned with target idx[:, 2:])
-        # L_stage2: [B, T] - non-causal lookahead losses (aligned with target idx[:, 2:])
-        
-        # 1. STOP GRADIENT FLOW: Prevent representation distortion
-        x_detached = x.detach()
-        
-        # Get soft hashing weights over nodes
-        logits = self.router(x_detached)
-        hash_weights = F.softmax(logits, dim=-1)  # [B, T, num_nodes]
-        
-        # Clone tracking buffers to avoid in-place version check autograd issues
-        error_ema_clone = self.error_ema.clone()
-        lp_ema_clone = self.lp_ema.clone()
-        
-        # Retrieve tracked metrics from concepts
-        token_expected_loss = torch.einsum('btk,k->bt', hash_weights, error_ema_clone)
-        token_lp = torch.einsum('btk,k->bt', hash_weights, lp_ema_clone)
-        
-        # Instantaneous learning progress: change in loss yielded by thinking
-        inst_lp = L_stage1 - L_stage2
-        
-        if self.training:
-            with torch.no_grad():
-                # Summarize batch variables per node
-                node_weights_sum = hash_weights.sum(dim=[0, 1])  # [num_nodes]
-                weighted_loss_sum = torch.einsum('btk,bt->k', hash_weights, L_stage1.detach())
-                weighted_lp_sum = torch.einsum('btk,bt->k', hash_weights, inst_lp.detach())
-                
-                safe_denom = torch.clamp(node_weights_sum, min=1e-5)
-                batch_mean_loss = weighted_loss_sum / safe_denom
-                batch_mean_lp = weighted_lp_sum / safe_denom
-                
-                # Dynamic update rates scaled by activation strength
-                update_rate = self.lp_alpha * torch.clamp(node_weights_sum / 10.0, max=1.0)
-                
-                # Perform in-place copy
-                self.error_ema.copy_((1.0 - update_rate) * self.error_ema + update_rate * batch_mean_loss)
-                self.lp_ema.copy_((1.0 - update_rate) * self.lp_ema + update_rate * batch_mean_lp)
-                
-        # Auxiliary loss ensuring the router learns accurate mappings of state cognitive difficulty
-        router_prediction_loss = F.mse_loss(token_expected_loss, L_stage1.detach()) + \
-                                 F.mse_loss(token_lp, inst_lp.detach())
-                                 
-        return token_lp, router_prediction_loss
+        self.weight = nn.Parameter(torch.ones(config.n_embd))
+        self.bias = nn.Parameter(torch.zeros(config.n_embd)) if config.bias else None
+       
+    def forward(self, input):
+        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
 
-class Model(nn.Module):
-    def __init__(self, vocab_size, k=5, lambda_thought=0.1, **kwargs):
+class Attention(nn.Module):
+    def __init__(self, config):
         super().__init__()
+        assert config.n_embd % config.n_head == 0
+        self.q_attn = (Linear(config.n_embd, config.n_embd, bias=config.bias))
+        self.k_attn = (Linear(config.n_embd, config.n_embd, bias=config.bias))
+        self.v_attn = Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj = Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head 
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        self.head_dim =  self.n_embd //  self.n_head 
+        self.qm = nn.Parameter(torch.ones(self.head_dim).normal_(mean=1, std=0.1))
+    
+    def forward(self, x, causal=True):
+        B, T, C = x.size() 
+        q = self.q_attn(x)
+        k = self.k_attn(x)
+        v = self.v_attn(x)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+
+        q_scale = math.log(T)*self.qm
+        y = torch.nn.functional.scaled_dot_product_attention(q*q_scale,k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal= causal)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) 
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
+
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.n_embd = config.n_embd
+        up = 4
+        self.c_fc    = Linear(config.n_embd, up * config.n_embd, bias=config.bias)
+        self.gelu    = nn.GELU()
+        self.c_proj  = Linear( up * config.n_embd, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+        if patt:
+            self.patt = Patt(config.n_embd, config.n_embd, pattcount)
+
+    def forward(self, x):
+        if patt:
+            return self.patt(x)
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        x = self.dropout(x)
+        return x
+    
+
+class Block(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.attn = Attention(config)
+        self.ln_1 = LayerNorm(config)
+        self.ln_2 = LayerNorm(config)
+        self.mlp = MLP(config)
+        self.register_buffer("block_input",torch.zeros([config.block_size, config.n_embd]))
         
-        if qkhwn:
-            wte = (nn.Embedding(vocab_size, n_embed))
-        else:
-            wte = nn.Embedding(vocab_size, n_embed)
+    def forward(self, x, causal = True):
+        self.block_input = x
+        x = x + self.attn(self.ln_1(x), causal)
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+    def spl(self, x):
+        predicted_output = self(-x, causal = False)
+        sploss = F.mse_loss(
+            utils.rms_norm(predicted_output.flatten()),
+            utils.rms_norm(self.block_input.flatten())
+        ) 
+        return sploss
+
+
+class GPT(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.vocab_size is not None
+        assert config.block_size is not None
+        self.n_embd = config.n_embd
+        self.config = config
+        blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        
+        wpe = nn.Embedding(config.block_size, config.n_embd)
 
         self.transformer = nn.ModuleDict(dict(
-            wte = wte,
-            wpe = nn.Embedding(block_size+1, n_embed),
-            h = nn.ModuleList([modules.Block(n_embed, n_head, dropout, False) for _ in range(n_layer)]),
-            ln_f = nn.LayerNorm(n_embed),
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wpe = wpe,
+            drop = nn.Dropout(config.dropout),
+            h = blocks,
+            ln_f = LayerNorm(config),
         ))
-        
-        if qkhwn:
-            self.lm_head =  (modules.OrthogonalLinear(n_embed, vocab_size, bias=False))
-            self.transformer.wte.weight = self.lm_head.weight 
-        else:
-            self.lm_head =  nn.Linear(n_embed, vocab_size, bias=False)
-            self.transformer.wte.weight = self.lm_head.weight 
-        
-        self.lambda_corrected = 0.0
-        self.k = k 
-        self.lambda_thought = lambda_thought 
-        
-        # Initialize 2-Stage Hashed Curiosity system
-        self.curiosity = Stage2HashedCuriosity(n_embed, num_nodes=256)
 
-    def transformer_forward(self, x, causal = True):
-        for i, block in enumerate(self.transformer.h):
-            x = block(x, causal)
-        return self.transformer.ln_f(x)
+        self.lm_head = Linear(config.n_embd, config.vocab_size, bias=False)
+        self.transformer.wte.weight = self.lm_head.weight 
+        self.wnl = utils.wnormlearnloss(config.n_embd)
         
-    def quant(self, x):
-        B,T,C = x.shape
+        # -------------------------------------------------------------
+        # Tunable-Order Active Inference Setup
+        # -------------------------------------------------------------
+        self.num_orders = config.num_orders
+        self.lp_alpha = config.lp_alpha
+        self.gamma_coupling = config.gamma_coupling
         
-        weight = self.transformer.wte.weight
-        V,_ = weight.shape
-        q = x.view(B, 1, T, C)
-        k = weight.view(1, 1, V, C) 
-        v = weight.view(1, 1, V, C)
-        scale = 10.0 
-        return F.scaled_dot_product_attention(q, k, v, scale=scale).view(x.shape)
+        # Register cascade buffer: ema_states[0] = error, ema_states[1:] = derivatives
+        self.register_buffer("ema_states", torch.zeros(self.num_orders))
+        
+        # Generative predictor layer (hidden state to next target embedding)
+        self.predictor = Linear(config.n_embd, config.n_embd, bias=config.bias)
+        # -------------------------------------------------------------
 
-    def forward(self, idx, Train=False, gumbel_temp=1.0, cl = 0.0):
-        B, T = idx.size()
-        T -= 2
+        self.apply(self._init_weights)
+        for pn, module in self.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                torch.nn.init.normal_(module, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+
+    def forward(self, idx, targets=None, decaying = 0.0, get_emb = False):
         device = idx.device
-        if not Train:
-            x = self.transformer.wte(idx)
-            hidden_states, _ = self.ssmfwd(x)
-            logits = self.lm_head(hidden_states)
-            return logits, None, None
+        b, t = idx.size()
         
         tok_emb = self.transformer.wte(idx)
-        pos_emb = self.transformer.wpe(torch.arange(T+1, device=device))
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
+        pos_emb = self.transformer.wpe(pos)
+        
+        x = tok_emb + pos_emb
+        x = self.transformer.drop(x)
+        
+        if self.training and wnll:
+            wnl = self.wnl(x)
+            wnl = wnl.flatten()
+            
+        x1 = x
+        for i, block in enumerate(self.transformer.h):
+            if soloblock:
+                x = self.transformer.h[0](x) 
+            else:
+                x = block(x) 
 
-        # 2-Stage Boredom Noise Perturbation
-        if self.training and cl > 0.0:
+        if isinstance(x, tuple):
+            x = x[0]
+            
+        # =========================================================================
+        # Active Inference & Tunable-Order Gamma Boredom
+        # =========================================================================
+        aux_loss = 0.0
+        
+        if self.training and t > 1:
+            current_hidden = x[:, :-1]
+            target_emb = tok_emb[:, 1:].detach()
+            
+            # Unit norm projection to secure latent space geometry
+            norm_current = F.normalize(current_hidden, p=2, dim=-1)
+            norm_target = F.normalize(target_emb, p=2, dim=-1)
+            
+            predicted_next = self.predictor(norm_current)
+            aux_loss = F.mse_loss(predicted_next, norm_target, reduction='mean')
+            
             with torch.no_grad():
-                # Query dynamic learning progress (cognitive gain) of context embeddings
-                dummy_s1 = torch.ones(B, T, device=device)
-                dummy_s2 = torch.ones(B, T, device=device)
-                token_lp_lookup, _ = self.curiosity(tok_emb[:, 1:-1, :], dummy_s1, dummy_s2)
+                current_val = aux_loss.detach()
+                next_ema_states = []
                 
-                # Boredom scale: high when learning progress (thinking improvement) is near or below 0
-                boredom_scale = torch.exp(-50.0 * F.relu(token_lp_lookup)).unsqueeze(-1)  # [B, T, 1]
+                # Recursive derivative EMA chain
+                for k in range(self.num_orders):
+                    prev_ema = self.ema_states[k]
+                    deriv = prev_ema - current_val
+                    
+                    new_ema = prev_ema * (1.0 - self.lp_alpha) + current_val * self.lp_alpha
+                    next_ema_states.append(new_ema)
+                    
+                    current_val = deriv
                 
-                # Inject noise into boring/trivial token embeddings to act as context-aware regularizers
-                noise_scale = 0.01
-                boredom_noise = torch.randn_like(tok_emb[:, 1:-1, :]) * noise_scale * boredom_scale
+                self.ema_states.copy_(torch.stack(next_ema_states))
                 
-            # Perturb embeddings in training slice
-            tok_emb = tok_emb.clone()
-            tok_emb[:, 1:-1, :] = tok_emb[:, 1:-1, :] + boredom_noise
-
-        x = tok_emb[:,:-2,:]
-        Y1_gt = idx[:, 1:-1]
-        
-        full_x = self.transformer_forward(tok_emb[:,:-1,:]+pos_emb)
-        
-        g2_emb = full_x[:, :-1,:]
-        g2_emb = g2_emb+pos_emb[1:,:]
-        gen2_x = self.transformer_forward(g2_emb,causal=False)
-
-        bfw = self.lm_head.weight.to(torch.bfloat16)
-        
-        L_guess = linear_cross_entropy(
-            gen2_x.to(torch.bfloat16),
-            bfw, 
-            idx[:, 2:], 
-            impl='torch_compile', 
-            reduction='none',
-            ).view(Y1_gt.shape)
-
-        L_all = linear_cross_entropy(
-            full_x.to(torch.bfloat16),
-            bfw, 
-            idx[:, 1:], 
-            impl='torch_compile', 
-            reduction='none',
-            ).view(idx[:, 1:].shape)
-        
-        if self.training:
-            # Align Stage 1 and Stage 2 losses over targets idx[:, 2:] (length T)
-            L_stage1 = L_all[:, 1:]
-            L_stage2 = L_guess
+                # -------------------------------------------------------------
+                # Dimensionless Gamma Boredom Calculation
+                # -------------------------------------------------------------
+                eps = 1e-8
+                smoothed_error = self.ema_states[0]
+                
+                # Combined progress: sum positive parts of higher-order EMAs
+                total_lp = torch.stack([F.relu(self.ema_states[i]) for i in range(1, self.num_orders)]).sum()
+                
+                # Normalize learning progress by baseline error to make it dimensionless
+                relative_lp = total_lp / (smoothed_error + eps)
+                relative_lp_clipped = torch.clamp(relative_lp, min=0.0, max=1.0 - eps)
+                
+                # Gamma coupling exponential decay
+                boredom_scale = torch.pow(1.0 - relative_lp_clipped, self.gamma_coupling / 2.0)
+                # -------------------------------------------------------------
             
-            # Pass intermediate features passively to updating curiosity router
-            _, router_loss = self.curiosity(g2_emb, L_stage1, L_stage2)
+            # Boredom-modulated stochastic foraging (noise perturbation)
+            errm = torch.sqrt(boredom_scale) * 0.01
+            x = x + torch.randn_like(x) * errm
+        # =========================================================================
+
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)
+        
+        if targets is not None:
+            reduce = 'mean' if not wnll else 'none'
+            loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1), reduction=reduce)
             
-            # Calculate standard task objectives
-            gk = utils.gaussian_kernel(L_guess,1.0,dim=-1) #centered on the end of sequence
-            base_loss = L_all.mean() + torch.log1p(L_guess*gk).mean()
-            
-            # Add passive prediction fitting loss
-            loss = base_loss + 0.1 * router_loss
+            if self.training:
+                if wnll:
+                    mean_surprise = ((1.0-wnl.detach())/2.0).mean()*0.99
+                    loss = loss / (1+ wnl.detach()*mean_surprise)
+                    loss = (loss + wnl).mean()
+                
+                loss = loss + 0.1 * aux_loss
+                
+                if spl:
+                    if sspl:
+                        self.transformer.h[1].block_input = x1
+                        loss = loss + self.transformer.h[1].spl(x)
+                    else:
+                        loss = loss + self.transformer.h[0].spl(x)
+            else:
+                if wnll:
+                    loss = loss.mean()
         else:
-            loss = L_all.mean()
-            
-        L_guess = L_guess.mean().detach()
-        gloss = None
-        return None, loss, (gloss, L_guess)
+            logits = self.lm_head(x[:, [-1], :])
+            loss = None
+        
+        return logits, loss
     
-    def configure_optimizers(self, weight_decay=0.1, learning_rate=1e-3, betas=(0.9, 0.95)):
-        # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        
+        if isinstance(module, Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.Conv1d):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    
+
+    def configure_optimizers(self, lr, wd):
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+        decay_params = []
+        nodecay_params = []
+        for n, p in param_dict.items():
+            if p.dim() >= 2:
+                decay_params.append(p)
+            else:
+                nodecay_params.append(p)
         optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
+                {'params': nodecay_params,  'weight_decay': 0.0},
+                {'params': decay_params,    'weight_decay': wd},
         ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
-        return optimizer
+        return torch.optim.AdamW(optim_groups, lr=lr, betas=(0.9,0.999))
+@torch.no_grad()
+def generate(model, prompt_text, device, always_byte, max_new_tokens=100, temperature=0.7, top_k=50):
+    import tiktoken
+    enc = tiktoken.get_encoding("gpt2")
+    
+    was_training = model.training
+    model.eval()
+    
+    # 1. Encode prompt according to byte/token toggle
+    if always_byte:
+        # Convert string directly to raw UTF-8 bytes (integers 0-255)
+        idx_list = list(prompt_text.encode('utf-8'))
+        # Replace unexpected out-of-bounds byte codes with a standard space character (32)
+        idx_list = [b if b < 256 else 32 for b in idx_list]
+    else:
+        # Standard GPT-2 BPE tokens
+        idx_list = enc.encode_ordinary(prompt_text)
+        
+    idx = torch.tensor(idx_list, dtype=torch.long, device=device).unsqueeze(0)
+    
+    # 2. Autoregressive loop
+    for _ in range(max_new_tokens):
+        idx_cond = idx if idx.size(1) <= model.config.block_size else idx[:, -model.config.block_size:]
+        logits, _ = model(idx_cond)
+        
+        logits = logits[:, -1, :] / temperature
+        
+        if top_k is not None:
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits[logits < v[:, [-1]]] = -float('Inf')
+            
+        probs = torch.nn.functional.softmax(logits, dim=-1)
+        idx_next = torch.multinomial(probs, num_samples=1)
+        idx = torch.cat((idx, idx_next), dim=1)
+        
+        # Stop on BPE end-of-text marker if not in byte mode
+        if not always_byte and idx_next.item() == enc.eot_token:
+            break
+            
+    # 3. Decode output according to byte/token toggle
+    result_list = idx[0].tolist()
+    if always_byte:
+        # Safely decode byte sequences back to UTF-8 text, handling potential half-characters with 'replace'
+        valid_bytes = [b for b in result_list if 0 <= b < 256]
+        decoded_output = bytes(valid_bytes).decode('utf-8', errors='replace')
+    else:
+        decoded_output = enc.decode(result_list)
+        
+    if was_training:
+        model.train()
+        
+    return decoded_output
 
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        """
-        for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= block_size else idx[:, -block_size:]
-            # forward the model to get the logits for the index in the sequence
-            logits, _, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
-
-        return idx
-
-model = Model(vocab_size=vocab_size)
+model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
+                  bias=bias, vocab_size=vocab_size, dropout=dropout) 
+gptconf = GPTConfig(**model_args)
+model = GPT(gptconf)
 model.to(device)
-optimizer = model.configure_optimizers(learning_rate=learning_rate)
+optimizer = model.configure_optimizers(lr=learning_rate, wd=weight_decay)
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision('medium')
+
 model.compile()
 print(f"Starting training on {device}")
 print(f"Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-
-if gradlog:
-    gradient_norms = {}
-
-    def get_grad_hook(name):
-        def hook(grad):
-            gradient_norms[name] = grad.norm(2).item()
-        return hook
-    for name, p in model.named_parameters():
-        if p.requires_grad:
-            p.register_hook(get_grad_hook(name))
-
 t0 = time.time()
+t1 = time.time()
 t2 = time.time()
+def log_periodic_generations(iter, model, device, always_byte):
+    prompts = {
+        "PRETRAIN": "Once upon a time, in a distant galaxy, there was a",
+        "SFT": "Below is an instruction that describes a task. Write a response.\n\n### Instruction:\nList three healthy foods.\n\n### Response:\n",
+        "CoT": "Below is a math problem. Think step-by-step.\n\n### Question:\nIf Jerry has 12 apples and eats 4, how many apples are left?\n\n### Thought & Solution:\n"
+    }
+    
+    print("\n" + "=" * 80)
+    print(f" STEP {iter} GENERATION RUN (Byte Mode: {always_byte}) ")
+    print("=" * 80)
+    for label, text in prompts.items():
+        output = generate(model, text, device, always_byte, max_new_tokens=80)
+        print(f"\n[{label}]\n" + "-"*40 + f"\n{output.strip()}\n" + "-"*40)
+    print("=" * 80 + "\n")
+
+def eval(max_iters, get_batch, model, optimizer, t0, t1, t2, iter, decaying, tasks):
+    t2 = time.time()
+    model.eval()
+    losses = {}
+    
+    for task in tasks:
+        for split in ['train', 'val']:
+            losses[f"{task}_{split}"] = 0.0
+            for k in range(eval_iters):
+                X_val, Y_val = get_batch(split, task=task)
+                with torch.no_grad():
+                    _, loss = model(X_val, Y_val, decaying=decaying)
+                losses[f"{task}_{split}"] += loss.detach().item()
+            losses[f"{task}_{split}"] /= eval_iters
+            
+    optimizer.zero_grad(set_to_none=True)
+    t1 = time.time()
+    
+    print(f"\n--- Step {iter:{len(str(max_iters))}d} ---")
+    for task in tasks:
+        print(f"  {task:<10} | train loss: {losses[f'{task}_train']:.4f} | val loss: {losses[f'{task}_val']:.4f}")
+    print(f"  time: {(t2-t0)*1000:.0f} ms, Tval: {(t1-t2)*1000:.0f} ms")
+    
+    model.train()
+    t0 = time.time()
+    return t0, t1, t2
 
 for iter in range(max_iters):
     lr = get_lr(iter)
-    # In your training loop
-    with torch.no_grad():
-        max_lambda = 0.1 # Final value
-        lambda_warmup_iters = 5000 # Ramp up over 5k steps
-    
-        # Calculate current lambda for this iteration
-        current_lambda = max_lambda * min(1.0, iter / lambda_warmup_iters)
-        
+    decaying = 1.0 - (iter / decay_iters)
+    decaying = torch.tensor(decaying, device=device, dtype=torch.float32)
+    decaying = torch.clamp(decaying, 0.0, 1.0)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
-    if iter % eval_interval == 0 or iter == max_iters - 1:
-        t2 = time.time()
-        model.eval()
-        losses = {}
-        for split in ['train', 'val']:
-            X_val, _ = get_batch(split)
-            with torch.no_grad():
-                _, loss, gloss = model(X_val, True, cl = current_lambda)
-            losses[split] = loss.detach().item()
-            if genloss and split == 'val':
-                glosses = [
-                    gloss[index].item() if gloss[index] is not None else None
-                    for index in range(len(gloss))
-                ]
-        optimizer.zero_grad(set_to_none=True)
-        t1 = time.time()
         
-        print(f"step {iter:{len(str(max_iters))}d}: "
-              f"train loss: {losses['train']:.4f}, "
-              f"val loss: {losses['val']:.4f}, ",end="")
-        if genloss:
-            utils.printReal("gen 1 loss: ", glosses, 0)
-            utils.printReal("gen 2 loss: ", glosses, 1)
-        print(f"time: {(t2-t0)*1000:.0f} ms, "
-              f"Tval: {(t1-t2)*1000:.0f} ms")
-        
-        model.train()
-        t0 = time.time()
-
-    X, _  = get_batch('train')
-    logits, loss, _ = model(X, True, cl = current_lambda)
-
+    torch.compiler.cudagraph_mark_step_begin()
+    
+    # Randomly select a task according to defined probabilities
+    selected_task = np.random.choice(tasks, p=probs)
+    X, Y = get_batch('train', task=selected_task)
+    
+    logits, loss = model(X, Y, decaying=decaying)
     loss.backward()
-    
-    if gradlog and iter > 100:
-        sorted_grads = sorted(gradient_norms.items(), key=lambda item: item[1], reverse=True)
-        for i, (name, norm) in enumerate(sorted_grads):
-            print(f"{i+1}. {name:<60} | Norm: {norm:.4f}")
     optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
-    if wnorm:
-        with torch.no_grad():
-            utils.softwnorm(model,1e-4)
     
+    if iter % eval_interval == 0 or iter == max_iters - 1:
+        t0, t1, t2 = eval(max_iters, get_batch, model, optimizer, t0, t1, t2, iter, decaying, tasks)
+    
+    if iter > 0 and iter % 10000 == 0:
+        log_periodic_generations(iter, model, device, always_byte)
+    optimizer.zero_grad(set_to_none=True)
 
+checkpoint = {
+    'model': model.state_dict(),
+    'optimizer': optimizer.state_dict(),
+    'config': gptconf,
+    'always_byte': always_byte,
+    'vocab_size': vocab_size
+}
+ckpt_path = 'model_ckpt.pt'
+torch.save(checkpoint, ckpt_path)
+print(f"\nTraining completed. Model checkpoint saved to '{ckpt_path}'.")
 
-if gen:
-    meta_path = os.path.join('data', 'shakespeare_char/meta.pkl')
+# =============================================================
+# Interactive Sanity Chat Session
+# =============================================================
+print("\n" + "=" * 80)
+print(" INTERACTIVE CHAT MODE (Type 'exit' or 'quit' to terminate) ")
+print("=" * 80)
 
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    stoi, itos = meta['stoi'], meta['itos']
-    def encode(s): 
-        return [stoi[c] for c in s]
-    def decode(ll):
-        decoded = []
-        for i in ll:
-            if i in itos:
-                decoded.append(itos[i])
-            elif i == idk_token:
-                decoded.append('[IDK]')
-            else:
-                decoded.append(f'[UNK{i}]')  # Or another placeholder for unknown tokens
-        return ''.join(decoded)
-
-    print("sanity check")
-    X, _ = get_batch('train')
-    with torch.no_grad():
-        model.eval()
-        outp = model.generate(X[0].unsqueeze(0), 100, temperature=1.0, top_k=5)
-        model.train()
-    print(decode(outp[0,-100:].detach().cpu().numpy().tolist()))
-    print("Training finished.")
+while True:
+    try:
+        user_input = input("\nYou: ")
+    except EOFError:
+        break
+    if user_input.strip().lower() in ['exit', 'quit']:
+        break
+    
+    # Structure the chat sequence as an instruction for instruction-following models
+    prompt = (
+        f"Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n"
+        f"### Instruction:\n{user_input}\n\n"
+        f"### Response:\n"
+    )
+    
+    # Generate the response
+    raw_response = generate(model, prompt, device, always_byte, max_new_tokens=150)
+    
+    # Isolate the Response block for clean terminal layout
+    if "### Response:\n" in raw_response:
+        response_body = raw_response.split("### Response:\n")[-1]
+    else:
+        response_body = raw_response
+        
+    print(f"Model: {response_body.strip()}")

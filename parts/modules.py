@@ -37,7 +37,7 @@ class HungryLinearFunc(torch.autograd.Function):
         
         alpha = conf.get('lookahead_alpha', 0.001)
         gwin = grad_weight
-        if conf.get('gnorm', True):
+        if conf.get('g_norm', True):
             gwin = utils.rms_norm(gwin)
         future_weight = weight - (gwin * alpha)
         
@@ -340,9 +340,12 @@ Linear = nn.Linear
 #Linear = HungryLinear
 
 class Kattention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, h_dim=None):
         super().__init__()
-        #assert config.n_embd % config.n_head == 0
+        if h_dim:
+            assert config.n_embd % config.hdim == 0
+        else:
+            assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
         
         self.q_attn = (Linear(config.n_embd,  config.n_embd, bias=config.bias))
@@ -356,7 +359,10 @@ class Kattention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_embd = config.n_embd
-        self.n_head = self.n_embd // 8
+        if h_dim:
+            self.n_head = self.n_embd // h_dim
+        else:
+            self.n_embd = config.n_head
         self.dropout = config.dropout
         self.head_dim =  self.n_embd // self.n_head 
 
@@ -588,9 +594,6 @@ class PattLayer(nn.Module):
         nn.init.kaiming_uniform_(self.val_tokens, a=math.sqrt(5))
 
     def forward(self, x: torch.Tensor, get_scores=False) -> torch.Tensor:
-        #keytok = utils.zca_newton_schulz(self.key_tokens,steps=2,power_iters=2).to(self.key_tokens.dtype)
-        #with torch.no_grad():
-        #    self.val_tokens.data = utils.zca_newton_schulz(self.val_tokens,steps=2,power_iters=2).to(self.val_tokens.dtype)
         scores = x @ self.key_tokens.T #self.key_tokens.T
         attn = tokenformer_theta(scores, dim=-1)
         x_out= attn @ self.val_tokens
@@ -729,6 +732,15 @@ class HungryPattLayer(nn.Module):
         return x_out
 
     def add_tokens(self, n: int, optimizer=None):
+        # Cap additions so that self.num_tokens + n <= 512
+        allowed_add = 512 - self.num_tokens
+        if allowed_add <= 0:
+            return  # Already at max capacity
+            
+        n = min(n, allowed_add)
+        if n <= 0:
+            return
+
         device = self.linear1.weight.device
         dtype = self.linear1.weight.dtype
 
@@ -761,25 +773,58 @@ class HungryPattLayer(nn.Module):
                 lambda t: torch.cat([t, torch.zeros(t.shape[0], n, device=device, dtype=dtype)], dim=1)
             )
 
-    def remove_tokens(self, n: int, optimizer=None):
-        if n >= self.num_tokens:
-            raise ValueError(f"Cannot remove {n} tokens, only have {self.num_tokens}")
+    def remove_tokens(self, indices, optimizer=None):
+        """
+        Removes specified token indices from the active parameter set.
+        
+        Args:
+            indices: An integer, a list/tuple of integers, or a PyTorch tensor 
+                     specifying which token index/indices to remove.
+            optimizer: Optional PyTorch optimizer instance to update corresponding states.
+        """
+        # Convert indices input into a unified python set
+        if isinstance(indices, int):
+            indices_to_remove = {indices}
+        elif isinstance(indices, (list, tuple)):
+            indices_to_remove = set(indices)
+        elif torch.is_tensor(indices):
+            indices_to_remove = set(indices.tolist())
+        else:
+            raise TypeError("indices must be an int, a list/tuple of ints, or a torch.Tensor")
+
+        # Validate that indices to remove fall within actual parameter bounds
+        for idx in indices_to_remove:
+            if idx < 0 or idx >= self.num_tokens:
+                raise IndexError(f"Token index {idx} is out of bounds for {self.num_tokens} tokens")
+
+        # Determine indices to retain
+        keep_indices = [i for i in range(self.num_tokens) if i not in indices_to_remove]
+        
+        # Prevent shrinking below 1 token, as zero-sized weights break linear layer operations
+        if len(keep_indices) == 0:
+            raise ValueError("Cannot remove all tokens; at least 1 token must remain in the layer.")
 
         old_w1 = self.linear1.weight
         old_w2 = self.linear2.weight
 
-        # 1. Slice the weights
-        self.linear1.weight = nn.Parameter(old_w1.data[:-n])
-        self.linear2.weight = nn.Parameter(old_w2.data[:, :-n])
+        # 1. Index-based slicing of the weights
+        self.linear1.weight = nn.Parameter(old_w1.data[keep_indices])
+        self.linear2.weight = nn.Parameter(old_w2.data[:, keep_indices])
 
-        self.num_tokens -= n
+        self.num_tokens = len(keep_indices)
 
         # 2. Perform surgery on the optimizer's state if provided
         if optimizer is not None:
             # Slice key projection states (dim 0)
-            self._update_optimizer_state(optimizer, old_w1, self.linear1.weight, lambda t: t[:-n])
+            self._update_optimizer_state(
+                optimizer, old_w1, self.linear1.weight, 
+                lambda t: t[keep_indices]
+            )
             # Slice value projection states (dim 1)
-            self._update_optimizer_state(optimizer, old_w2, self.linear2.weight, lambda t: t[:, :-n])
+            self._update_optimizer_state(
+                optimizer, old_w2, self.linear2.weight, 
+                lambda t: t[:, keep_indices]
+            )
 
     def _update_optimizer_state(self, optimizer, old_param, new_param, resize_fn):
         """Swaps parameter references in optimizer and resizes internal AdamW states."""
@@ -1046,6 +1091,113 @@ class SSM(nn.Module):
         Y = self.resid_dropout(Y)
         return Y, q
 
+class AssociativeSSM(nn.Module):
+    def __init__(self, n_embd, dropout, bias):
+        super().__init__()
+
+        self.q_attn = nn.Linear(n_embd, n_embd, bias=bias)
+        self.v_attn = nn.Linear(n_embd, n_embd, bias=bias)
+        self.c_proj = nn.Linear(n_embd, n_embd, bias=bias)
+
+        self.identity = nn.Parameter(torch.rand(n_embd))
+        self.resid_dropout = nn.Dropout(dropout)
+        self.n_embd = n_embd
+        
+        # Orthogonal projections act on the sequence-wide inputs/outputs
+        self.input_proj = ProcrustesLinear(n_embd, n_embd)
+        self.output_proj = ProcrustesLinear(n_embd, n_embd)
+        
+        # Learnable diagonal decay
+        self.log_decay = nn.Parameter(torch.empty(n_embd))
+        nn.init.uniform_(self.log_decay, 2.2, 4.6)
+        
+    def get_weight(self):
+        return self.input_proj.compute_orthogonal_weight(), self.output_proj.compute_orthogonal_weight()
+
+    def forward(self, x: torch.Tensor, causal=True, get_q=False, weight=None):
+        q = self.q_attn(x) 
+        v = self.v_attn(x)
+        
+        if weight is None:
+            w_in, w_out = self.get_weight()
+        else:
+            w_in, w_out = weight
+            
+        # 1. Project inputs using the first Procrustes matrix
+        q_projected = self.input_proj(q, w_in)
+        
+        # 2. Extract stable diagonal decay and input scaling vectors
+        D = torch.sigmoid(self.log_decay).view(1, 1, -1)
+        input_scale = torch.sqrt(1.0 - D**2 + 1e-7)
+        
+        # 3. Define a strictly associative diagonal prefix scan
+        # Tuple composition: (A_L, B_L) \otimes (A_R, B_R) = (A_R * A_L, A_R * B_L + B_R)
+        def associative_scan_func(left_tuple, right_tuple):
+            a_left, b_left = left_tuple
+            a_right, b_right = right_tuple
+            return (a_right * a_left, a_right * b_left + b_right)
+        
+        # Prepare scan inputs
+        # Each step t is represented by the tuple (D_t, Input_t)
+        # We expand D to match the batch and sequence dimensions
+        B, T, C = x.shape
+        decay_expanded = D.expand(B, T, C)
+        scaled_input = input_scale * q_projected
+        
+        # Pack into a combined tensor to scan over
+        # Shape: (B, T, 2 * C) to keep pscan2's single tensor signature
+        scan_input = torch.cat([decay_expanded, scaled_input], dim=-1)
+        
+        def scan_adapter(left, right):
+            # Split back into decay (A) and state (B) components
+            a_l, b_l = left.chunk(2, dim=-1)
+            a_r, b_r = right.chunk(2, dim=-1)
+            
+            a_out, b_out = associative_scan_func((a_l, b_l), (a_r, b_r))
+            return torch.cat([a_out, b_out], dim=-1)
+            
+        # We run the parallel scan over the packed associative tuples
+        init_packed = torch.cat([torch.ones_like(self.identity), self.identity], dim=-1)
+        scanned_packed = utils.pscan2(scan_input, scan_adapter, init_packed)
+        
+        # Extract the accumulated state component (last C elements)
+        _, q_scanned = scanned_packed.chunk(2, dim=-1)
+        
+        # 4. Project outputs using the second Procrustes matrix and apply RMSNorm
+        q_out = self.output_proj(q_scanned, w_out)
+        q_out = utils.rms_norm(q_out)
+        
+        Y = q_out * v 
+        Y = self.c_proj(Y)
+        Y = self.resid_dropout(Y)
+        
+        if get_q:
+            return Y, q_out
+        return Y
+    
+    def nexts(self, prev: torch.Tensor, x: torch.Tensor, causal=False, weight=None):
+        q = self.q_attn(x) 
+        v = self.v_attn(x)
+        
+        if weight is None:
+            w_in, w_out = self.get_weight()
+        else:
+            w_in, w_out = weight
+            
+        D = torch.sigmoid(self.log_decay)
+        input_scale = torch.sqrt(1.0 - D**2 + 1e-7)
+        
+        # Sequential step matches the parallel scan exactly
+        q_projected = self.input_proj(q, w_in)
+        q_scanned = D * prev + input_scale * q_projected
+        
+        q_out = self.output_proj(q_scanned, w_out)
+        q_out = utils.rms_norm(q_out)
+        
+        Y = q_out * v 
+        Y = self.c_proj(Y)
+        Y = self.resid_dropout(Y)
+        return Y, q_scanned
 
 class CrossAttention(nn.Module):
     def __init__(self, config):

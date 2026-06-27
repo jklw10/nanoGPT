@@ -360,4 +360,165 @@ class Grms(torch.optim.AdamW):
                 # 3. Standard Step
         return super().step(closure)
 
-        
+class EAdamW(torch.optim.Optimizer):
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999) , eps=1e-8,
+                 gamma=1e-3, mode='sphere', kernel='softsign'):
+        defaults = dict(
+            lr=lr, 
+            betas=betas, 
+            eps=eps, 
+            gamma=gamma,
+            mode=mode.lower(),
+            kernel=kernel,
+        )
+        super(EAdamW, self).__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group['lr']
+            beta1, beta2 = group['betas']
+            eps = group['eps']
+            gamma = group['gamma']
+            mode = group['mode']
+            kernel = group['kernel']
+            R = 1.0 
+            eps_geom = 1e-12
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad
+                state = self.state[p]
+
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p, dtype=torch.float32)
+                    state['exp_avg_sq'] = torch.zeros_like(p, dtype=torch.float32)
+
+                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+                state['step'] += 1
+                step = state['step']
+
+                p_fp32 = p.to(torch.float32)
+                grad_fp32 = grad.to(torch.float32)
+
+                # 1. Update biased moments
+                exp_avg.mul_(beta1).add_(grad_fp32, alpha=1.0 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad_fp32, grad_fp32, value=1.0 - beta2)
+
+                # 2. Bias corrections
+                bias_correction1 = 1.0 - beta1 ** step
+                bias_correction2 = 1.0 - beta2 ** step
+                step_size = lr / bias_correction1
+
+                # 3. Preconditioning denominator
+                exp_avg_sq_safe = torch.clamp(exp_avg_sq, min=0.0)
+                denom = (exp_avg_sq_safe.sqrt() / math.sqrt(bias_correction2)).add_(eps)
+                step_direction_fp32 = exp_avg / denom
+
+                if p.dim() <= 1:
+                    p_fp32.add_(step_direction_fp32, alpha=-step_size)
+                    p.copy_(p_fp32.to(p.dtype))
+                    continue
+
+                # --- MODE 1: HYPERSPHERE GEOMETRY ---
+                if mode == 'sphere':
+                    dims = list(range(1, p.dim()))
+                    r = torch.norm(p_fp32, p=2, dim=dims, keepdim=True)
+                    r_clamped = torch.clamp(r, max=R - eps_geom)
+                    r_safe = torch.clamp(r_clamped, min=eps_geom)
+                    w = p_fp32 / r_safe
+
+                    # Tangent projection of momentum to prevent out-of-plane drift
+                    dot_product_momentum = torch.sum(w * exp_avg, dim=dims, keepdim=True)
+                    exp_avg.sub_(dot_product_momentum * w)
+                    step_direction_fp32 = exp_avg / denom
+
+                    # Kernel scale derivations
+                    x_norm = r_safe / R
+                    if kernel == 'softsign':
+                        K_norm = x_norm / (x_norm + 1.0)
+                        K_prime = 1.0 / (x_norm + 1.0).square()
+                    elif kernel == 'tanh':
+                        K_norm = torch.tanh(torch.clamp(x_norm, max=20.0))
+                        K_prime = torch.clamp(1.0 - K_norm.square(), min=0.0)
+
+                    one_minus_K2 = torch.clamp(1.0 - K_norm.square(), min=eps_geom)
+                    metric_scale = K_prime / (R * one_minus_K2)
+                    
+                    # Dynamically compute scale factor
+                    alpha_dynamic = eps * metric_scale.square()
+
+                    # Symmetrized projection utilizing tied damping (damping = eps)
+                    w_norm_sq = torch.sum(w * w, dim=dims, keepdim=True)
+                    proj_denom_stable = torch.clamp(eps + alpha_dynamic * w_norm_sq, min=eps_geom)
+
+                    # Jordan Product composition: 0.5 * (H(A(v)) + A(H(v)))
+                    dot_product_forward = torch.sum(w * step_direction_fp32, dim=dims, keepdim=True)
+                    step_natural_forward = step_direction_fp32 - (alpha_dynamic * dot_product_forward / proj_denom_stable) * w
+                    
+                    dot_product_raw = torch.sum(w * exp_avg, dim=dims, keepdim=True)
+                    raw_projected = exp_avg - (alpha_dynamic * dot_product_raw / proj_denom_stable) * w
+                    step_natural_reverse = raw_projected / denom
+
+                    step_natural_fp32 = 0.5 * (step_natural_forward + step_natural_reverse)
+                    
+                    # Entropic restoring force handles norm regularization exclusively
+                    gamma_stable = min(gamma, 1.9 / step_size) if step_size > 0 else 0.0
+                    entropic_force_fp32 = gamma_stable * w * (1.0 + x_norm.square())
+                    
+                    proposed_update = step_natural_fp32 + entropic_force_fp32
+
+                    # Radial-only boundary censorship
+                    radial_step = torch.sum(w * proposed_update, dim=dims, keepdim=True)
+                    tangent_step = proposed_update - radial_step * w
+                    
+                    max_radial_step = 0.9 * (R - r_safe)
+                    scale_radial = torch.where(
+                        radial_step > 0,
+                        torch.clamp(max_radial_step / torch.clamp(radial_step, min=eps_geom), max=1.0),
+                        torch.ones_like(radial_step)
+                    )
+                    final_update = (radial_step * scale_radial) * w + tangent_step
+
+                # --- MODE 2: HYPERCUBE GEOMETRY ---
+                else:
+                    r = torch.abs(p_fp32)
+                    r_safe = torch.clamp(r, min=eps_geom, max=R - eps_geom)
+
+                    x_norm = r_safe / R
+                    if kernel == 'softsign':
+                        K_norm = x_norm / (x_norm + 1.0)
+                        K_prime = 1.0 / (x_norm + 1.0).square()
+                    elif kernel == 'tanh':
+                        K_norm = torch.tanh(x_norm)
+                        K_prime = 1.0 - K_norm.square()
+
+                    one_minus_K2 = torch.clamp(1.0 - K_norm.square(), min=eps_geom)
+
+                    # Tied preconditioning using eps
+                    scale = one_minus_K2.square() / (K_prime + eps * one_minus_K2.square())
+
+                    gamma_stable = min(gamma, 1.9 / step_size) if step_size > 0 else 0.0
+                    coeff_num = K_norm * K_prime * one_minus_K2
+                    coeff_denom_stable = torch.clamp(K_prime.square() + eps * one_minus_K2.square(), min=eps_geom)
+                    coeff = gamma_stable * (coeff_num / coeff_denom_stable)
+                    
+                    entropic_force_fp32 = coeff * (p_fp32 / r_safe)
+                    proposed_update = step_direction_fp32 * scale + entropic_force_fp32
+
+                    max_step = 0.9 * (R - r_safe)
+                    final_update = torch.clamp(proposed_update, min=-max_step, max=max_step)
+
+                # 4. Apply final update and copy back
+                p_fp32.add_(final_update, alpha=-step_size)
+                p.copy_(p_fp32.to(p.dtype))
+
+        return loss

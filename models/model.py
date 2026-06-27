@@ -39,8 +39,9 @@ spl             = False
 #good in shkspr-char
 mix_squish      = False
 
+assocssm        = True
 #good in owt-char
-qrot            = True
+qrot            = False
 diffac          = False
 rms_lnorm       = False
 #good in owt
@@ -350,6 +351,8 @@ class Block(nn.Module):
         self.attn = Attention(config)
         if(qrottention):
             self.attn = modules.SSM(config.n_embd,config.dropout,config.bias)
+        elif assocssm:
+            self.attn = modules.AssociativeSSM(config.n_embd,config.dropout,config.bias)
         elif k_atten:
             self.attn = modules.FKattention(config)
         elif h_k_atten:

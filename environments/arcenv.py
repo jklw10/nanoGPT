@@ -82,22 +82,30 @@ class BatchedARCEnv:
             self.target_grid[b, start_y_o:start_y_o+h_o, start_x_o:start_x_o+w_o] = out[:h_o, :w_o]
         
     def get_vision(self):
-        # Slice the 16x16 grids into sixteen 4x4 spatial patches. Shape becomes: (B, 16 patches, 16 pixels)
+        # 1. Slice grids into sixteen 4x4 patches (B, 16, 16)
         v_in = self.input_grid.unfold(1, 4, 4).unfold(2, 4, 4).contiguous().view(self.B, 16, 16) / 9.0
         v_canv = self.canvas_grid.unfold(1, 4, 4).unfold(2, 4, 4).contiguous().view(self.B, 16, 16) / 9.0
         
-        # Target Sensor is BLINDED in Test Phase
-        if self.phase_step >= self.demo_duration:
-            v_targ = torch.zeros_like(v_in)
-        else:
-            v_targ = self.target_grid.unfold(1, 4, 4).unfold(2, 4, 4).contiguous().view(self.B, 16, 16) / 9.0
+        # 2. Prevent target leakage:
+        # Target sensor is BLINDED during active painting, EVEN in the demo phase.
+        # It should only be used to compute external loss gradients, not observed directly.
+        v_targ = torch.zeros_like(v_in)
             
-        v_noise = torch.randn(self.B, 16, 16, device=self.device) * self.hunger.view(self.B, 1, 1)
+        # 3. Scale down the exploration noise to avoid drowning out the signal
+        v_noise = torch.randn(self.B, 16, 16, device=self.device) * self.hunger.view(self.B, 1, 1) * 0.05
         
-        # Concatenate the 4 channels of 16 pixels into a perfect 64-dim vector per node
-        inputs = torch.cat([v_in, v_canv, v_targ, v_noise], dim=2) # Shape: (B, 16, 64)
+        # 4. Create 2D Coordinate Embeddings (B, 16, 2)
+        # Allows the router to know the relative spatial positions of the patches
+        grid_coords = torch.stack(torch.meshgrid(
+            torch.linspace(-1, 1, 4, device=self.device),
+            torch.linspace(-1, 1, 4, device=self.device),
+            indexing='ij'
+        ), dim=-1).view(16, 2).unsqueeze(0).expand(self.B, -1, -1)
         
-        # The agent expects shape (N, num_inputs, dim)
+        # 5. Concatenate channels (16 + 16 + 16 + 16 + 2 = 66 dimensions)
+        # Ensure self.dim is set to 66 in your config
+        inputs = torch.cat([v_in, v_canv, v_targ, v_noise, grid_coords], dim=2)
+        
         return inputs.view(self.N, self.num_inputs, self.dim)
         
     def step(self, agent_outputs):
