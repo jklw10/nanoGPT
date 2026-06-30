@@ -359,19 +359,13 @@ class KreinEntropicAdamW(torch.optim.Optimizer):
 
 
 def get_rank1_approximation(G):
-    """
-    Computes a fast, single-step power iteration approximation on the GPU
-    without triggering CPU-GPU synchronizations.
-    """
     m, n = G.shape
     device = G.device
     dtype = G.dtype
     
-    # 1. Initialize v with column-wise sums
     v = torch.sum(G, dim=0, keepdim=True).T
     norm_v = torch.norm(v)
     
-    # Avoid Python branching on GPU tensors by using torch.where
     v = torch.where(
         norm_v > 1e-8,
         v / (norm_v + 1e-12),
@@ -386,7 +380,6 @@ def get_rank1_approximation(G):
         torch.randn((m, 1), dtype=dtype, device=device) / math.sqrt(m)
     )
         
-    # Re-project to refine v
     v = torch.matmul(G.T, u)
     norm_v = torch.norm(v)
     v = torch.where(
@@ -398,26 +391,43 @@ def get_rank1_approximation(G):
     return u, v
 
 
+
 def sherman_morrison_update(A_inv, x, beta, A_inv_init, leak):
+    """
+    Updates the inverse matrix A_inv under a rank-1 update with diagonal leakage
+    to prevent estimator wind-up and preserve positive-definiteness.
+    """
     alpha = 1.0 - beta
     Ax = torch.matmul(A_inv, x)  # (d, 1)
-    xAx = torch.matmul(x.T, Ax)  # (1, 1) tensor
+    xAx = torch.matmul(x.T, Ax)
     
     num = alpha * torch.matmul(Ax, Ax.T)
     denom = beta + alpha * xAx
     
+    # Use torch.clamp to avoid CPU-GPU sync and compiler graph breaks
     denom = torch.clamp(denom, min=1e-12)
     A_inv_new = (A_inv - num / denom) / beta
     
-    # Stabilize by leaking back to the prior (initial identity)
-    A_inv_stable = (1.0 - leak) * A_inv_new + leak * A_inv_init
-    return A_inv_stable
+    # Apply Leaky RLS step to guarantee numerical stability
+    return (1.0 - leak) * A_inv_new + leak * A_inv_init
 
 
 class KreinKroneckerSM(torch.optim.Optimizer):
+    """
+    Krein Kronecker Sherman-Morrison Optimizer.
+    
+    Maintains dual positive-definite channels (W = W_plus - W_minus) 
+    operating in an indefinite Krein space. Employs left and right Kronecker-factored 
+    preconditioning matrices updated via direct online Sherman-Morrison rank-1 inversions.
+    
+    Modes:
+      - 'sphere': Projections onto the tangent space of a sphere of radius R, 
+                  applying Jordan Symmetrized Products to resolve geometric drift.
+      - 'hypercube': Coordinates are restricted independently to the interval [eps_geom, R].
+    """
     def __init__(self, params, lr=1e-3, beta_cov=0.99, eps=1e-8,
                  damping=1e-5, gamma=1e-3, weight_decay=1e-2, 
-                 R=2.5, mode='hypercube', kernel='softsign', update_interval=1):
+                 R=2.5, mode='hypercube', kernel='softsign'):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
         if eps < 0.0:
@@ -447,7 +457,6 @@ class KreinKroneckerSM(torch.optim.Optimizer):
             R=R,
             mode=mode_lower,
             kernel=kernel,
-            update_interval=update_interval,
         )
         super(KreinKroneckerSM, self).__init__(params, defaults)
     
@@ -467,7 +476,6 @@ class KreinKroneckerSM(torch.optim.Optimizer):
             R = group['R']
             mode = group['mode']
             kernel = group['kernel']
-            update_interval = group['update_interval']
 
             for p in group['params']:
                 if p.grad is None:
@@ -484,6 +492,7 @@ class KreinKroneckerSM(torch.optim.Optimizer):
                 orig_shape = p.shape
                 is_multidim = p.dim() > 1
                 
+                # Treat higher-dimensional tensors (e.g., Conv2D) by flattening to 2D
                 if is_multidim:
                     m = orig_shape[0]
                     n = p.numel() // m
@@ -492,12 +501,13 @@ class KreinKroneckerSM(torch.optim.Optimizer):
 
                 if len(state) == 0:
                     state['step'] = 0
+                    # Initialize dual channels
                     state['p_plus'] = torch.clamp(p.data, min=0.0).add_(1e-4)
                     state['p_minus'] = torch.clamp(-p.data, min=0.0).add_(1e-4)
                     
                     scale_factor = 1.0 / math.sqrt(max(damping, eps_geom))
                     
-                    # Store the initial regularization matrices (priors)
+                    # Store identity priors for leakage stabilization
                     state['L_inv_init'] = scale_factor * torch.eye(m, dtype=torch.float32, device=p.device)
                     state['R_inv_init'] = scale_factor * torch.eye(n, dtype=torch.float32, device=p.device)
                     
@@ -506,19 +516,10 @@ class KreinKroneckerSM(torch.optim.Optimizer):
                         state[f'R_inv_{ch}'] = state['R_inv_init'].clone()
 
                 state['step'] += 1
-                step = state['step']
 
                 p_plus = state['p_plus'].to(torch.float32)
                 p_minus = state['p_minus'].to(torch.float32)
                 grad_fp32 = grad.to(torch.float32)
-
-                # --- FIX 2: SYMMETRIZED DUAL-CHANNEL SHRINKAGE (KREIN REGULARIZATION) ---
-                # Keeps p_plus and p_minus bounded near the sparse boundary,
-                # leaving the physical parameter difference (p_plus - p_minus) completely invariant.
-                min_val = torch.minimum(p_plus, p_minus)
-                shrinkage = torch.clamp(min_val - 1e-5, min=0.0)
-                p_plus.sub_(shrinkage)
-                p_minus.sub_(shrinkage)
 
                 # 2. Decoupled Weight Decay on Channels
                 if is_multidim and weight_decay != 0:
@@ -530,12 +531,13 @@ class KreinKroneckerSM(torch.optim.Optimizer):
                 g_plus = torch.clamp(grad_fp32, min=0.0)
                 g_minus = torch.clamp(-grad_fp32, min=0.0)
 
+                # Flatten gradients to 2D matrices for Kronecker-based preconditioning
                 g_plus_2d = g_plus.view(m, n)
                 g_minus_2d = g_minus.view(m, n)
 
-                # 4. Update Preconditioning Inverse Matrices periodically with Leaky Stabilization
-                if is_multidim and (step % update_interval == 0 or step < 10):
-                    leak = 1.00 * (1.0 - beta_cov)
+                # 4. Update the Preconditioning Inverse Matrices via Sherman-Morrison
+                if is_multidim:
+                    leak = 1.05 * (1.0 - beta_cov)
                     
                     # Plus Channel
                     u_plus, v_plus = get_rank1_approximation(g_plus_2d)
@@ -554,7 +556,6 @@ class KreinKroneckerSM(torch.optim.Optimizer):
                     state['R_inv_minus'] = sherman_morrison_update(
                         state['R_inv_minus'], v_minus, beta_cov, state['R_inv_init'], leak
                     )
-
                 # 5. Independent Geometric/Entropic Updates
                 channels = {
                     'plus': (p_plus, g_plus, g_plus_2d, state['L_inv_plus'], state['R_inv_plus']),
@@ -564,7 +565,9 @@ class KreinKroneckerSM(torch.optim.Optimizer):
                 for ch_name, (p_ch, g_ch, g_ch_2d, L_inv, R_inv) in channels.items():
                     step_size = lr
 
+                    # 1D fallback (e.g., biases)
                     if not is_multidim:
+                        # Fall back to scalar update if weight dimensions cannot be factored
                         p_ch.add_(g_ch, alpha=-step_size)
                         p_ch.clamp_(min=1e-6)
                         continue
@@ -577,19 +580,22 @@ class KreinKroneckerSM(torch.optim.Optimizer):
                         r_safe = torch.clamp(r_clamped, min=eps_geom)
                         w = p_ch / r_safe
 
-                        # Jordan Symmetrized Term 1
+                        # Jordan Symmetrized Term 1: H(A(g))
+                        # We precondition the gradient, then project onto the sphere's tangent space
                         step_precond_2d = torch.matmul(L_inv, torch.matmul(g_ch_2d, R_inv))
                         step_precond = step_precond_2d.view_as(p_ch)
                         dot_precond = torch.sum(w * step_precond, dim=dims, keepdim=True)
                         step_nat_forward = step_precond - dot_precond * w
 
-                        # Jordan Symmetrized Term 2
+                        # Jordan Symmetrized Term 2: A(H(g))
+                        # We project the gradient first, then apply the Kronecker preconditioning
                         dot_g = torch.sum(w * g_ch, dim=dims, keepdim=True)
                         g_projected = g_ch - dot_g * w
                         g_proj_2d = g_projected.view(m, n)
                         step_nat_reverse_2d = torch.matmul(L_inv, torch.matmul(g_proj_2d, R_inv))
                         step_nat_reverse = step_nat_reverse_2d.view_as(p_ch)
 
+                        # Compute final natural update direction via the Jordan Symmetric Product
                         step_natural = 0.5 * (step_nat_forward + step_nat_reverse)
 
                         # Metric Scales and Kernel parameters
@@ -601,13 +607,13 @@ class KreinKroneckerSM(torch.optim.Optimizer):
                         else:
                             raise ValueError(f"Unknown kernel: {kernel}")
 
-                        # Entropic Restoring Force
+                        # Entropic Restoring Force (stabilizes boundaries)
                         gamma_stable = min(gamma, 1.9 / step_size) if step_size > 0 else 0.0
                         entropic_force = gamma_stable * w * (1.0 + x_norm.square())
 
                         proposed_update = step_natural + entropic_force
 
-                        # Sliced Boundary Censorship
+                        # Sliced Boundary Censorship (Radial-only limits)
                         radial_step = torch.sum(w * proposed_update, dim=dims, keepdim=True)
                         tangent_step = proposed_update - radial_step * w
                         
@@ -619,6 +625,7 @@ class KreinKroneckerSM(torch.optim.Optimizer):
                         )
                         final_update = (radial_step * scale_radial) * w + tangent_step
 
+                    # --- MODE 2: HYPERCUBE GEOMETRY ---
                     else:
                         r = torch.abs(p_ch)
                         r_safe = torch.clamp(r, min=eps_geom, max=R - eps_geom)
@@ -636,9 +643,11 @@ class KreinKroneckerSM(torch.optim.Optimizer):
                         one_minus_K2 = torch.clamp(1.0 - K_norm.square(), min=eps_geom)
                         scale = one_minus_K2.square() / (K_prime + damping * one_minus_K2.square())
 
+                        # Precondition raw gradient with matrix-covariance operators
                         step_precond_2d = torch.matmul(L_inv, torch.matmul(g_ch_2d, R_inv))
                         step_precond = step_precond_2d.view_as(p_ch)
                         
+                        # Apply coordinate-wise metric scaling
                         step_natural = step_precond * scale
 
                         gamma_stable = min(gamma, 1.9 / step_size) if step_size > 0 else 0.0
@@ -648,12 +657,15 @@ class KreinKroneckerSM(torch.optim.Optimizer):
                         entropic_force = (gamma_stable * (coeff_num / coeff_denom)) * (p_ch / r_safe)
                         proposed_update = step_natural + entropic_force
 
+                        # Coordinate-wise Boundary Censorship
                         max_step = 0.9 * (R - r_safe)
                         final_update = torch.clamp(proposed_update, min=-max_step, max=max_step)
 
+                    # Apply updates to each dual component
                     p_ch.add_(final_update, alpha=-step_size)
-                    p_ch.clamp_(min=1e-6)
+                    p_ch.clamp_(min=1e-6)  # Rigid physical barrier for positive-definiteness
 
+                # 6. Reconstruct and write back physical parameter
                 state['p_plus'].copy_(p_plus)
                 state['p_minus'].copy_(p_minus)
                 p.copy_((p_plus - p_minus).to(p.dtype))

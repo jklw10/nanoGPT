@@ -189,6 +189,320 @@ class EntropicPathAdamW(torch.optim.Optimizer):
         return loss
 
 
+def get_rank1_approximation(G):
+    m, n = G.shape
+    device = G.device
+    dtype = G.dtype
+    
+    v = torch.sum(G, dim=0, keepdim=True).T
+    norm_v = torch.norm(v)
+    
+    v = torch.where(
+        norm_v > 1e-8,
+        v / (norm_v + 1e-12),
+        torch.randn((n, 1), dtype=dtype, device=device) / math.sqrt(n)
+    )
+        
+    u = torch.matmul(G, v)
+    norm_u = torch.norm(u)
+    u = torch.where(
+        norm_u > 1e-8,
+        u / (norm_u + 1e-12),
+        torch.randn((m, 1), dtype=dtype, device=device) / math.sqrt(m)
+    )
+        
+    v = torch.matmul(G.T, u)
+    norm_v = torch.norm(v)
+    v = torch.where(
+        norm_v > 1e-8,
+        v / (norm_v + 1e-12),
+        torch.randn((n, 1), dtype=dtype, device=device) / math.sqrt(n)
+    )
+        
+    return u, v
+
+
+
+def sherman_morrison_update(A_inv, x, beta, A_inv_init, leak):
+    """
+    Updates the inverse matrix A_inv under a rank-1 update with diagonal leakage
+    to prevent estimator wind-up and preserve positive-definiteness.
+    """
+    alpha = 1.0 - beta
+    Ax = torch.matmul(A_inv, x)  # (d, 1)
+    xAx = torch.matmul(x.T, Ax)
+    
+    num = alpha * torch.matmul(Ax, Ax.T)
+    denom = beta + alpha * xAx
+    
+    # Use torch.clamp to avoid CPU-GPU sync and compiler graph breaks
+    denom = torch.clamp(denom, min=1e-12)
+    A_inv_new = (A_inv - num / denom) / beta
+    
+    # Apply Leaky RLS step to guarantee numerical stability
+    return (1.0 - leak) * A_inv_new + leak * A_inv_init
+
+
+class KreinKroneckerSM(torch.optim.Optimizer):
+    """
+    Krein Kronecker Sherman-Morrison Optimizer.
+    
+    Maintains dual positive-definite channels (W = W_plus - W_minus) 
+    operating in an indefinite Krein space. Employs left and right Kronecker-factored 
+    preconditioning matrices updated via direct online Sherman-Morrison rank-1 inversions.
+    
+    Modes:
+      - 'sphere': Projections onto the tangent space of a sphere of radius R, 
+                  applying Jordan Symmetrized Products to resolve geometric drift.
+      - 'hypercube': Coordinates are restricted independently to the interval [eps_geom, R].
+    """
+    def __init__(self, params, lr=1e-3, beta_cov=0.99, eps=1e-8,
+                 damping=1e-5, gamma=1e-3, weight_decay=1e-2, 
+                 R=2.5, mode='hypercube', kernel='softsign'):
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if eps < 0.0:
+            raise ValueError(f"Invalid epsilon: {eps}")
+        if not 0.0 <= beta_cov < 1.0:
+            raise ValueError(f"Invalid beta_cov: {beta_cov}")
+        if damping < 0.0:
+            raise ValueError(f"Invalid damping: {damping}")
+        if gamma < 0.0:
+            raise ValueError(f"Invalid gamma: {gamma}")
+        if weight_decay < 0.0:
+            raise ValueError(f"Invalid weight_decay: {weight_decay}")
+        if R <= 0.0:
+            raise ValueError(f"Invalid boundary scale R: {R}")
+        
+        mode_lower = mode.lower()
+        if mode_lower not in ('sphere', 'hypercube'):
+            raise ValueError(f"Unknown mode: {mode}. Choose 'sphere' or 'hypercube'.")
+
+        defaults = dict(
+            lr=lr, 
+            beta_cov=beta_cov, 
+            eps=eps, 
+            damping=damping, 
+            gamma=gamma,
+            weight_decay=weight_decay, 
+            R=R,
+            mode=mode_lower,
+            kernel=kernel,
+        )
+        super(KreinKroneckerSM, self).__init__(params, defaults)
+    
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group['lr']
+            beta_cov = group['beta_cov']
+            damping = group['damping']
+            gamma = group['gamma']
+            weight_decay = group['weight_decay']
+            R = group['R']
+            mode = group['mode']
+            kernel = group['kernel']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad
+                if grad.is_sparse:
+                    raise RuntimeError("KreinKroneckerSM does not support sparse gradients.")
+
+                state = self.state[p]
+                eps_geom = 1e-12
+
+                # 1. State and Dual-Channel Initialization
+                orig_shape = p.shape
+                is_multidim = p.dim() > 1
+                
+                # Treat higher-dimensional tensors (e.g., Conv2D) by flattening to 2D
+                if is_multidim:
+                    m = orig_shape[0]
+                    n = p.numel() // m
+                else:
+                    m, n = p.numel(), 1
+
+                if len(state) == 0:
+                    state['step'] = 0
+                    # Initialize dual channels
+                    state['p_plus'] = torch.clamp(p.data, min=0.0).add_(1e-4)
+                    state['p_minus'] = torch.clamp(-p.data, min=0.0).add_(1e-4)
+                    
+                    scale_factor = 1.0 / math.sqrt(max(damping, eps_geom))
+                    
+                    # Store identity priors for leakage stabilization
+                    state['L_inv_init'] = scale_factor * torch.eye(m, dtype=torch.float32, device=p.device)
+                    state['R_inv_init'] = scale_factor * torch.eye(n, dtype=torch.float32, device=p.device)
+                    
+                    for ch in ['plus', 'minus']:
+                        state[f'L_inv_{ch}'] = state['L_inv_init'].clone()
+                        state[f'R_inv_{ch}'] = state['R_inv_init'].clone()
+
+                state['step'] += 1
+
+                p_plus = state['p_plus'].to(torch.float32)
+                p_minus = state['p_minus'].to(torch.float32)
+                grad_fp32 = grad.to(torch.float32)
+
+                # 2. Decoupled Weight Decay on Channels
+                if is_multidim and weight_decay != 0:
+                    decay_factor = 1.0 - lr * weight_decay
+                    p_plus.mul_(decay_factor)
+                    p_minus.mul_(decay_factor)
+
+                # 3. Gradient Splitting
+                g_plus = torch.clamp(grad_fp32, min=0.0)
+                g_minus = torch.clamp(-grad_fp32, min=0.0)
+
+                # Flatten gradients to 2D matrices for Kronecker-based preconditioning
+                g_plus_2d = g_plus.view(m, n)
+                g_minus_2d = g_minus.view(m, n)
+
+                # 4. Update the Preconditioning Inverse Matrices via Sherman-Morrison
+                if is_multidim:
+                    leak = 1.05 * (1.0 - beta_cov)
+                    
+                    # Plus Channel
+                    u_plus, v_plus = get_rank1_approximation(g_plus_2d)
+                    state['L_inv_plus'] = sherman_morrison_update(
+                        state['L_inv_plus'], u_plus, beta_cov, state['L_inv_init'], leak
+                    )
+                    state['R_inv_plus'] = sherman_morrison_update(
+                        state['R_inv_plus'], v_plus, beta_cov, state['R_inv_init'], leak
+                    )
+                    
+                    # Minus Channel
+                    u_minus, v_minus = get_rank1_approximation(g_minus_2d)
+                    state['L_inv_minus'] = sherman_morrison_update(
+                        state['L_inv_minus'], u_minus, beta_cov, state['L_inv_init'], leak
+                    )
+                    state['R_inv_minus'] = sherman_morrison_update(
+                        state['R_inv_minus'], v_minus, beta_cov, state['R_inv_init'], leak
+                    )
+                # 5. Independent Geometric/Entropic Updates
+                channels = {
+                    'plus': (p_plus, g_plus, g_plus_2d, state['L_inv_plus'], state['R_inv_plus']),
+                    'minus': (p_minus, g_minus, g_minus_2d, state['L_inv_minus'], state['R_inv_minus'])
+                }
+
+                for ch_name, (p_ch, g_ch, g_ch_2d, L_inv, R_inv) in channels.items():
+                    step_size = lr
+
+                    # 1D fallback (e.g., biases)
+                    if not is_multidim:
+                        # Fall back to scalar update if weight dimensions cannot be factored
+                        p_ch.add_(g_ch, alpha=-step_size)
+                        p_ch.clamp_(min=1e-6)
+                        continue
+
+                    # --- MODE 1: HYPERSPHERE GEOMETRY ---
+                    if mode == 'sphere':
+                        dims = list(range(1, p.dim()))
+                        r = torch.norm(p_ch, p=2, dim=dims, keepdim=True)
+                        r_clamped = torch.clamp(r, max=R - eps_geom)
+                        r_safe = torch.clamp(r_clamped, min=eps_geom)
+                        w = p_ch / r_safe
+
+                        # Jordan Symmetrized Term 1: H(A(g))
+                        # We precondition the gradient, then project onto the sphere's tangent space
+                        step_precond_2d = torch.matmul(L_inv, torch.matmul(g_ch_2d, R_inv))
+                        step_precond = step_precond_2d.view_as(p_ch)
+                        dot_precond = torch.sum(w * step_precond, dim=dims, keepdim=True)
+                        step_nat_forward = step_precond - dot_precond * w
+
+                        # Jordan Symmetrized Term 2: A(H(g))
+                        # We project the gradient first, then apply the Kronecker preconditioning
+                        dot_g = torch.sum(w * g_ch, dim=dims, keepdim=True)
+                        g_projected = g_ch - dot_g * w
+                        g_proj_2d = g_projected.view(m, n)
+                        step_nat_reverse_2d = torch.matmul(L_inv, torch.matmul(g_proj_2d, R_inv))
+                        step_nat_reverse = step_nat_reverse_2d.view_as(p_ch)
+
+                        # Compute final natural update direction via the Jordan Symmetric Product
+                        step_natural = 0.5 * (step_nat_forward + step_nat_reverse)
+
+                        # Metric Scales and Kernel parameters
+                        x_norm = r_safe / R
+                        if kernel == 'softsign':
+                            K_norm = x_norm / (x_norm + 1.0)
+                        elif kernel == 'tanh':
+                            K_norm = torch.tanh(torch.clamp(x_norm, max=20.0))
+                        else:
+                            raise ValueError(f"Unknown kernel: {kernel}")
+
+                        # Entropic Restoring Force (stabilizes boundaries)
+                        gamma_stable = min(gamma, 1.9 / step_size) if step_size > 0 else 0.0
+                        entropic_force = gamma_stable * w * (1.0 + x_norm.square())
+
+                        proposed_update = step_natural + entropic_force
+
+                        # Sliced Boundary Censorship (Radial-only limits)
+                        radial_step = torch.sum(w * proposed_update, dim=dims, keepdim=True)
+                        tangent_step = proposed_update - radial_step * w
+                        
+                        max_radial_step = 0.9 * (R - r_safe)
+                        scale_radial = torch.where(
+                            radial_step > 0,
+                            torch.clamp(max_radial_step / torch.clamp(radial_step, min=eps_geom), max=1.0),
+                            torch.ones_like(radial_step)
+                        )
+                        final_update = (radial_step * scale_radial) * w + tangent_step
+
+                    # --- MODE 2: HYPERCUBE GEOMETRY ---
+                    else:
+                        r = torch.abs(p_ch)
+                        r_safe = torch.clamp(r, min=eps_geom, max=R - eps_geom)
+
+                        x_norm = r_safe / R
+                        if kernel == 'softsign':
+                            K_norm = x_norm / (x_norm + 1.0)
+                            K_prime = 1.0 / (x_norm + 1.0).square()
+                        elif kernel == 'tanh':
+                            K_norm = torch.tanh(x_norm)
+                            K_prime = 1.0 - K_norm.square()
+                        else:
+                            raise ValueError(f"Unknown kernel: {kernel}")
+
+                        one_minus_K2 = torch.clamp(1.0 - K_norm.square(), min=eps_geom)
+                        scale = one_minus_K2.square() / (K_prime + damping * one_minus_K2.square())
+
+                        # Precondition raw gradient with matrix-covariance operators
+                        step_precond_2d = torch.matmul(L_inv, torch.matmul(g_ch_2d, R_inv))
+                        step_precond = step_precond_2d.view_as(p_ch)
+                        
+                        # Apply coordinate-wise metric scaling
+                        step_natural = step_precond * scale
+
+                        gamma_stable = min(gamma, 1.9 / step_size) if step_size > 0 else 0.0
+                        coeff_num = K_norm * K_prime * one_minus_K2
+                        coeff_denom = torch.clamp(K_prime.square() + damping * one_minus_K2.square(), min=eps_geom)
+                        
+                        entropic_force = (gamma_stable * (coeff_num / coeff_denom)) * (p_ch / r_safe)
+                        proposed_update = step_natural + entropic_force
+
+                        # Coordinate-wise Boundary Censorship
+                        max_step = 0.9 * (R - r_safe)
+                        final_update = torch.clamp(proposed_update, min=-max_step, max=max_step)
+
+                    # Apply updates to each dual component
+                    p_ch.add_(final_update, alpha=-step_size)
+                    p_ch.clamp_(min=1e-6)  # Rigid physical barrier for positive-definiteness
+
+                # 6. Reconstruct and write back physical parameter
+                state['p_plus'].copy_(p_plus)
+                state['p_minus'].copy_(p_minus)
+                p.copy_((p_plus - p_minus).to(p.dtype))
+
+        return loss
+
 # ==========================================
 # CUDA PROFILING UTILITY
 # ==========================================
@@ -571,6 +885,7 @@ class NodeParams3(nn.Module):
             w = self.weight.unsqueeze(0).expand(x.shape[0], -1, -1, -1)
             
         norm_weight = F.normalize(w, p=2, dim=-2) * self.w_scale
+        #norm_weight = w
         raw_pred = torch.einsum('bni,bnio->bno', x, norm_weight)
             
         bound = math.sqrt(2.0 + math.sqrt(2.0))
@@ -823,15 +1138,25 @@ class GradientOptimizer:
         self.use_es_lookahead = use_es_lookahead
         
         # Swapped traditional AdamW for EntropicPathAdamW
-        self.optimizer = EntropicPathAdamW(
+        #self.optimizer = EntropicPathAdamW(
+        #    model.parameters(), 
+        #    lr=lr, 
+        #    weight_decay=1e-4, 
+        #    damping=1e-3, 
+        #    alpha=0.05, 
+        #    R=1.0, 
+        #    gamma=1e-3
+        #)
+        self.optimizer = KreinKroneckerSM(
             model.parameters(), 
             lr=lr, 
             weight_decay=1e-4, 
             damping=1e-3, 
-            alpha=0.05, 
             R=1.0, 
-            gamma=1e-3
+            gamma=1e-3,
+            mode='hypercube'
         )
+        
         self.profiler = CUDAProfiler()
         self.state_tuple = model.init_states(exec_config.batch_size)
         
