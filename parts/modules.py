@@ -1,6 +1,7 @@
 
 import math
 
+from attr import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -1265,12 +1266,17 @@ class CrossAttention(nn.Module):
         y = self.resid_dropout(y)
 
         return y
-
+@dataclass
+class bc():
+    n_embd:int = 0
+    n_head:int  = 0
+    dropout:float  = 0
+    bias:bool = False
 class CombineBlock(nn.Module):
     def __init__(self, n_embd, n_head, dropout, bias):
         super().__init__()
 
-        self.attn = CrossAttention(n_embd, n_head, dropout, bias)
+        self.attn = CrossAttention(bc(n_embd, n_head, dropout, bias))
 
         self.ln_1 = LayerNorm(n_embd, bias)
         self.ln_2 = LayerNorm(n_embd, bias)
@@ -2195,13 +2201,13 @@ class Autoencoder(nn.Module):
         self.qdim = qdim
         self.encoder = nn.Sequential(
             nn.Linear(input, hidden), 
-            DRRelu(), 
+            nn.LeakyReLU(), 
             nn.Linear(hidden, qdim))
         self.quantizer = quantizer
         self.codebook = nn.Linear(self.qdim, embed, bias=False)
         self.decoder = nn.Sequential(
             nn.Linear(embed, hidden), 
-            DRRelu(), 
+            nn.LeakyReLU(), 
             nn.Linear(hidden, input))
         
     def forward(self, x):
@@ -2222,3 +2228,66 @@ class Autoencoder(nn.Module):
         if norm:
             q = utils.rms_norm(q)
         return self.decoder(q)
+
+
+class MSEOrderHeadChain(nn.Module):
+    def __init__(self, dim: int, num_orders: int = 3, homeostatic_coef: float = 1e-4):
+        super().__init__()
+        self.num_orders = num_orders
+        self.homeostatic_coef = homeostatic_coef
+        self.heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim, dim // 4),
+                nn.GELU(),
+                nn.Linear(dim // 4, 1)
+            ) for _ in range(num_orders)
+        ])
+        
+    def forward(self, x: torch.Tensor, loss_0: torch.Tensor):
+        """
+        Args:
+            x (Tensor): Input representation of shape (B, T, dim)
+            loss_0 (Tensor): Target loss tensor. Should be compatible with shape (B, T).
+        """
+        B, T, _ = x.shape
+        
+        # Defensive shape checking to prevent silent (B, T) - (B, T, 1) broadcasting bugs
+        if loss_0.dim() == 3 and loss_0.shape[-1] == 1:
+            loss_0 = loss_0.squeeze(-1)
+        elif loss_0.shape != (B, T):
+            raise ValueError(
+                f"Expected loss_0 to have shape ({B}, {T}) or ({B}, {T}, 1), "
+                f"but got {loss_0.shape}."
+            )
+        
+        predictions = []
+        level_losses = []
+        
+        current_target = loss_0
+        
+        for i in range(self.num_orders):
+            pred_i = self.heads[i](x).squeeze(-1)  # Shape: (B, T)
+            predictions.append(pred_i)
+            
+            loss_i = (pred_i - current_target) ** 2
+            level_losses.append(loss_i)
+            
+            # Detach here to isolate head parameter updates.
+            # This forces each head to adapt to the static, realized error of the prior head,
+            # while still allowing gradients from all level losses to flow back into x.
+            current_target = loss_i.detach()
+            
+        mean_losses = [l.mean() for l in level_losses]
+        aux_loss = sum(mean_losses)
+        
+        last_pred = predictions[-1]
+        homeostatic_loss = torch.mean(last_pred ** 2) * self.homeostatic_coef
+        
+        total_chain_loss = aux_loss + homeostatic_loss
+        
+        metrics = {
+            f"meta_loss_order_{i+1}": mean_losses[i].item() for i in range(self.num_orders)
+        }
+        metrics["meta_homeostatic_loss"] = homeostatic_loss.item()
+        
+        return total_chain_loss, predictions, metrics

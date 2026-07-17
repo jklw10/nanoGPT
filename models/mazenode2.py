@@ -7,187 +7,9 @@ import torch.nn.functional as F
 from parts import quantizer
 import parts.utils as utils
 
-# ==========================================
-# MATHEMATICAL OPTIMIZATION TOGGLES
-# ==========================================
 USE_DIMENSIONLESS_BOREDOM = True       # True: (1 - LP/MSE)^(gamma/2), False: exp(-50 * LP) [1]
 USE_ENTROPIC_RESTORING_FORCE = True    # True: Attractive drift to 0 that scales with (1 - boredom) [1]
 GAMMA_COUPLING = 2.0                   # Physical coupling parameter (gamma) for both equations [1]
-
-
-# ==========================================
-# ENTROPIC PATH ADAMW OPTIMIZER
-# ==========================================
-class EntropicPathAdamW(torch.optim.Optimizer):
-    """
-    Entropic Path AdamW (EPA) - Sliced Spherical Natural Gradient Optimizer.
-    Dynamically scales parameter updates according to the exact pullback manifold metric,
-    acting as a geometric, non-linear weight decay that stabilizes parameter routing.
-    """
-    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8,
-                 damping=1e-3, alpha=0.05, gamma=1e-3, weight_decay=1e-4, 
-                 R=1.0, kernel='softsign'):
-        if lr < 0.0:
-            raise ValueError(f"Invalid learning rate: {lr}")
-        if eps < 0.0:
-            raise ValueError(f"Invalid epsilon: {eps}")
-        if not 0.0 <= betas[0] < 1.0:
-            raise ValueError(f"Invalid beta1: {betas[0]}")
-        if not 0.0 <= betas[1] < 1.0:
-            raise ValueError(f"Invalid beta2: {betas[1]}")
-        if damping < 0.0:
-            raise ValueError(f"Invalid damping: {damping}")
-        if alpha < 0.0:
-            raise ValueError(f"Invalid alpha: {alpha}")
-        if gamma < 0.0:
-            raise ValueError(f"Invalid gamma: {gamma}")
-        if weight_decay < 0.0:
-            raise ValueError(f"Invalid weight_decay: {weight_decay}")
-        if R <= 0.0:
-            raise ValueError(f"Invalid boundary scale R: {R}")
-
-        defaults = dict(
-            lr=lr, 
-            betas=betas, 
-            eps=eps, 
-            damping=damping, 
-            alpha=alpha,
-            gamma=gamma,
-            weight_decay=weight_decay, 
-            R=R,
-            kernel=kernel,
-        )
-        super(EntropicPathAdamW, self).__init__(params, defaults)
-    
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        for group in self.param_groups:
-            lr = group['lr']
-            beta1, beta2 = group['betas']
-            eps = group['eps']
-            damping = group['damping']
-            alpha = group['alpha']
-            gamma = group['gamma']
-            weight_decay = group['weight_decay']
-            R = group['R']
-            kernel = group['kernel']
-
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-
-                grad = p.grad
-                if grad.is_sparse:
-                    raise RuntimeError("EntropicPathAdamW does not support sparse gradients.")
-
-                state = self.state[p]
-                eps_geom = 1e-12
-
-                # State initialization
-                if len(state) == 0:
-                    state['step'] = 0
-                    state['exp_avg'] = torch.zeros_like(p, dtype=torch.float32, memory_format=torch.preserve_format)
-                    state['exp_avg_sq'] = torch.zeros_like(p, dtype=torch.float32, memory_format=torch.preserve_format)
-
-                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
-                state['step'] += 1
-                step = state['step']
-
-                p_fp32 = p.to(torch.float32)
-                grad_fp32 = grad.to(torch.float32)
-
-                # Decoupled Weight Decay for 1D parameters.
-                # Bypassed for multi-dimensional node parameters as the entropic force takes its place.
-                if p.dim() <= 1 and weight_decay != 0:
-                    p_fp32.mul_(1.0 - lr * weight_decay)
-
-                # Update biased moment estimates
-                exp_avg.mul_(beta1).add_(grad_fp32, alpha=1.0 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(grad_fp32, grad_fp32, value=1.0 - beta2)
-
-                # Bias corrections
-                bias_correction1 = 1.0 - beta1 ** step
-                bias_correction2 = 1.0 - beta2 ** step
-                step_size = lr / bias_correction1
-
-                # Adam preconditioning denominator
-                eps_stable = max(eps, eps_geom)
-                exp_avg_sq_safe = torch.clamp(exp_avg_sq, min=0.0)
-                denom = (exp_avg_sq_safe.sqrt() / math.sqrt(bias_correction2)).add_(eps_stable)
-                step_direction_fp32 = exp_avg / denom
-
-                # Fallback for 1-dimensional parameters
-                if p.dim() <= 1:
-                    p_fp32.add_(step_direction_fp32, alpha=-step_size)
-                    p.copy_(p_fp32)
-                    continue
-
-                # Sliced norm computation (N-dimensional node slicing)
-                dims = list(range(1, p.dim()))
-                r = torch.norm(p_fp32, p=2, dim=dims, keepdim=True)
-                r_clamped = torch.clamp(r, max=R - eps_geom)
-                r_safe = torch.clamp(r_clamped, min=eps_geom)
-                w = p_fp32 / r_safe
-
-                # Compute Kernel Parameters and Pullback Metric Scale
-                x_norm = r_safe / R
-                if kernel == 'softsign':
-                    K_norm = x_norm / (x_norm + 1.0)
-                    K_prime = 1.0 / (x_norm + 1.0).square()
-                elif kernel == 'tanh':
-                    K_norm = torch.tanh(torch.clamp(x_norm, max=20.0))
-                    K_prime = torch.clamp(1.0 - K_norm.square(), min=0.0)
-                else:
-                    raise ValueError(f"Unknown kernel: {kernel}")
-
-                # Dynamic projection strength based on pullback metric G(theta)
-                one_minus_K2 = torch.clamp(1.0 - K_norm.square(), min=eps_geom)
-                metric_scale = K_prime / (R * one_minus_K2)
-                alpha_dynamic = alpha * metric_scale.square()
-
-                # Sherman-Morrison Natural Projection
-                dot_product = torch.sum(w * step_direction_fp32, dim=dims, keepdim=True)
-                w_norm_sq = torch.sum(w * w, dim=dims, keepdim=True)
-                
-                damping_stable = max(damping, eps_geom)
-                proj_denom = damping_stable + alpha_dynamic * w_norm_sq
-                proj_denom_stable = torch.clamp(proj_denom, min=eps_geom)
-                
-                step_natural_fp32 = step_direction_fp32 - (alpha_dynamic * dot_product / proj_denom_stable) * w
-
-                # Adaptive Non-linear Entropic Restoring Force
-                if step_size > 0:
-                    gamma_stable = min(gamma, 1.9 / step_size)
-                else:
-                    gamma_stable = 0.0
-                
-                coeff_num = K_norm * K_prime * one_minus_K2
-                coeff_denom = K_prime.square() + damping_stable * one_minus_K2.square()
-                coeff_denom_stable = torch.clamp(coeff_denom, min=eps_geom)
-                coeff = gamma_stable * (coeff_num / coeff_denom_stable)
-                
-                entropic_force_fp32 = coeff * w
-
-                # Compute proposed update vector
-                proposed_update = step_natural_fp32 + entropic_force_fp32
-
-                # Stochastic Boundary Censorship
-                update_norm = torch.norm(proposed_update, p=2, dim=dims, keepdim=True)
-                max_step = 0.9 * (R - r_safe)
-                scale_factor = torch.clamp(max_step / torch.clamp(update_norm, min=eps_geom), max=1.0)
-                final_update = proposed_update * scale_factor
-
-                # Parameter Update
-                p_fp32.add_(final_update, alpha=-step_size)
-                p.copy_(p_fp32)
-
-        return loss
-
 
 def get_rank1_approximation(G):
     m, n = G.shape
@@ -258,7 +80,7 @@ class KreinKroneckerSM(torch.optim.Optimizer):
     """
     def __init__(self, params, lr=1e-3, beta_cov=0.99, eps=1e-8,
                  damping=1e-5, gamma=1e-3, weight_decay=1e-2, 
-                 R=2.5, mode='hypercube', kernel='softsign'):
+                 R=1.0, mode='hypercube', kernel='softsign'):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
         if eps < 0.0:
@@ -1137,23 +959,14 @@ class GradientOptimizer:
         self.exec_config = exec_config
         self.use_es_lookahead = use_es_lookahead
         
-        # Swapped traditional AdamW for EntropicPathAdamW
-        #self.optimizer = EntropicPathAdamW(
-        #    model.parameters(), 
-        #    lr=lr, 
-        #    weight_decay=1e-4, 
-        #    damping=1e-3, 
-        #    alpha=0.05, 
-        #    R=1.0, 
-        #    gamma=1e-3
-        #)
+        
         self.optimizer = KreinKroneckerSM(
             model.parameters(), 
             lr=lr, 
-            weight_decay=1e-4, 
-            damping=1e-3, 
+            weight_decay=1e-5, 
+            damping=1e-5, 
             R=1.0, 
-            gamma=1e-3,
+            gamma=1e-5,
             mode='hypercube'
         )
         
@@ -1321,15 +1134,14 @@ class EGGROLLSurpriseOptimizer:
             for p in model.parameters() if p.requires_grad
         }
         
-        # Swapped traditional AdamW for EntropicPathAdamW
-        self.optimizer = EntropicPathAdamW(
+        self.optimizer = KreinKroneckerSM(
             self.master_param_map.values(), 
             lr=exec_config.es_lr, 
-            weight_decay=1e-4,
-            damping=1e-3, 
-            alpha=0.05, 
+            weight_decay=1e-4, 
+            damping=1e-5, 
             R=1.0, 
-            gamma=1e-3
+            gamma=1e-5,
+            mode='hypercube'
         )
 
     def _apply_master_to_model(self):
@@ -1453,14 +1265,15 @@ class HyperParamTuner:
         self.eval_model.apply_hyperparams(hyper_cfg.to_tensor_config())
         
         # Tuned parameters evaluated via local offline EPA run
-        optimizer = EntropicPathAdamW(
+        
+        optimizer = KreinKroneckerSM(
             self.eval_model.parameters(), 
             lr=0.01, 
             weight_decay=1e-4, 
-            damping=1e-3, 
-            alpha=0.05, 
+            damping=1e-5, 
             R=1.0, 
-            gamma=1e-3
+            gamma=1e-5,
+            mode='hypercube'
         )
         
         env = MazeEnvTensor(batch_size=16, size=self.exec_config.maze_size, food_density=0.15, device=self.device)

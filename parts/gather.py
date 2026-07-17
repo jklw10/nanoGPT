@@ -872,15 +872,19 @@ def run_viz():
         #gathered_candidates, selected_indices = RLMAXgbg3.apply(
         #    gate_logits, candidate_pool, K, 0.1, True # True enables Gumbel noise
         #)
-        gathered_candidates, selected_indices = RLMAXgbg.apply(
-            gate_logits, candidate_pool, K, 0.1, True,
-        )
+        #gathered_candidates, selected_indices = RLMAXgbg.apply(
+        #    gate_logits, candidate_pool, K, 0.1, True,
+        #)
         #gathered_candidates, selected_indices = AntiClumpGBG.apply(
         #    gate_logits, candidate_pool, K, 0.1, True,
         #)
         #gathered_candidates, selected_indices = RLMAXgbg4.apply(
         #    gate_logits, candidate_pool, K, 0.1, True, 0.3 
         #)
+
+        gathered_candidates, selected_indices = RLMAXgbg5.apply(
+            gate_logits, candidate_pool, K, 0.1, True, 0.3 
+        )
 
         model_output = gathered_candidates.mean(dim=1) 
         loss = ((model_output - target_pos)**2).sum()

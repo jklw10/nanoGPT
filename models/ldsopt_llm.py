@@ -413,21 +413,9 @@ def sherman_morrison_update(A_inv, x, beta, A_inv_init, leak):
 
 
 class KreinKroneckerSM(torch.optim.Optimizer):
-    """
-    Krein Kronecker Sherman-Morrison Optimizer.
-    
-    Maintains dual positive-definite channels (W = W_plus - W_minus) 
-    operating in an indefinite Krein space. Employs left and right Kronecker-factored 
-    preconditioning matrices updated via direct online Sherman-Morrison rank-1 inversions.
-    
-    Modes:
-      - 'sphere': Projections onto the tangent space of a sphere of radius R, 
-                  applying Jordan Symmetrized Products to resolve geometric drift.
-      - 'hypercube': Coordinates are restricted independently to the interval [eps_geom, R].
-    """
     def __init__(self, params, lr=1e-3, beta_cov=0.99, eps=1e-8,
                  damping=1e-5, gamma=1e-3, weight_decay=1e-2, 
-                 R=2.5, mode='hypercube', kernel='softsign'):
+                 R=1.5, mode='hypercube', kernel='softsign'):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
         if eps < 0.0:

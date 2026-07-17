@@ -14,7 +14,7 @@ HALF_GRID = (GRID_SIZE - 1) / 2.0
 # Physical Constants of Imperfect Diffusion
 D = 0.12                # Diffusion rate (D)
 KAPPA_SQ = 0.05         # Informational absorption/decay (κ² - entropy)
-NOISE_STRENGTH = 0.20   # Stochastic coordinate noise (entropy injection)
+NOISE_STRENGTH = 0.15   # Stochastic coordinate noise (entropy injection)
 DT = 0.1                # Step size
 
 # Temporal Homeostasis tracking

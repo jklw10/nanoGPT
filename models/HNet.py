@@ -55,7 +55,7 @@ ael         = True
 cce         = True
 winit       = True
 emb_wn      = False
-pattlin     = True
+pattlin     = False
 wnll        = True
 patt_AE     = True
 pattcount   = 256
@@ -100,7 +100,7 @@ class Patcher(nn.Module):
         #self.up_proj = modules.Pattention(outer_dim,inner_dim,256)
         self.AE = modules.Autoencoder(
             inner_dim,inner_dim,inner_dim,inner_dim,
-            quantizer.ThresHot.apply
+            quantizer.threshotSTE_softmax
             )
         
         if patt_AE:
@@ -156,7 +156,7 @@ class Patcher(nn.Module):
         gate = self.up_gate(gathered).squeeze(-1)
         gate = self.gate_norm(gate)
         gathered = utils.rms_norm(gathered)
-        gathered, _ = gather.RLMAXgbg4.apply(
+        gathered, _ = gather.RLMAXgbg5.apply(
             gate, 
             gathered, 
             self.inner_seq,

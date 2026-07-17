@@ -336,6 +336,7 @@ def topkhotIMLESTE(x,k,noise_scale=0.1,nudge_w=0.05,samples=16):
 def topkhotIMLE(x,k,scale=0.1,l_sca=0.1,samples=16):
     x = torch.sigmoid(x)
     return IMLETopKFunction.apply(x, k, scale, l_sca, samples)
+
 def topkhotSTE(x,k):
     probs = F.sigmoid(x)
     _, indices = torch.topk(x, k=k, dim=-1)
@@ -395,18 +396,12 @@ class ThresHot(torch.autograd.Function):
         grad_x = F.sigmoid(x) - hard_target
         return grad_x    
 def threshotSTE_softmax(x):
-    # 1. Forward Pass (Threshold based on Softmax)
     probs_softmax = F.softmax(x, dim=-1)
     k_hot = torch.where(probs_softmax >= (1.0 / x.shape[-1]), 1.0, 0.0)
-    
-    # 2. Backward Pass (Competitive gradients)
     return k_hot + probs_softmax - probs_softmax.detach()
 def threshotSTE_sigmoid(x):
-    # 1. Forward Pass (Threshold based on Softmax)
     probs_softmax = F.softmax(x, dim=-1)
     k_hot = torch.where(probs_softmax >= (1.0 / x.shape[-1]), 1.0, 0.0)
-    
-    # 2. Backward Pass (Independent binary gradients)
     probs_sigmoid = torch.sigmoid(x)
     return k_hot + probs_sigmoid - probs_sigmoid.detach()
 class AdjThresHot(torch.autograd.Function):

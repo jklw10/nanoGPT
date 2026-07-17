@@ -78,7 +78,7 @@ class ExecutionConfig:
         self.max_episode_steps = 40
         
         self.gd_lr = 0.001
-        self.gd_total_steps = 500
+        self.gd_total_steps = 1000
         
         self.es_lr = 0.03
         self.es_sigma = 0.08
