@@ -1,261 +1,188 @@
 import torch
-import torch.nn as nn
-import math
 import time
+from typing import Tuple
 
-# --- 1. Original Newton-Schulz (with O(N^3) Residual GEMM) ---
-@torch.compile(backend='inductor', mode='max-autotune')
-def NS_inverse_update_original(A_reg, V_old, steps=3, power_iters=5):
-    device, dtype = A_reg.device, A_reg.dtype
-    d = A_reg.size(0)
-    I = torch.eye(d, device=device, dtype=dtype)
-    
-    # Estimate spectral norm of A_reg
-    v = torch.ones(d, 1, device=device, dtype=dtype)
-    for _ in range(power_iters):
-        v = torch.matmul(A_reg, v)
-        v = v / (v.norm() + 1e-15)
-    s = torch.matmul(v.T, torch.matmul(A_reg, v)).squeeze()
-    
-    # Check convergence of warm-start (O(N^3) GEMM)
-    R = I - torch.matmul(A_reg, V_old)
-    v_r = torch.ones(d, 1, device=device, dtype=dtype)
-    for _ in range(power_iters):
-        v_r = torch.matmul(R, v_r)
-        v_r = v_r / (v_r.norm() + 1e-15)
-    rho_R = torch.matmul(R, v_r).norm().squeeze()
-    
-    is_safe = (rho_R < 0.95) & (~torch.isnan(rho_R)) & (~torch.isinf(rho_R))
-    V0_fallback = I / (s + 1e-15)
-    V = torch.where(is_safe, V_old, V0_fallback)
-    
-    for _ in range(steps):
-        V = torch.matmul(V, 2 * I - torch.matmul(A_reg, V))
-    return V
+# Ensure reproducible results
+torch.manual_seed(42)
 
-# --- 2. Optimized Newton-Schulz (Zero GEMMs in Safety Check, O(N^2) Vector Iteration) ---
-@torch.compile(backend='inductor', mode='max-autotune')
-def NS_inverse_update_optimized(A_reg, V_old, steps=2, power_iters=3):
-    device, dtype = A_reg.device, A_reg.dtype
-    d = A_reg.size(0)
-    I = torch.eye(d, device=device, dtype=dtype)
-    
-    # Estimate spectral norm of A_reg in O(N^2)
-    v = torch.ones(d, 1, device=device, dtype=dtype)
-    for _ in range(power_iters):
-        v = torch.matmul(A_reg, v)
-        v = v / (v.norm() + 1e-15)
-    s = torch.matmul(v.T, torch.matmul(A_reg, v)).squeeze()
-    
-    # Check convergence in O(N^2) by avoiding R matrix creation
-    # R x = x - A_reg @ (V_old @ x)
-    v_r = torch.ones(d, 1, device=device, dtype=dtype)
-    for _ in range(power_iters):
-        v_r = v_r - torch.matmul(A_reg, torch.matmul(V_old, v_r))
-        v_r = v_r / (v_r.norm() + 1e-15)
-    
-    rho_R = (v_r - torch.matmul(A_reg, torch.matmul(V_old, v_r))).norm().squeeze()
-    
-    is_safe = (rho_R < 0.95) & (~torch.isnan(rho_R)) & (~torch.isinf(rho_R))
-    V0_fallback = I / (s + 1e-15)
-    V = torch.where(is_safe, V_old, V0_fallback)
-    
-    # Only computation with O(N^3) GEMMs is the refinement itself
-    for _ in range(steps):
-        V = torch.matmul(V, 2 * I - torch.matmul(A_reg, V))
-    return V
+# Global configuration
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DTYPE = torch.float32
+B, D = 2048, 1024  # Batch size and Feature dimension
+GROUPS = 8         # Number of groups for Sliced ZCA
+ITERS = 5          # Number of iterations for Newton-Schulz ZCA
+BETA = 0.05        # Decay rate for online update
 
+print(f"Running benchmark on: {DEVICE.upper()}")
+print(f"Matrix Dimensions: Batch Size = {B}, Features = {D}")
 
-# --- 3. Optimizer Class ---
-class EntropicKFACOptimizer(torch.optim.Optimizer):
-    def __init__(self, model, params=None, lr=1e-3, damping_kfac=1e-3, use_optimized=False):
-        self.model = model
-        self.damping_kfac = damping_kfac
-        self.use_optimized = use_optimized
-        self.modules = []
-        self.stats = {}
-        self.inverses = {}
-        self.steps = 0
+# =========================================================================
+# 1. Whitening Algorithms
+# =========================================================================
+
+def zca_whitening_svd(X: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """Baseline ZCA Whitening using standard Eigenvalue Decomposition (EVD)."""
+    X_centered = X - X.mean(dim=0, keepdim=True)
+    N = X_centered.shape[0]
+    cov = (X_centered.T @ X_centered) / (N - 1) + eps * torch.eye(D, device=X.device, dtype=DTYPE)
+    # EVD / eigh is an O(D^3) bottleneck
+    L, U = torch.linalg.eigh(cov)
+    L_inv_sqrt = torch.diag(1.0 / torch.sqrt(torch.clamp(L, min=1e-7)))
+    W = U @ L_inv_sqrt @ U.T
+    return X_centered @ W.T
+
+def zca_whitening_sliced(X: torch.Tensor, groups: int = 8, eps: float = 1e-5) -> torch.Tensor:
+    """Sliced ZCA Whitening operating independently on groups of channels."""
+    B_sz, D_sz = X.shape
+    m = D_sz // groups
+    X_centered = X - X.mean(dim=0, keepdim=True)
+    
+    # Reshape features to [groups, B, m]
+    X_reshaped = X_centered.view(B_sz, groups, m).transpose(0, 1)
+    
+    # Batch covariance computation: [groups, m, m]
+    cov = torch.bmm(X_reshaped.transpose(1, 2), X_reshaped) / (B_sz - 1)
+    cov = cov + eps * torch.eye(m, device=X.device, dtype=DTYPE).unsqueeze(0)
+    
+    # Batch EVD
+    L, U = torch.linalg.eigh(cov)
+    L_inv_sqrt = 1.0 / torch.sqrt(torch.clamp(L, min=1e-7))
+    
+    # Batch reconstruction of the projection matrices
+    W = torch.bmm(U * L_inv_sqrt.unsqueeze(1), U.transpose(1, 2))
+    
+    # Batch projection
+    X_whitened = torch.bmm(X_reshaped, W)
+    return X_whitened.transpose(0, 1).contiguous().view(B_sz, D_sz)
+
+def zca_whitening_newton_schulz(X: torch.Tensor, iters: int = 5, eps: float = 1e-5) -> torch.Tensor:
+    """SVD-Free ZCA Whitening using iterative matrix multiplications (Newton-Schulz)."""
+    B_sz, D_sz = X.shape
+    X_centered = X - X.mean(dim=0, keepdim=True)
+    cov = (X_centered.T @ X_centered) / (B_sz - 1) + eps * torch.eye(D_sz, device=X.device, dtype=DTYPE)
+    
+    # Trace normalization to ensure the spectral radius is strictly less than 1
+    norm = cov.trace()
+    Y = cov / norm
+    
+    # Coupled Newton-Schulz iteration for A^(-1/2)
+    P = Y.clone()
+    Q = torch.eye(D_sz, device=X.device, dtype=DTYPE)
+    I3 = 3.0 * torch.eye(D_sz, device=X.device, dtype=DTYPE)
+    
+    for _ in range(iters):
+        QP = Q @ P
+        P = 0.5 * P @ (I3 - QP)
+        Q = 0.5 * (I3 - QP) @ Q
         
-        self.param_to_module = {}
-        for name, module in self.model.named_modules():
-            if isinstance(module, nn.Linear):
-                self.param_to_module[module.weight] = module
+    # Scale back by the normalization factor
+    W = Q / torch.sqrt(norm)
+    return X_centered @ W.T
+
+# =========================================================================
+# 2. Online Update Algorithms
+# =========================================================================
+
+def update_inv_cov_recompute(cov_prev: torch.Tensor, x_new: torch.Tensor, beta: float, eps: float = 1e-5) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Incremental covariance update followed by a full matrix inversion (O(D^3))."""
+    cov_new = (1.0 - beta) * cov_prev + beta * torch.outer(x_new, x_new)
+    inv_cov_new = torch.linalg.inv(cov_new + eps * torch.eye(D, device=cov_prev.device, dtype=DTYPE))
+    return cov_new, inv_cov_new
+
+def update_inv_cov_sherman_morrison(inv_cov_prev: torch.Tensor, x_new: torch.Tensor, beta: float) -> torch.Tensor:
+    """Direct inverse covariance update via the Sherman-Morrison identity (O(D^2))."""
+    inv_u = inv_cov_prev @ x_new
+    denom = (1.0 - beta) + beta * torch.dot(x_new, inv_u)
+    num = beta * torch.outer(inv_u, inv_u)
+    return (inv_cov_prev - num / denom) / (1.0 - beta)
+
+
+# =========================================================================
+# 3. Compilation Wrapper
+# =========================================================================
+
+# Compile all functions using PyTorch Inductor
+compiled_svd = torch.compile(zca_whitening_svd)
+compiled_sliced = torch.compile(zca_whitening_sliced)
+compiled_newton_schulz = torch.compile(zca_whitening_newton_schulz)
+
+compiled_recompute = torch.compile(update_inv_cov_recompute)
+compiled_sherman_morrison = torch.compile(update_inv_cov_sherman_morrison)
+
+# =========================================================================
+# 4. Benchmark Execution Harness
+# =========================================================================
+
+def run_timing(fn, *args, num_warmup: int = 25, num_runs: int = 100) -> float:
+    """Helper to warm up and precisely measure the runtime of a function."""
+    # Compilation & Warmup phase
+    for _ in range(num_warmup):
+        _ = fn(*args)
         
-        self._register_hooks()
-        if params is None:
-            params = [p for p in self.model.parameters() if p.requires_grad]
-        super().__init__(params, dict(lr=lr))
+    if DEVICE == "cuda":
+        torch.cuda.synchronize()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        for _ in range(num_runs):
+            _ = fn(*args)
+        end_event.record()
+        torch.cuda.synchronize()
+        return start_event.elapsed_time(end_event) / num_runs  # Returned in ms
+    else:
+        start = time.perf_counter()
+        for _ in range(num_runs):
+            _ = fn(*args)
+        end = time.perf_counter()
+        return (end - start) * 1000 / num_runs  # Returned in ms
 
-    def _register_hooks(self):
-        for module in self.param_to_module.values():
-            self.modules.append(module)
-            out_features, in_features = module.weight.shape
-            device = module.weight.device
-            dtype = module.weight.dtype
-            
-            self.stats[module] = {
-                'A': torch.zeros(in_features, in_features, device=device, dtype=dtype),
-                'S': torch.zeros(out_features, out_features, device=device, dtype=dtype),
-                'initialized': torch.tensor(0.0, device=device)
-            }
-            self.inverses[module] = {
-                'A_inv': torch.eye(in_features, device=device, dtype=dtype) / self.damping_kfac,
-                'S_inv': torch.eye(out_features, device=device, dtype=dtype) / self.damping_kfac
-            }
-            module.register_forward_hook(self._save_forward_stats)
-            module.register_full_backward_hook(self._save_backward_stats)
-
-    def _save_forward_stats(self, module, input, output):
-        X = input[0].detach()
-        if len(X.shape) > 2: X = X.view(-1, X.shape[-1])
-        A_curr = (X.t() @ X) / X.size(0)
-        self.stats[module]['A'].copy_(A_curr)
-
-    def _save_backward_stats(self, module, grad_input, grad_output):
-        G = grad_output[0].detach()
-        if len(G.shape) > 2: G = G.view(-1, G.shape[-1])
-        S_curr = (G.t() @ G) / G.size(0)
-        self.stats[module]['S'].copy_(S_curr)
-
-    def _update_inverses(self):
-        for module in self.modules:
-            A = self.stats[module]['A']
-            S = self.stats[module]['S']
-            
-            dim_A = A.size(0)
-            dim_S = S.size(0)
-            
-            A_reg = A + self.damping_kfac * torch.eye(dim_A, dtype=A.dtype, device=A.device)
-            S_reg = S + self.damping_kfac * torch.eye(dim_S, dtype=S.dtype, device=S.device)
-
-            A_inv_old = self.inverses[module]['A_inv']
-            S_inv_old = self.inverses[module]['S_inv']
-            
-            if self.use_optimized:
-                A_inv = NS_inverse_update_optimized(A_reg, A_inv_old, steps=1, power_iters=1).clone()
-                S_inv = NS_inverse_update_optimized(S_reg, S_inv_old, steps=1, power_iters=1).clone()
-            else:
-                A_inv = NS_inverse_update_original(A_reg, A_inv_old, steps=3, power_iters=5).clone()
-                S_inv = NS_inverse_update_original(S_reg, S_inv_old, steps=3, power_iters=5).clone()
-            
-            self.inverses[module]['A_inv'] = A_inv
-            self.inverses[module]['S_inv'] = S_inv
-
-    @torch.no_grad()
-    def step(self):
-        self.steps += 1
-        for group in self.param_groups:
-            for p in group['params']:
-                if p.grad is None: continue
-                module = self.param_to_module.get(p, None)
-                if module is not None:
-                    A_inv = self.inverses[module]['A_inv']
-                    S_inv = self.inverses[module]['S_inv']
-                    g_eff = S_inv @ p.grad @ A_inv
-                    p.add_(g_eff, alpha=-group['lr'])
-
-
-# --- 4. Timing Harness ---
-def run_benchmark():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # MLP with 4 layers (generating shapes of 1024x1024 and 512x512)
-    model = nn.Sequential(
-        nn.Linear(1024, 1024), nn.ReLU(),
-        nn.Linear(1024, 1024), nn.ReLU(),
-        nn.Linear(1024, 1024), nn.ReLU(),
-        nn.Linear(1024, 512)
-    ).to(device)
-
-    x = torch.randn(256, 1024, device=device)
-    y = torch.randn(256, 512, device=device)
-    criterion = nn.MSELoss()
-
-    optimizer = EntropicKFACOptimizer(model, lr=1e-3, use_optimized=False)
-
-    print("="*60)
-    print("STRICT WARM-UP PHASE (Baking Compiler & Instantiating Kernels)")
-    print("="*60)
-    
-    # 1. Warm up the forward/backward/step path 15 times
-    for _ in range(15):
-        optimizer.zero_grad()
-        out = model(x)
-        loss = criterion(out, y)
-        loss.backward()
-        optimizer.step()
-        
-    # 2. Warm up both compilation paths of the Inversion Step explicitly
-    print("Pre-compiling and warming up 'Original NS Inversion'...")
-    optimizer.use_optimized = False
-    for _ in range(15):
-        optimizer._update_inverses()
-        
-    print("Pre-compiling and warming up 'Optimized NS Inversion'...")
-    optimizer.use_optimized = True
-    for _ in range(15):
-        optimizer._update_inverses()
-        
-    torch.cuda.synchronize()
-    print("Warm-up complete. All kernels are 100% compiled.\n")
-
-    # --- BENCHMARKING ACTIVE STEP ---
-    start_evt = torch.cuda.Event(enable_timing=True)
-    end_evt = torch.cuda.Event(enable_timing=True)
-    steps = 50
-
-    # A. Time Forward + Backward Pass
-    start_evt.record()
-    for _ in range(steps):
-        optimizer.zero_grad()
-        out = model(x)
-        loss = criterion(out, y)
-        loss.backward()
-    end_evt.record()
-    torch.cuda.synchronize()
-    fwd_bwd_time = start_evt.elapsed_time(end_evt) / steps
-
-    # B. Time Warmed-Up Original Matrix Inversion
-    optimizer.use_optimized = False
-    start_evt.record()
-    for _ in range(steps):
-        optimizer._update_inverses()
-    end_evt.record()
-    torch.cuda.synchronize()
-    inv_time_original = start_evt.elapsed_time(end_evt) / steps
-
-    # C. Time Warmed-Up Optimized Matrix Inversion
-    optimizer.use_optimized = True
-    start_evt.record()
-    for _ in range(steps):
-        optimizer._update_inverses()
-    end_evt.record()
-    torch.cuda.synchronize()
-    inv_time_optimized = start_evt.elapsed_time(end_evt) / steps
-
-    # D. Time Optimizer Parameter Step
-    # Populate gradients once
-    optimizer.zero_grad()
-    out = model(x)
-    loss = criterion(out, y)
-    loss.backward()
-    
-    start_evt.record()
-    for _ in range(steps):
-        optimizer.step()
-    end_evt.record()
-    torch.cuda.synchronize()
-    step_time = start_evt.elapsed_time(end_evt) / steps
-
-    print("="*60)
-    print("           TRUE WARMED-UP GPU EXECUTION SPEED           ")
-    print("="*60)
-    print(f"Forward + Backward Pass (with hooks): {fwd_bwd_time:10.3f} ms")
-    print(f"Original Inversion (steps=3, O(N^3)): {inv_time_original:10.3f} ms")
-    print(f"Optimized Inversion (steps=2, O(N^2)):{inv_time_optimized:10.3f} ms")
-    print(f"Optimizer Parameter Step:             {step_time:10.3f} ms")
-    print("="*60)
 
 if __name__ == "__main__":
-    run_benchmark()
+    # Generate mock inputs
+    X_data = torch.randn(B, D, device=DEVICE, dtype=DTYPE)
+    cov_init = (X_data.T @ X_data) / (B - 1) + 1e-5 * torch.eye(D, device=DEVICE, dtype=DTYPE)
+    inv_cov_init = torch.linalg.inv(cov_init)
+    x_step = torch.randn(D, device=DEVICE, dtype=DTYPE)
+
+    print("\n--- Phase 1: Batch Whitening Methods Comparison ---")
+    
+    # 1. Measure SVD ZCA
+    time_svd = run_timing(compiled_svd, X_data)
+    print(f"Compiled Baseline SVD ZCA:         {time_svd:8.3f} ms")
+    
+    # 2. Measure Sliced ZCA
+    time_sliced = run_timing(compiled_sliced, X_data, GROUPS)
+    print(f"Compiled Sliced ZCA (G={GROUPS}):      {time_sliced:8.3f} ms  ({time_svd / time_sliced:.2f}x speedup)")
+    
+    # 3. Measure Newton-Schulz ZCA
+    time_ns = run_timing(compiled_newton_schulz, X_data, ITERS)
+    print(f"Compiled Newton-Schulz (I={ITERS}):   {time_ns:8.3f} ms  ({time_svd / time_ns:.2f}x speedup)")
+
+    print("\n--- Phase 2: Online Covariance Update Methods Comparison ---")
+    
+    # 1. Measure Covariance Update + Re-Inversion
+    time_recomp = run_timing(compiled_recompute, cov_init, x_step, BETA)
+    print(f"Compiled Covariance Re-Inversion:   {time_recomp:8.3f} ms")
+    
+    # 2. Measure Sherman-Morrison Update
+    time_sm = run_timing(compiled_sherman_morrison, inv_cov_init, x_step, BETA)
+    print(f"Compiled Sherman-Morrison Update:   {time_sm:8.3f} ms  ({time_recomp / time_sm:.2f}x speedup)")
+
+    # =========================================================================
+    # 5. Numerical Validation
+    # =========================================================================
+    print("\n--- Numerical Sanity Check ---")
+    with torch.no_grad():
+        out_svd = zca_whitening_svd(X_data)
+        out_ns = zca_whitening_newton_schulz(X_data, iters=10)
+        
+        # Verify the features have been successfully decorrelated (Covariance ≈ Identity)
+        cov_svd = (out_svd.T @ out_svd) / (B - 1)
+        cov_ns = (out_ns.T @ out_ns) / (B - 1)
+        identity = torch.eye(D, device=DEVICE, dtype=DTYPE)
+        
+        err_svd = torch.norm(cov_svd - identity).item()
+        err_ns = torch.norm(cov_ns - identity).item()
+        
+        print(f"L2 distance of SVD Whitened Covariance to Identity: {err_svd:.5f}")
+        print(f"L2 distance of N-S Whitened Covariance to Identity: {err_ns:.5f} (with 10 iterations)")

@@ -426,6 +426,104 @@ class RLMAXgbg5(torch.autograd.Function):
         return grad_gate_logits, grad_candidate_pool, None, None, None, None
 
 
+class KreinHyperbolicGBG(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, gate_logits, candidate_pool, k, tau=1.0, training=False, eps=1e-12):
+        """
+        Hyperbolic Gather-By-Gate utilizing a stabilized Minkowski (Krein) metric.
+        Args:
+            gate_logits: (B, P) - Router log-probabilities for P candidates
+            candidate_pool: (B, P, C) - Spatial candidate embeddings
+            k: int - Number of candidates to gather
+            tau: float - Gumbel temperature
+            training: bool - Active exploration flag
+        """
+        # 1. Gumbel-Top-K Exploration
+        if training:
+            gumbels = -torch.log(-torch.log(torch.rand_like(gate_logits) + eps) + eps)
+            noisy_logits = (gate_logits + gumbels) / tau
+        else:
+            noisy_logits = gate_logits
+        
+        b, p, c = candidate_pool.shape
+        _, top_indices = torch.topk(noisy_logits, k=k, dim=-1) # (B, K)
+        
+        # Gather the spatial outputs
+        expanded_indices = top_indices.unsqueeze(-1).expand(b, k, c)
+        output = torch.gather(candidate_pool, 1, expanded_indices) # (B, K, C)
+        
+        ctx.save_for_backward(gate_logits, candidate_pool, output, top_indices)
+        ctx.eps = eps
+        ctx.k = k
+        return output, top_indices
+
+    @staticmethod
+    def backward(ctx, grad_output, _):
+        gate_logits, candidate_pool, output, top_indices = ctx.saved_tensors
+        eps = ctx.eps
+        k = ctx.k
+        b, p, c = candidate_pool.shape
+        
+        grad_gate_logits = grad_candidate_pool = None
+
+        with torch.no_grad():
+            # 1. Compute Spatial Ideal Target (Hindsight Step)
+            ideal_s = output - grad_output # (B, K, C)
+            cand_s = candidate_pool # (B, P, C)
+            
+            # 2. Project Spatial Coordinates onto the Minkowski Hyperboloid (Time-Like Dimension)
+            # x_t = sqrt(1 + ||x_s||^2)
+            ideal_t = torch.sqrt(1.0 + torch.sum(ideal_s ** 2, dim=-1, keepdim=True)) # (B, K, 1)
+            cand_t = torch.sqrt(1.0 + torch.sum(cand_s ** 2, dim=-1, keepdim=True)) # (B, P, 1)
+            
+            # 3. Compute Lorentzian Inner Product Matrix: -u_t * v_t + <u_s, v_s>
+            # Space-like alignment
+            dot_s = torch.bmm(ideal_s, cand_s.transpose(1, 2)) # (B, K, P)
+            # Time-like penalty
+            dot_t = torch.bmm(ideal_t, cand_t.transpose(1, 2)) # (B, K, P)
+            
+            lorentzian_inner = -dot_t + dot_s # (B, K, P) -> Values are <= -1
+            
+            # We maximize Lorentzian inner product to minimize Hyperbolic distance
+            scores = lorentzian_inner
+            _, best_candidate_indices = torch.max(scores, dim=-1) # (B, K)
+           
+        # --- ROUTER GRADIENT (Input 0) ---
+        if ctx.needs_input_grad[0]:
+            # Construct hard hindsight target for the router
+            hard_target = torch.zeros_like(gate_logits) 
+            hard_target.scatter_add_(
+                dim=1, 
+                index=best_candidate_indices, 
+                src=torch.ones_like(best_candidate_indices, dtype=torch.float)
+            )
+            hard_target = torch.clamp(hard_target, max=1.0)
+            
+            # Sigmoid-BCE Gradient matching your stabilizer proofs
+            probs = torch.sigmoid(gate_logits)
+            grad_gate_logits = probs - hard_target
+            
+        # --- CANDIDATE POOL GRADIENT (Input 1) ---
+        if ctx.needs_input_grad[1]:
+            # Extract the Lorentzian inner products of the actually selected candidates
+            selected_lorentzian = torch.gather(scores, 2, top_indices.unsqueeze(-1)).squeeze(-1) # (B, K)
+            
+            # Hyperbolic similarity: 1 / (-lorentzian) mapping strictly to (0, 1]
+            hyperbolic_sim = 1.0 / (-selected_lorentzian + eps)
+            
+            # Apply a quadratic soft mask to act as a boundary trust-region decelerator
+            soft_mask = hyperbolic_sim ** 2
+            mask = soft_mask.unsqueeze(-1) # (B, K, 1)
+            
+            # Scale the upstream gradient
+            masked_grad = grad_output * mask
+
+            # Scatter back to the candidate pool
+            expanded_indices = top_indices.unsqueeze(-1).expand(b, k, c)
+            grad_candidate_pool = torch.zeros_like(candidate_pool)
+            grad_candidate_pool.scatter_add_(1, expanded_indices, masked_grad)
+        
+        return grad_gate_logits, grad_candidate_pool, None, None, None, None
 
 class HungryGatherFunc(torch.autograd.Function):
     @staticmethod

@@ -153,7 +153,6 @@ wfunc               = utils.polar_decomp3
 zcastep             = 2 #2, 5
 szcapow             = 2 #2, 10
 
-ghook = gblend or gstd or grms or gavg or grefl or gball or gwrot or gdiff_enabled or ndiff_enabled or gnorm or dfw_enabled or grokfast or gfft or gzca_enabled or sign_enabled or gsphere or ggauss or gchaos or gradorth or muon
 
 decay               = False
 decaying = 1.0
@@ -161,12 +160,15 @@ decaying = 1.0
 eigenInit           = False
 
 lrfinder            = False
-
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 train_logging = False
 exec(open('training_tools/configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
+
+ghook = gblend or gstd or grms or gavg or grefl or gball or gwrot or gdiff_enabled or ndiff_enabled or gnorm or dfw_enabled or grokfast or gfft or gzca_enabled or sign_enabled or gsphere or ggauss or gchaos or gradorth or muon
+if ghook:
+    print("--- Using a gradient hook. ---")
 #for fftmem owt: 1e-5 #beta2 dependent
 #for fftmem skspr: 5e-5 #beta2 dependent
 config["swfa"]      = 1e-5 if dataset == "openwebtext" else 1e-3
@@ -721,6 +723,7 @@ def model_step(iter_num, tl, best_val_loss, config):
     if iter_num > max_iters:
         return 0, False, best_val_loss
     return iter_num + 1, True, best_val_loss
+
 run = True
 tl = time.time()
 while run:

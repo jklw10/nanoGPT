@@ -33,6 +33,26 @@ DEFAULT_HYPERPARAMS = {
     'opt_R': 1.0,
     'opt_gamma': 1e-5
 }
+
+successful_params = {
+    'UNTANH': 0.725268,
+    'w_scale': 0.548835,
+    'EMA_SPEED': 0.071671,
+    'REW_SENS': 1.330760,
+    'speed': 1.355162,
+    'width': 0.001000,
+    'sprs': 0.580194,
+    'c_moment': 0.905514,
+    'a_variance': 0.05,
+    
+    'opt_gd_lr': 0.01,
+    'opt_es_lr': 0.03,
+    'opt_beta_cov': 0.99,
+    'opt_damping': 1e-5,
+    'opt_decay': 1e-5,
+    'opt_R': 1.0,
+    'opt_gamma': 1e-5
+}
 TUNABLE_KEYS = [
     'UNTANH', 'w_scale', 'EMA_SPEED', 'REW_SENS', 'speed', 'width', 'sprs', 'c_moment',
     #'opt_gd_lr', 'opt_es_lr'
@@ -268,16 +288,24 @@ class MazeEnvTensor:
             pool_idx = torch.randint(0, self.pool_size, (len(indices),), device=self.device)
             self.grid[indices] = pool[pool_idx]
             
-        for idx in indices:
-            i = idx.item()
-            empty_mask = (self.grid[i] == 0.0).float()
-            random_mask = (torch.rand(self.size, self.size, device=self.device) < self.food_density).float()
-            new_food = empty_mask * random_mask
-            new_food[self.size // 2, self.size // 2] = 0.0
-            goal_idx = torch.nonzero(self.grid[i] == 2.0)
-            if len(goal_idx) > 0:
-                new_food[goal_idx[0, 0], goal_idx[0, 1]] = 0.0
-            self.food_grid[i].copy_(new_food)
+        # --- 100% Vectorized GPU Reset (No Python Loops, No Synchronizations) ---
+        num_reset = len(indices)
+        
+        empty_mask = (self.grid[indices] == 0.0).float()
+        random_mask = (torch.rand(num_reset, self.size, self.size, device=self.device) < self.food_density).float()
+        
+        # Determine where to place food (only in empty cells)
+        new_food = empty_mask * random_mask
+        
+        # Zero out starting position (center)
+        new_food[:, self.size // 2, self.size // 2] = 0.0
+        
+        # Zero out the goal position using a boolean mask instead of torch.nonzero
+        is_not_goal = (self.grid[indices] != 2.0).float()
+        new_food = new_food * is_not_goal
+        
+        # Copy to the batch slice in one step
+        self.food_grid[indices] = new_food
             
         return self._get_obs()
 
@@ -392,6 +420,111 @@ class StatelessNodeNet3(nn.Module):
         mean, error_pred = torch.chunk(prediction, 2, dim=-1)
         
         route_logits = router_logits + F.relu(lp_ema).unsqueeze(1) * 5.0
+        
+        # 1. Compute only local sparse probabilities
+        sparse_probs, aux, mask = sparse_route_diffusion(route_logits, self.N)
+        
+        # 2. Mathematically exact variance tracking: Var(route) = (1 - s)^2 * Var(sparse_probs)
+        current_var = ((1.0 - self.sprs) ** 2) * sparse_probs.var(dim=-1, keepdim=True)
+        
+        vd = F.relu(self.a_variance - current_var)
+        base_noise = torch.sqrt(vd) * torch.randn_like(output)
+        
+        if USE_DIMENSIONLESS_BOREDOM:
+            relative_lp = torch.clamp(F.relu(lp_ema) / (error_ema + 1e-8), min=0.0, max=1.0 - 1e-8)
+            boredom_scale = torch.pow(1.0 - relative_lp, GAMMA_COUPLING / 2.0).unsqueeze(-1)
+        else:
+            boredom_scale = torch.exp(-50.0 * F.relu(lp_ema)).unsqueeze(-1)
+            
+        # 3. Factorized Graph Diffusion Step: target = (1 - s)*(P @ H) + s*mean(H)
+        local_diffusion = torch.matmul(sparse_probs, output)
+        global_mean = torch.mean(output, dim=1, keepdim=True)
+        
+        target = (1.0 - self.sprs) * local_diffusion + self.sprs * global_mean + base_noise * boredom_scale
+        
+        if USE_ENTROPIC_RESTORING_FORCE:
+            target = target - (GAMMA_COUPLING * 0.01) * state * (1.0 - boredom_scale)
+
+        target = utils.softsign(target)
+        
+        pad_len = self.num_input_nodes * self.D - input_dim
+        env_input_padded = F.pad(env_input, (0, pad_len)) if pad_len > 0 else env_input
+        env_input_reshaped = env_input_padded.view(PB, self.num_input_nodes, self.D)
+        
+        if self.num_input_nodes < self.N:
+            target = torch.cat([env_input_reshaped, target[:, self.num_input_nodes:, :]], dim=1)
+        else:
+            target = env_input_reshaped
+            
+        loss_pred = F.mse_loss(mean, target.detach(), reduction='none')
+        loss_err_pred = F.mse_loss(error_pred, torch.abs(target - mean).detach(), reduction='none')
+        loss_w1 = loss_pred + 0.1 * loss_err_pred
+        
+        with torch.no_grad():
+            current_error = loss_w1.mean(dim=-1).detach()
+            next_error_ema = error_ema * (1.0 - self.lp_alpha) + current_error * self.lp_alpha
+            next_lp_ema = lp_ema * (1.0 - self.lp_alpha) + (error_ema - current_error) * self.lp_alpha
+            
+        total_loss = (loss_w1.sum() + aux) / PB
+        
+        if USE_DIMENSIONLESS_BOREDOM:
+            next_relative_lp = torch.clamp(F.relu(next_lp_ema) / (next_error_ema + 1e-8), min=0.0, max=1.0 - 1e-8)
+            next_boredom_scale = torch.pow(1.0 - next_relative_lp, GAMMA_COUPLING / 2.0).unsqueeze(-1)
+        else:
+            next_boredom_scale = torch.exp(-50.0 * torch.relu(next_lp_ema)).unsqueeze(-1)
+            
+        target = target + torch.randn_like(target) * torch.sqrt(next_boredom_scale) * 0.01
+        
+        return total_loss, target.detach(), mean.detach(), next_error_ema, next_lp_ema, loss_pred
+
+class StatelessNodeNet4(nn.Module):
+    def __init__(self, num_nodes, dim, device, input_dim=32):
+        super().__init__()
+        self.N = num_nodes
+        self.D = dim
+        self.device = device
+        self.num_input_nodes = math.ceil(input_dim / dim)
+        
+        self.w1 = NodeParams3(num_nodes, dim, dim * 2, device)
+        self.router = NodeParams3(num_nodes, dim, num_nodes, device)
+        self.wnll = utils.wnormlearnloss(dim)
+        
+        self.c_moment = 0.8
+        self.a_variance = 0.05
+        self.lp_alpha = 0.1 
+        self.sprs = 0.5
+
+    def init_states(self, batch_size):
+        state = 1e-5 * torch.randn(batch_size, self.N, self.D, device=self.device)
+        output = 1e-5 * torch.randn(batch_size, self.N, self.D, device=self.device)
+        error_ema = torch.ones(batch_size, self.N, device=self.device)
+        lp_ema = torch.zeros(batch_size, self.N, device=self.device)
+        return state, output, error_ema, lp_ema
+
+    def apply_hyperparams(self, config):
+        self.sprs = config.get('sprs').view(-1, 1, 1)
+        self.c_moment = config.get('c_moment').view(-1, 1, 1, 1)
+        self.a_variance = config.get('a_variance').view(-1, 1, 1)
+        self.lp_alpha = float(config.get('EMA_SPEED').item())
+        self.w1.apply_hyperparams(config)
+        self.router.apply_hyperparams(config)
+
+    def get_action_logits(self, state, count, voters=4):
+        num_out_nodes = math.ceil(count / self.D) * voters
+        return state[:, -num_out_nodes:, :].sum(dim=1)[:, :count]
+
+    def forward(self, env_input, state, output, error_ema, lp_ema, pop_weights=None):
+        PB = env_input.shape[0]
+        input_dim = env_input.shape[1]
+        
+        w1_p = pop_weights.get(self.w1.weight) if pop_weights is not None else None
+        router_p = pop_weights.get(self.router.weight) if pop_weights is not None else None
+        
+        prediction = self.w1(state, w1_p)
+        router_logits = self.router(state, router_p)
+        mean, error_pred = torch.chunk(prediction, 2, dim=-1)
+        
+        route_logits = router_logits + F.relu(lp_ema).unsqueeze(1) * 5.0
         route, aux, mask = sparse_route_batched(route_logits, self.N, self.sprs)
         
         current_var = route.var(dim=[-1], keepdim=True)
@@ -454,6 +587,12 @@ def sparse_route_batched(router, node_count, sprs):
     route = ((1.0 - sprs) * sparse_probs) + (sprs * flat_probs)
     return route, 0.0, mask
 
+def sparse_route_diffusion(router, node_count):
+    probs = torch.sigmoid(router)
+    mask = quantizer.topkhotSTE(router, int(math.sqrt(node_count)))
+    sparse_probs = mask * probs
+    sparse_probs = sparse_probs / (sparse_probs.sum(dim=-1, keepdim=True) + 1e-8)
+    return sparse_probs, 0.0, mask
 
 # ==========================================
 # 4. OPTIMIZER & SPECIALIZED TRAINERS
@@ -492,12 +631,7 @@ def get_rank1_approximation(G):
     return u, v
 
 
-
 def sherman_morrison_update(A_inv, x, beta, A_inv_init, leak):
-    """
-    Updates the inverse matrix A_inv under a rank-1 update with diagonal leakage
-    to prevent estimator wind-up and preserve positive-definiteness.
-    """
     alpha = 1.0 - beta
     Ax = torch.matmul(A_inv, x)  # (d, 1)
     xAx = torch.matmul(x.T, Ax)
@@ -505,61 +639,37 @@ def sherman_morrison_update(A_inv, x, beta, A_inv_init, leak):
     num = alpha * torch.matmul(Ax, Ax.T)
     denom = beta + alpha * xAx
     
-    # Use torch.clamp to avoid CPU-GPU sync and compiler graph breaks
     denom = torch.clamp(denom, min=1e-12)
     A_inv_new = (A_inv - num / denom) / beta
     
-    # Apply Leaky RLS step to guarantee numerical stability
     return (1.0 - leak) * A_inv_new + leak * A_inv_init
 
 
-class KreinKroneckerSM(torch.optim.Optimizer):
-    """
-    Krein Kronecker Sherman-Morrison Optimizer.
-    
-    Maintains dual positive-definite channels (W = W_plus - W_minus) 
-    operating in an indefinite Krein space. Employs left and right Kronecker-factored 
-    preconditioning matrices updated via direct online Sherman-Morrison rank-1 inversions.
-    
-    Modes:
-      - 'sphere': Projections onto the tangent space of a sphere of radius R, 
-                  applying Jordan Symmetrized Products to resolve geometric drift.
-      - 'hypercube': Coordinates are restricted independently to the interval [eps_geom, R].
-    """
+def apply_precond(g_2d, L_inv, R_inv, use_L, use_R):
+    if use_R:
+        res = torch.matmul(g_2d, R_inv)
+    else:
+        res = g_2d * R_inv  
+        
+    if use_L:
+        res = torch.matmul(L_inv, res)
+    else:
+        res = res * L_inv  
+    return res
+
+class KreinKroneckerSM3(torch.optim.Optimizer):
     def __init__(self, params, lr=1e-3, beta_cov=0.99, eps=1e-8,
                  damping=1e-5, gamma=1e-3, weight_decay=1e-2, 
-                 R=1.0, mode='hypercube', kernel='softsign'):
-        if lr < 0.0:
-            raise ValueError(f"Invalid learning rate: {lr}")
-        if eps < 0.0:
-            raise ValueError(f"Invalid epsilon: {eps}")
-        if not 0.0 <= beta_cov < 1.0:
-            raise ValueError(f"Invalid beta_cov: {beta_cov}")
-        if damping < 0.0:
-            raise ValueError(f"Invalid damping: {damping}")
-        if gamma < 0.0:
-            raise ValueError(f"Invalid gamma: {gamma}")
-        if weight_decay < 0.0:
-            raise ValueError(f"Invalid weight_decay: {weight_decay}")
-        if R <= 0.0:
-            raise ValueError(f"Invalid boundary scale R: {R}")
-        
-        mode_lower = mode.lower()
-        if mode_lower not in ('sphere', 'hypercube'):
-            raise ValueError(f"Unknown mode: {mode}. Choose 'sphere' or 'hypercube'.")
-
+                 R=None, kernel='softsign'):
+        """
+        KreinKroneckerSM with dynamic, information-theoretic boundary scaling 
+        and symmetric trust-region step-size stabilization.
+        """
         defaults = dict(
-            lr=lr, 
-            beta_cov=beta_cov, 
-            eps=eps, 
-            damping=damping, 
-            gamma=gamma,
-            weight_decay=weight_decay, 
-            R=R,
-            mode=mode_lower,
-            kernel=kernel,
+            lr=lr, beta_cov=beta_cov, eps=eps, damping=damping, gamma=gamma,
+            weight_decay=weight_decay, kernel=kernel
         )
-        super(KreinKroneckerSM, self).__init__(params, defaults)
+        super(KreinKroneckerSM3, self).__init__(params, defaults)
     
     @torch.no_grad()
     def step(self, closure=None):
@@ -574,8 +684,6 @@ class KreinKroneckerSM(torch.optim.Optimizer):
             damping = group['damping']
             gamma = group['gamma']
             weight_decay = group['weight_decay']
-            R = group['R']
-            mode = group['mode']
             kernel = group['kernel']
 
             for p in group['params']:
@@ -583,17 +691,12 @@ class KreinKroneckerSM(torch.optim.Optimizer):
                     continue
 
                 grad = p.grad
-                if grad.is_sparse:
-                    raise RuntimeError("KreinKroneckerSM does not support sparse gradients.")
-
                 state = self.state[p]
                 eps_geom = 1e-12
 
-                # 1. State and Dual-Channel Initialization
                 orig_shape = p.shape
                 is_multidim = p.dim() > 1
                 
-                # Treat higher-dimensional tensors (e.g., Conv2D) by flattening to 2D
                 if is_multidim:
                     m = orig_shape[0]
                     n = p.numel() // m
@@ -602,19 +705,23 @@ class KreinKroneckerSM(torch.optim.Optimizer):
 
                 if len(state) == 0:
                     state['step'] = 0
-                    # Initialize dual channels
                     state['p_plus'] = torch.clamp(p.data, min=0.0).add_(1e-4)
                     state['p_minus'] = torch.clamp(-p.data, min=0.0).add_(1e-4)
                     
                     scale_factor = 1.0 / math.sqrt(max(damping, eps_geom))
-                    
-                    # Store identity priors for leakage stabilization
-                    state['L_inv_init'] = scale_factor * torch.eye(m, dtype=torch.float32, device=p.device)
-                    state['R_inv_init'] = scale_factor * torch.eye(n, dtype=torch.float32, device=p.device)
+                    state['L_inv_init'] = scale_factor * torch.eye(m, dtype=p.dtype, device=p.device)
+                    state['R_inv_init'] = scale_factor * torch.eye(n, dtype=p.dtype, device=p.device)
                     
                     for ch in ['plus', 'minus']:
                         state[f'L_inv_{ch}'] = state['L_inv_init'].clone()
                         state[f'R_inv_{ch}'] = state['R_inv_init'].clone()
+
+                    # Dynamic output-space KL divergence (Fisher Norm) tracker
+                    state['ema_kl'] = 0.0
+
+                    # Store the initial standard deviation to prevent growth-lock
+                    std_init = p.data.std().item() if p.numel() > 1 else p.data.abs().item()
+                    state['std_init'] = max(std_init, 1e-4)
 
                 state['step'] += 1
 
@@ -622,25 +729,20 @@ class KreinKroneckerSM(torch.optim.Optimizer):
                 p_minus = state['p_minus'].to(torch.float32)
                 grad_fp32 = grad.to(torch.float32)
 
-                # 2. Decoupled Weight Decay on Channels
                 if is_multidim and weight_decay != 0:
                     decay_factor = 1.0 - lr * weight_decay
                     p_plus.mul_(decay_factor)
                     p_minus.mul_(decay_factor)
 
-                # 3. Gradient Splitting
                 g_plus = torch.clamp(grad_fp32, min=0.0)
                 g_minus = torch.clamp(-grad_fp32, min=0.0)
-
-                # Flatten gradients to 2D matrices for Kronecker-based preconditioning
                 g_plus_2d = g_plus.view(m, n)
                 g_minus_2d = g_minus.view(m, n)
 
-                # 4. Update the Preconditioning Inverse Matrices via Sherman-Morrison
                 if is_multidim:
                     leak = 1.05 * (1.0 - beta_cov)
                     
-                    # Plus Channel
+                    # Update Plus Channel Kronecker Factors
                     u_plus, v_plus = get_rank1_approximation(g_plus_2d)
                     state['L_inv_plus'] = sherman_morrison_update(
                         state['L_inv_plus'], u_plus, beta_cov, state['L_inv_init'], leak
@@ -649,7 +751,7 @@ class KreinKroneckerSM(torch.optim.Optimizer):
                         state['R_inv_plus'], v_plus, beta_cov, state['R_inv_init'], leak
                     )
                     
-                    # Minus Channel
+                    # Update Minus Channel Kronecker Factors
                     u_minus, v_minus = get_rank1_approximation(g_minus_2d)
                     state['L_inv_minus'] = sherman_morrison_update(
                         state['L_inv_minus'], u_minus, beta_cov, state['L_inv_init'], leak
@@ -657,116 +759,103 @@ class KreinKroneckerSM(torch.optim.Optimizer):
                     state['R_inv_minus'] = sherman_morrison_update(
                         state['R_inv_minus'], v_minus, beta_cov, state['R_inv_init'], leak
                     )
-                # 5. Independent Geometric/Entropic Updates
+
+                    # Compute Preconditioned Updates (Natural Gradient Directions)
+                    step_precond_plus_2d = torch.matmul(state['L_inv_plus'], torch.matmul(g_plus_2d, state['R_inv_plus']))
+                    step_precond_plus = step_precond_plus_2d.view_as(g_plus)
+                    
+                    step_precond_minus_2d = torch.matmul(state['L_inv_minus'], torch.matmul(g_minus_2d, state['R_inv_minus']))
+                    step_precond_minus = step_precond_minus_2d.view_as(g_minus)
+
+                    # --- DETECT OUTPUT-SPACE KL DIVERGENCE RATE (FISHER NORM) ---
+                    kl_rate_plus = torch.sum(g_plus * step_precond_plus).item()
+                    kl_rate_minus = torch.sum(g_minus * step_precond_minus).item()
+                    kl_rate = max(kl_rate_plus + kl_rate_minus, 1e-12)
+
+                    # Update the baseline information-change scale
+                    beta_noise = 0.99
+                    if state['step'] == 1:
+                        state['ema_kl'] = kl_rate
+                    else:
+                        state['ema_kl'] = beta_noise * state['ema_kl'] + (1.0 - beta_noise) * kl_rate
+
+                    # Dimensionless KL change ratio relative to history
+                    kl_ratio = kl_rate / (state['ema_kl'] + 1e-8)
+
+                    # Map the ratio to a stable [0, 1] interval using a balanced sigmoid
+                    noise_ratio = kl_ratio / (kl_ratio + 1.0)
+
+                    # Prevent capacity bottlenecks by referencing std_init
+                    std_current = p.data.std().item() if p.numel() > 1 else p.data.abs().item()
+                    scale_ref = max(state['std_init'], std_current)
+                    
+                    # Statistical Boundary R_t: multiplier interval [3.0, 6.0]
+                    # to keep the bulk of the parameter distribution inside the boundary.
+                    R_t = (6.0 - 3.0 * noise_ratio) * scale_ref
+                else:
+                    step_precond_plus = None
+                    step_precond_minus = None
+                    R_t = None
+
                 channels = {
-                    'plus': (p_plus, g_plus, g_plus_2d, state['L_inv_plus'], state['R_inv_plus']),
-                    'minus': (p_minus, g_minus, g_minus_2d, state['L_inv_minus'], state['R_inv_minus'])
+                    'plus': (p_plus, g_plus, step_precond_plus),
+                    'minus': (p_minus, g_minus, step_precond_minus)
                 }
 
-                for ch_name, (p_ch, g_ch, g_ch_2d, L_inv, R_inv) in channels.items():
+                # --- CHANNEL OPTIMIZATION LOOP ---
+                for ch_name, (p_ch, g_ch, step_precond) in channels.items():
                     step_size = lr
-
-                    # 1D fallback (e.g., biases)
                     if not is_multidim:
-                        # Fall back to scalar update if weight dimensions cannot be factored
                         p_ch.add_(g_ch, alpha=-step_size)
                         p_ch.clamp_(min=1e-6)
                         continue
 
-                    # --- MODE 1: HYPERSPHERE GEOMETRY ---
-                    if mode == 'sphere':
-                        dims = list(range(1, p.dim()))
-                        r = torch.norm(p_ch, p=2, dim=dims, keepdim=True)
-                        r_clamped = torch.clamp(r, max=R - eps_geom)
-                        r_safe = torch.clamp(r_clamped, min=eps_geom)
-                        w = p_ch / r_safe
+                    r = torch.abs(p_ch)
+                    # Enforce the dynamic Gaussian confidence boundary
+                    r_safe = torch.clamp(r, min=eps_geom, max=R_t - eps_geom)
 
-                        # Jordan Symmetrized Term 1: H(A(g))
-                        # We precondition the gradient, then project onto the sphere's tangent space
-                        step_precond_2d = torch.matmul(L_inv, torch.matmul(g_ch_2d, R_inv))
-                        step_precond = step_precond_2d.view_as(p_ch)
-                        dot_precond = torch.sum(w * step_precond, dim=dims, keepdim=True)
-                        step_nat_forward = step_precond - dot_precond * w
+                    x_norm = r_safe / R_t
+                    if kernel == 'softsign':
+                        K_norm = x_norm / (x_norm + 1.0)
+                        K_prime = 1.0 / (x_norm + 1.0).square()
+                    elif kernel == 'tanh':
+                        K_norm = torch.tanh(x_norm)
+                        K_prime = 1.0 - K_norm.square()
 
-                        # Jordan Symmetrized Term 2: A(H(g))
-                        # We project the gradient first, then apply the Kronecker preconditioning
-                        dot_g = torch.sum(w * g_ch, dim=dims, keepdim=True)
-                        g_projected = g_ch - dot_g * w
-                        g_proj_2d = g_projected.view(m, n)
-                        step_nat_reverse_2d = torch.matmul(L_inv, torch.matmul(g_proj_2d, R_inv))
-                        step_nat_reverse = step_nat_reverse_2d.view_as(p_ch)
+                    one_minus_K2 = torch.clamp(1.0 - K_norm.square(), min=eps_geom)
+                    scale = one_minus_K2.square() / (K_prime + damping * one_minus_K2.square())
 
-                        # Compute final natural update direction via the Jordan Symmetric Product
-                        step_natural = 0.5 * (step_nat_forward + step_nat_reverse)
+                    # Scale precalculated preconditioned gradient
+                    step_natural = step_precond * scale
 
-                        # Metric Scales and Kernel parameters
-                        x_norm = r_safe / R
-                        if kernel == 'softsign':
-                            K_norm = x_norm / (x_norm + 1.0)
-                        elif kernel == 'tanh':
-                            K_norm = torch.tanh(torch.clamp(x_norm, max=20.0))
-                        else:
-                            raise ValueError(f"Unknown kernel: {kernel}")
+                    gamma_stable = min(gamma, 1.9 / step_size) if step_size > 0 else 0.0
+                    coeff_num = K_norm * K_prime * one_minus_K2
+                    coeff_denom = torch.clamp(K_prime.square() + damping * one_minus_K2.square(), min=eps_geom)
+                    
+                    entropic_force = (gamma_stable * (coeff_num / coeff_denom)) * (p_ch / r_safe)
+                    proposed_update = step_natural + entropic_force
 
-                        # Entropic Restoring Force (stabilizes boundaries)
-                        gamma_stable = min(gamma, 1.9 / step_size) if step_size > 0 else 0.0
-                        entropic_force = gamma_stable * w * (1.0 + x_norm.square())
+                    # --- MATHEMATICALLY SOUND TRUST-REGION BOUNDS ---
+                    # We bound final_update directly to 90% of R_t (matching the original stable learning scale)
+                    delta_limit = 0.9 * R_t
+                    
+                    # 1. Limit growth (final_update < 0): must not exceed remaining distance to R_t,
+                    # and is capped at delta_limit (stable learning rate speed).
+                    min_allowed_update = -0.9 * torch.clamp(R_t - p_ch, min=1e-12)
+                    min_allowed_update = torch.clamp(min_allowed_update, min=-delta_limit)
+                    
+                    # 2. Limit shrinkage (final_update > 0): must not drop below 0,
+                    # and is capped at delta_limit (stable learning rate speed).
+                    # Crucially, this does NOT depend on (R_t - p_ch), resolving the freezing trap.
+                    max_allowed_update = 0.9 * p_ch
+                    max_allowed_update = torch.clamp(max_allowed_update, max=delta_limit)
 
-                        proposed_update = step_natural + entropic_force
+                    # Clamp the proposed update with our safe, non-trapping trust limits
+                    final_update = torch.clamp(proposed_update, min=min_allowed_update, max=max_allowed_update)
 
-                        # Sliced Boundary Censorship (Radial-only limits)
-                        radial_step = torch.sum(w * proposed_update, dim=dims, keepdim=True)
-                        tangent_step = proposed_update - radial_step * w
-                        
-                        max_radial_step = 0.9 * (R - r_safe)
-                        scale_radial = torch.where(
-                            radial_step > 0,
-                            torch.clamp(max_radial_step / torch.clamp(radial_step, min=eps_geom), max=1.0),
-                            torch.ones_like(radial_step)
-                        )
-                        final_update = (radial_step * scale_radial) * w + tangent_step
-
-                    # --- MODE 2: HYPERCUBE GEOMETRY ---
-                    else:
-                        r = torch.abs(p_ch)
-                        r_safe = torch.clamp(r, min=eps_geom, max=R - eps_geom)
-
-                        x_norm = r_safe / R
-                        if kernel == 'softsign':
-                            K_norm = x_norm / (x_norm + 1.0)
-                            K_prime = 1.0 / (x_norm + 1.0).square()
-                        elif kernel == 'tanh':
-                            K_norm = torch.tanh(x_norm)
-                            K_prime = 1.0 - K_norm.square()
-                        else:
-                            raise ValueError(f"Unknown kernel: {kernel}")
-
-                        one_minus_K2 = torch.clamp(1.0 - K_norm.square(), min=eps_geom)
-                        scale = one_minus_K2.square() / (K_prime + damping * one_minus_K2.square())
-
-                        # Precondition raw gradient with matrix-covariance operators
-                        step_precond_2d = torch.matmul(L_inv, torch.matmul(g_ch_2d, R_inv))
-                        step_precond = step_precond_2d.view_as(p_ch)
-                        
-                        # Apply coordinate-wise metric scaling
-                        step_natural = step_precond * scale
-
-                        gamma_stable = min(gamma, 1.9 / step_size) if step_size > 0 else 0.0
-                        coeff_num = K_norm * K_prime * one_minus_K2
-                        coeff_denom = torch.clamp(K_prime.square() + damping * one_minus_K2.square(), min=eps_geom)
-                        
-                        entropic_force = (gamma_stable * (coeff_num / coeff_denom)) * (p_ch / r_safe)
-                        proposed_update = step_natural + entropic_force
-
-                        # Coordinate-wise Boundary Censorship
-                        max_step = 0.9 * (R - r_safe)
-                        final_update = torch.clamp(proposed_update, min=-max_step, max=max_step)
-
-                    # Apply updates to each dual component
                     p_ch.add_(final_update, alpha=-step_size)
-                    p_ch.clamp_(min=1e-6)  # Rigid physical barrier for positive-definiteness
+                    p_ch.clamp_(min=1e-6)
 
-                # 6. Reconstruct and write back physical parameter
                 state['p_plus'].copy_(p_plus)
                 state['p_minus'].copy_(p_minus)
                 p.copy_((p_plus - p_minus).to(p.dtype))
@@ -775,8 +864,10 @@ class KreinKroneckerSM(torch.optim.Optimizer):
 
 
 
+
+
 def build_optimizer(params, hyper_cfg, lr):
-    return KreinKroneckerSM(
+    return KreinKroneckerSM3(
         params,
         lr=lr,
         beta_cov=float(hyper_cfg.get('opt_beta_cov').item()),
@@ -784,7 +875,7 @@ def build_optimizer(params, hyper_cfg, lr):
         weight_decay=float(hyper_cfg.get('opt_decay').item()),
         R=float(hyper_cfg.get('opt_R').item()),
         gamma=float(hyper_cfg.get('opt_gamma').item()),
-        mode='hypercube'
+        #mode='hypercube'
     )
 
 def generate_low_rank_noise(shape, rank=4, device=None):
@@ -1019,33 +1110,55 @@ class EGGROLLSurpriseOptimizer:
             p: nn.Parameter(p.clone().to(device), requires_grad=True) for p in model.parameters() if p.requires_grad
         }
         self.optimizer = build_optimizer(self.master_param_map.values(), hyper_cfg, lr=float(hyper_cfg.get('opt_es_lr').item()))
+        
+        self.vec_env = None
 
     def _apply_master_to_model(self):
         for p, master_p in self.master_param_map.items():
             p.data.copy_(master_p.data)
 
     def step(self, env, step_idx=0):
-        # Read batch size directly from env.batch_size for dynamic environments
         P, half_P, B = self.exec_config.es_pop_size, self.exec_config.es_pop_size // 2, env.batch_size
+        
         self.profiler.start("1. Low-Rank Noise Generation")
         noise_dict, pop_weights = {}, {}
         for p, master_p in self.master_param_map.items():
-            noise = torch.stack([generate_low_rank_noise(master_p.shape, self.exec_config.es_rank, device=master_p.device) for _ in range(half_P)], dim=0)
-            noise_dict[p] = noise
-            w_pos = master_p.unsqueeze(0) + self.exec_config.es_sigma * noise
-            w_neg = master_p.unsqueeze(0) - self.exec_config.es_sigma * noise
+            # Generate standard, independent white noise mutations
+            white_noise = torch.stack([
+                generate_low_rank_noise(master_p.shape, self.exec_config.es_rank, device=master_p.device) 
+                for _ in range(half_P)
+            ], dim=0)
+            
+            # Filter the noise spatially within this generation (temporally uncorrelated)
+            # center_offset = 0.0 (low-pass), sigma = 0.15 (cuts out high frequencies)
+            colored_noise = utils.apply_spectral_filter(white_noise, center_offset=0.0, sigma_val=0.15)
+            
+            noise_dict[p] = colored_noise
+            
+            w_pos = master_p.unsqueeze(0) + self.exec_config.es_sigma * colored_noise
+            w_neg = master_p.unsqueeze(0) - self.exec_config.es_sigma * colored_noise
             pop_weights[p] = torch.cat([w_pos, w_neg], dim=0)
         self.profiler.stop("1. Low-Rank Noise Generation")
             
         self.profiler.start("2. Vectorized Environment Init")
         grid_tiled = env.grid[:B].repeat(P, 1, 1)
-        vec_env = MazeEnvTensor(batch_size=P * B, size=env.size, grid=grid_tiled, food_density=env.food_density, device=env.device)
-        vec_env.reset()
+        if self.vec_env is None or self.vec_env.batch_size != P * B:
+            self.vec_env = MazeEnvTensor(
+                batch_size=P * B, 
+                size=env.size, 
+                grid=grid_tiled, 
+                food_density=env.food_density, 
+                device=env.device
+            )
+        else:
+            self.vec_env.grid.copy_(grid_tiled)
+            
+        self.vec_env.reset()
         self.profiler.stop("2. Vectorized Environment Init")
         
         self.profiler.start("3. Complete Rollout Loop")
         with torch.no_grad():
-            rollout_data = run_rollout(self.model, vec_env, num_steps=self.exec_config.max_episode_steps, pop_weights=pop_weights)
+            rollout_data = run_rollout(self.model, self.vec_env, num_steps=self.exec_config.max_episode_steps, pop_weights=pop_weights)
         self.profiler.stop("3. Complete Rollout Loop")
 
         self.profiler.start("4. Parameter Update & Math Reduction")
@@ -1066,7 +1179,6 @@ class EGGROLLSurpriseOptimizer:
         self._apply_master_to_model()
         self.profiler.stop("4. Parameter Update & Math Reduction")
         return mean_s.item()
-
 
 # ==========================================
 # 5. HYPERPARAMETER TUNING ENGINE
@@ -1350,8 +1462,9 @@ def select_sample_to_render(eval_results):
 # 7. EXECUTION ENTRYPOINT
 # ==========================================
 if __name__ == "__main__":
-    random.seed(42)
-    torch.manual_seed(42)
+    seed = 42
+    random.seed(seed)
+    torch.manual_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}\n")
     torch.set_float32_matmul_precision('high')
@@ -1382,12 +1495,13 @@ if __name__ == "__main__":
     # ------------------------------------------
     # TRIAL 2: EVOLUTION STRATEGIES (ES)
     # ------------------------------------------
-    tuner_es = HyperParamTuner(device, exec_config, generations=3, pop_size=16)
-    es_hyperparams = tuner_es.tune(mode='es')
+    #tuner_es = HyperParamTuner(device, exec_config, generations=3, pop_size=16)
+    #es_hyperparams = tuner_es.tune(mode='es')
     
     envs_es = MazeEnvTensor(batch_size=exec_config.batch_size, size=exec_config.maze_size, grid=grid_batched, food_density=0.15, device=device)
     model_es = StatelessNodeNet3(num_nodes=exec_config.num_nodes, dim=exec_config.dim, device=device).to(device)
-    model_es.apply_hyperparams(es_hyperparams)
+    #model_es.apply_hyperparams(es_hyperparams)
+    es_hyperparams = HyperParamsConfig(device, init_dict=successful_params)
     
     optimizer_es = EGGROLLSurpriseOptimizer(model_es, exec_config, es_hyperparams)
     run_training(optimizer_es, envs_es, total_steps=exec_config.es_generations, label="ES")

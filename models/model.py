@@ -22,6 +22,7 @@ from cut_cross_entropy import linear_cross_entropy
 import parts.quantizer as quantizer
 #todo
 #prediction machine
+
 #Linear = optim.OptimizedLinear
 #Linear = nn.Linear
 Linear = nn.Linear
@@ -33,13 +34,15 @@ Plin = modules.ProbingLinear
 Orthlin = modules.OrthogonalLinear
 #settings :)
 #intest
+kratt           = True
+kreinSSM        = False
 soloblock       = False
 loopblock       = False
 spl             = False
 #good in shkspr-char
 mix_squish      = False
 
-assocssm        = True
+assocssm        = False
 #good in owt-char
 qrot            = False
 diffac          = False
@@ -268,14 +271,192 @@ class Attention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
 
         return y
-    
+
+class TanhGrad(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        return x
+    @staticmethod
+    def backward(ctx, grad_output):
+        if grad_output is None:
+            return None
+        return torch.tanh(grad_output)
+
+class ScaleGrad(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.save_for_backward(scale)
+        return x
+    @staticmethod
+    def backward(ctx, grad_output):
+        scale, = ctx.saved_tensors
+        if grad_output is None:
+            return None, None
+        return grad_output * scale, None
+
+class KreinAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        
+        self.n_head = config.n_head 
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        self.head_dim = self.n_embd // self.n_head 
+        
+        # Hyperparameters for the Krein/Lorentzian coordinate manifold
+        self.pos_dim = getattr(config, 'pos_dim', 16)
+        self.delta = getattr(config, 'delta', 1e-4)
+        self.tau = getattr(config, 'tau', 0.01)
+        init_c = getattr(config, 'init_c', 1.0)
+        self.block_size = getattr(config, 'block_size', 1024)
+        
+        # Feature projections
+        self.q_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.k_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.v_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.out_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        
+        # Projections from high-dimensional representations to coordinate space
+        self.to_pos_q = nn.Linear(config.n_embd, self.pos_dim, bias=False)
+        self.to_pos_kv = nn.Linear(config.n_embd, self.pos_dim, bias=False)
+        
+        # Self-adjoint coordinate transformation matrix to prevent parameter curl
+        self.pos_proj = nn.Parameter(torch.randn(self.pos_dim, self.pos_dim) * 0.02)
+        
+        # Learnable speed of causality propagation c
+        self.log_c = nn.Parameter(torch.tensor(math.log(init_c)))
+        
+        # Learnable Head-wise Spacetime Mixing Coefficient
+        self.mix_coef = nn.Parameter(torch.zeros(1, self.n_head, 1, 1))
+        
+        # Regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x, causal=True):
+        B, T, C = x.size()
+        H = self.n_head
+        d_k = self.head_dim
+        
+        # 1. Dynamically generate sequential temporal coordinates normalized by static context window size
+        t = torch.arange(T, dtype=x.dtype, device=x.device).view(1, T, 1)  # (1, T, 1)
+        t = t.expand(B, T, 1) / self.block_size
+        
+        q_x, kv_x = x, x
+        q_t, kv_t = t, t
+            
+        # 2. Map features to raw spatial coordinates in the manifold
+        q_pos_raw = self.to_pos_q(q_x)
+        kv_pos_raw = self.to_pos_kv(kv_x)
+            
+        # 3. Symmetrize weight matrix to enforce self-adjointness (prevents coordinate curl)
+        W_symm = 0.5 * (self.pos_proj + self.pos_proj.t())
+        q_pos_proj = F.linear(q_pos_raw, W_symm)
+        kv_pos_proj = F.linear(kv_pos_raw, W_symm)
+        
+        # 4. Standard multi-head feature mapping (Unsplit, full dimensional)
+        q = self.q_proj(q_x).view(B, T, H, d_k).transpose(1, 2)
+        k = self.k_proj(kv_x).view(B, T, H, d_k).transpose(1, 2)
+        v = self.v_proj(kv_x).view(B, T, H, d_k).transpose(1, 2)
+        
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d_k)
+        
+        # Temporal distance: dT = t_q - t_kv
+        dT = q_t - kv_t.transpose(1, 2)  # (B, T, T)
+        
+        # --- 5. Curved Spacetime Geometry: Hyperboloid Projection ---
+        # Map flat coordinates z to the hyperboloid sheet: x = (sqrt(1 + ||z||^2), z)
+        q_norm2 = torch.sum(q_pos_proj**2, dim=-1, keepdim=True)
+        q_0 = torch.sqrt(1.0 + q_norm2)  # (B, T, 1)
+        
+        kv_norm2 = torch.sum(kv_pos_proj**2, dim=-1, keepdim=True)
+        kv_0 = torch.sqrt(1.0 + kv_norm2)  # (B, T, 1)
+        
+        # Calculate Minkowski inner product pairwise: -q0 * kv0^T + q_pos * kv_pos^T
+        term_time = -torch.matmul(q_0, kv_0.transpose(1, 2))  # (B, T, T)
+        term_space = torch.bmm(q_pos_proj, kv_pos_proj.transpose(1, 2))  # (B, T, T)
+        minkowski_dot = term_time + term_space  # (B, T, T)
+        
+        # Hyperbolic distance calculation: dS = arcosh(-minkowski_dot)
+        u = -minkowski_dot
+        u = torch.clamp(u, min=1.0)
+        
+        # Numerically stable inverse hyperbolic cosine to prevent infinite gradients at u=1
+        dS = torch.log(u + torch.sqrt(u**2 - 1.0 + self.delta))
+        dS2 = dS ** 2
+        
+        # Apply smooth softsign distance scaling
+        dS2_smooth = dS2 / (torch.sqrt(dS2 + self.delta) + 1.0)
+        
+        # Spacetime interval
+        log_c_stabilized = TanhGrad.apply(self.log_c)
+        c = torch.exp(log_c_stabilized)
+        lorentzian_interval = dS2_smooth - (c * dT) ** 2  # (B, T, T)
+        
+        # 6. Continuous Spacetime Gating
+        gate_temporal = torch.sigmoid(dT / self.tau)
+        gate_lorentzian = torch.sigmoid(-lorentzian_interval / self.tau)
+        
+        if causal:
+            gate_space = (gate_temporal * (1.0 - gate_lorentzian)).unsqueeze(1)  # Spacelike channel
+            gate_time = (gate_temporal * gate_lorentzian).unsqueeze(1)           # Timelike channel
+        else:
+            gate_space = (1.0 - gate_lorentzian).unsqueeze(1)
+            gate_time = gate_lorentzian.unsqueeze(1)
+        
+        # Smoothly modulate logits via Log-Gate Bias
+        gated_logits_space = attn_logits + torch.log(gate_space + 1e-6)
+        gated_logits_time = attn_logits + torch.log(gate_time + 1e-6)
+        
+        # STRICT CAUSAL HARD-MASK: Prevents future leakage
+        if causal:
+            hard_mask = torch.triu(torch.full((T, T), float('-inf'), device=x.device), diagonal=1).view(1, 1, T, T)
+            gated_logits_space = gated_logits_space + hard_mask
+            gated_logits_time = gated_logits_time + hard_mask
+        
+        # 7. Hyperbolic Boundary Deceleration
+        if self.training:
+            proximity = (1.0 / (torch.sqrt(lorentzian_interval**2 + self.delta) + 1.0)).detach()
+            
+            # Mask out future keys/values in the proximity calculation (shape: 1, T, T)
+            causal_mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, T, T)
+            masked_proximity = proximity * causal_mask
+            
+            # scale_q: Mean over keys (dim=-1) using only valid past steps
+            scale_q = masked_proximity.sum(dim=-1, keepdim=True) / causal_mask.sum(dim=-1, keepdim=True)
+            
+            # scale_kv: Mean over queries (dim=-2) using only valid past steps, then transpose
+            scale_kv_raw = masked_proximity.sum(dim=-2, keepdim=True) / causal_mask.sum(dim=-2, keepdim=True)
+            scale_kv = scale_kv_raw.transpose(1, 2)
+            
+            # Re-route projections through the custom ScaleGrad autograd graph
+            q_pos_proj = ScaleGrad.apply(q_pos_proj, scale_q)
+            kv_pos_proj = ScaleGrad.apply(kv_pos_proj, scale_kv)
+        
+        # Softmax over distinct spacetime pathways
+        attn_weights_space = F.softmax(gated_logits_space, dim=-1)
+        attn_weights_time = F.softmax(gated_logits_time, dim=-1)
+        
+        attn_weights_space = self.attn_dropout(attn_weights_space)
+        attn_weights_time = self.attn_dropout(attn_weights_time)
+        
+        # 8. Convex Combination of attention maps using learnable per-head mixing coefficient
+        mix = torch.sigmoid(self.mix_coef)
+        attn_weights = (1.0 - mix) * attn_weights_space + mix * attn_weights_time
+        
+        # Single multiplication by the full V matrix (No representational capacity drop)
+        context = torch.matmul(attn_weights, v)
+        
+        # Symmetrical transposition back to query_dim (C)
+        context = context.transpose(1, 2).contiguous().view(B, T, C)
+        
+        return self.resid_dropout(self.out_proj(context))
 class ShiftedReLU(nn.Module):
-    """ReLU with fixed per-neuron random shifts near zero (like weight init)."""
     def __init__(self, num_neurons):
         super().__init__()
-        # Shifts sampled once from N(0, 0.02), same as Linear weight init in this model
         shifts = 0.02/torch.sqrt(torch.arange(0, num_neurons))
-        self.register_buffer('shift', shifts)  # non-trainable
+        self.register_buffer('shift', shifts) 
 
     def forward(self, x):
         return F.relu(x - self.shift)
@@ -353,6 +534,11 @@ class Block(nn.Module):
             self.attn = modules.SSM(config.n_embd,config.dropout,config.bias)
         elif assocssm:
             self.attn = modules.AssociativeSSM(config.n_embd,config.dropout,config.bias)
+        elif kreinSSM:
+            self.attn = modules.KreinSSM(config.n_embd,config.dropout,config.bias)
+        elif kratt:
+            self.attn = KreinAttention(config)
+        
         elif k_atten:
             self.attn = modules.FKattention(config)
         elif h_k_atten:

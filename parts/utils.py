@@ -1476,6 +1476,36 @@ def gaussian_kernel_batched(activation_tensor: torch.Tensor,
     kernel = torch.exp(-(indices - center).pow(2) / (2 * sigma**2))
     return kernel
 @torch.compile(backend='inductor', mode='max-autotune')
+def gaussian_kernel_nd(features: int, 
+                       center_offset: float, 
+                       sigma_val: float, 
+                       device: torch.device, 
+                       dtype: torch.dtype) -> torch.Tensor:
+    # Generates a clean 1D kernel that automatically broadcasts over any leading dimensions
+    indices = torch.arange(features, dtype=dtype, device=device)
+    center = center_offset * (features - 1)
+    sigma = max(sigma_val * (features - 1), 1e-6)
+    kernel = torch.exp(-(indices - center).pow(2) / (2 * sigma**2))
+    return kernel
+
+def apply_spectral_filter(signal: torch.Tensor, center_offset: float = 0.0, sigma_val: float = 0.15) -> torch.Tensor:
+    # Compute RFFT along only the last dimension (no flattening)
+    noise_fft = torch.fft.rfft(signal, dim=-1)
+    
+    features = noise_fft.shape[-1]
+    kernel = gaussian_kernel_nd(
+        features=features, 
+        center_offset=center_offset, 
+        sigma_val=sigma_val, 
+        device=signal.device, 
+        dtype=signal.real.dtype
+    )
+    
+    # Broadcast-multiplication automatically scales the last dimension of any ND tensor
+    filtered_fft = noise_fft * kernel
+    return torch.fft.irfft(filtered_fft, n=signal.shape[-1], dim=-1)
+
+@torch.compile(backend='inductor', mode='max-autotune')
 def wrapping_gaussian_kernel(activation_tensor: torch.Tensor, 
                                      center_offset: torch.Tensor, 
                                      sigma: torch.Tensor) -> torch.Tensor:

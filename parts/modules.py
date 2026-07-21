@@ -1200,6 +1200,214 @@ class AssociativeSSM(nn.Module):
         Y = self.resid_dropout(Y)
         return Y, q_scanned
 
+
+
+class KreinSSM(nn.Module):
+    def __init__(self, n_embd, dropout, bias, delta=1e-4):
+        super().__init__()
+
+        self.q_attn = nn.Linear(n_embd, n_embd, bias=bias)
+        self.v_attn = nn.Linear(n_embd, n_embd, bias=bias)
+        self.c_proj = nn.Linear(n_embd, n_embd, bias=bias)
+
+        # De-ghosted learnable initial state for the reconstructed difference channel
+        self.identity = nn.Parameter(torch.empty(n_embd))
+        nn.init.uniform_(self.identity, -0.01, 0.01)
+        
+        self.resid_dropout = nn.Dropout(dropout)
+        self.n_embd = n_embd
+        self.delta = delta
+        
+        # Orthogonal projections
+        self.input_proj = ProcrustesLinear(n_embd, n_embd)
+        self.output_proj = ProcrustesLinear(n_embd, n_embd)
+        
+        # Enforced Temporal Symmetry
+        self.damping = nn.Parameter(torch.empty(n_embd))
+        nn.init.uniform_(self.damping, 2.2, 4.6)
+        
+        # Independent rapidities for asymmetric write-scaling
+        self.log_decay_plus = nn.Parameter(torch.empty(n_embd))
+        self.log_decay_minus = nn.Parameter(torch.empty(n_embd))
+        nn.init.uniform_(self.log_decay_plus, 0.25, 0.35)
+        nn.init.uniform_(self.log_decay_minus, 0.25, 0.35)
+
+    def get_weight(self):
+        return self.input_proj.compute_orthogonal_weight(), self.output_proj.compute_orthogonal_weight()
+
+    def forward(self, x: torch.Tensor, causal=True, get_q=False, weight=None):
+        q = self.q_attn(x) 
+        v = self.v_attn(x)
+        
+        if weight is None:
+            w_in, w_out = self.get_weight()
+        else:
+            w_in, w_out = weight
+            
+        # Project first 
+        q_projected = self.input_proj(q, w_in)
+        
+        # Split second
+        q_reg = torch.sqrt(q_projected**2 + self.delta)
+        q_plus = 0.5 * (q_reg + q_projected)
+        q_minus = 0.5 * (q_reg - q_projected)
+        
+        # Share the decay rate D for both tracks to guarantee temporal coherence
+        D = torch.sigmoid(self.damping).view(1, 1, -1)
+        D_plus = D
+        D_minus = D
+        
+        # Variance-Preserving Envelope-Coupling
+        base_scale = torch.sqrt(1.0 - D**2 + 1e-7)
+        input_scale_plus = base_scale * torch.tanh(self.log_decay_plus).view(1, 1, -1)
+        input_scale_minus = base_scale * torch.tanh(self.log_decay_minus).view(1, 1, -1)
+        
+        # Dual-channel associative scan
+        B, T, C = x.shape
+        decay_all = torch.cat([D_plus.expand(B, T, C), D_minus.expand(B, T, C)], dim=0)
+        scaled_input = torch.cat([
+            input_scale_plus * q_plus, 
+            input_scale_minus * q_minus
+        ], dim=0)
+        
+        scan_input_all = torch.cat([decay_all, scaled_input], dim=-1)
+        
+        def associative_scan_func(left_tuple, right_tuple):
+            a_left, b_left = left_tuple
+            a_right, b_right = right_tuple
+            return (a_right * a_left, a_right * b_left + b_right)
+
+        def scan_adapter(left, right):
+            a_l, b_l = left.chunk(2, dim=-1)
+            a_r, b_r = right.chunk(2, dim=-1)
+            a_out, b_out = associative_scan_func((a_l, b_l), (a_r, b_r))
+            return torch.cat([a_out, b_out], dim=-1)
+            
+        # Zero-initialized scan state to ensure 1D init_packed shape (prevents view/expand crash)
+        init_packed = torch.cat([torch.ones_like(self.damping), torch.zeros_like(self.damping)], dim=-1)
+        scanned_packed_all = utils.pscan2(scan_input_all, scan_adapter, init_packed)
+        
+        _, q_scanned_all = scanned_packed_all.chunk(2, dim=-1)
+        q_scanned_plus, q_scanned_minus = q_scanned_all.chunk(2, dim=0)
+        
+        # Indefinite Metric Reconstruction
+        q_scanned = q_scanned_plus - q_scanned_minus
+        
+        # Analytically apply the decayed initial state (identical to non-zero scan initialization)
+        decay_expanded = D.expand(B, T, C)
+        decay_cumulative = torch.cumprod(decay_expanded, dim=1)
+        initial_decayed = decay_cumulative * self.identity.view(1, 1, -1)
+        q_scanned = q_scanned + initial_decayed
+        
+        q_out = self.output_proj(q_scanned, w_out)
+        q_out = utils.rms_norm(q_out)
+        
+        Y = q_out * v 
+        Y = self.c_proj(Y)
+        Y = self.resid_dropout(Y)
+        
+        if get_q:
+            return Y, q_out
+        return Y
+
+class KreinSSM2(nn.Module):
+    def __init__(self, n_embd, dropout, bias, delta=1e-4):
+        super().__init__()
+
+        self.q_attn = nn.Linear(n_embd, n_embd, bias=bias)
+        self.v_attn = nn.Linear(n_embd, n_embd, bias=bias)
+        self.c_proj = nn.Linear(n_embd, n_embd, bias=bias)
+
+        # Zero-initialized to prevent transient drift in split channels
+        self.identity = nn.Parameter(torch.zeros(n_embd))
+        self.resid_dropout = nn.Dropout(dropout)
+        self.n_embd = n_embd
+        self.delta = delta
+        
+        # Orthogonal projections
+        self.input_proj = ProcrustesLinear(n_embd, n_embd)
+        self.output_proj = ProcrustesLinear(n_embd, n_embd)
+        
+        # Unified Hyperbolic Coupling (Energy Preserving)
+        # Initialized to match the memory horizon of ASSM [0.90, 0.99]
+        self.rapidity_plus = nn.Parameter(torch.empty(n_embd))
+        self.rapidity_minus = nn.Parameter(torch.empty(n_embd))
+        nn.init.uniform_(self.rapidity_plus, 0.15, 0.45)
+        nn.init.uniform_(self.rapidity_minus, 0.15, 0.45)
+
+    def get_weight(self):
+        return self.input_proj.compute_orthogonal_weight(), self.output_proj.compute_orthogonal_weight()
+
+    def forward(self, x: torch.Tensor, causal=True, get_q=False, weight=None):
+        q = self.q_attn(x) 
+        v = self.v_attn(x)
+        
+        if weight is None:
+            w_in, w_out = self.get_weight()
+        else:
+            w_in, w_out = weight
+            
+        # 1. Project input first (matches ASSM exactly)
+        q_projected = self.input_proj(q, w_in)
+        
+        # 2. Smooth absolute split *after* projection (guarantees sign purity & coordinate symmetry)
+        q_reg = torch.sqrt(q_projected**2 + self.delta)
+        q_proj_plus = 0.5 * (q_reg + q_projected)
+        q_proj_minus = 0.5 * (q_reg - q_projected)
+        
+        # 3. Energy-preserving hyperbolic coupling using rapidities
+        theta_plus = torch.clamp(self.rapidity_plus.abs(), min=1e-5).view(1, 1, -1)
+        theta_minus = torch.clamp(self.rapidity_minus.abs(), min=1e-5).view(1, 1, -1)
+        
+        D_plus = 1.0 / torch.cosh(theta_plus)
+        D_minus = 1.0 / torch.cosh(theta_minus)
+        
+        input_scale_plus = torch.tanh(theta_plus)
+        input_scale_minus = torch.tanh(theta_minus)
+        
+        # 4. Dual-channel associative scan
+        B, T, C = x.shape
+        decay_all = torch.cat([D_plus.expand(B, T, C), D_minus.expand(B, T, C)], dim=0)
+        scaled_input = torch.cat([
+            input_scale_plus * q_proj_plus, 
+            input_scale_minus * q_proj_minus
+        ], dim=0)
+        
+        scan_input_all = torch.cat([decay_all, scaled_input], dim=-1)
+        
+        def associative_scan_func(left_tuple, right_tuple):
+            a_left, b_left = left_tuple
+            a_right, b_right = right_tuple
+            return (a_right * a_left, a_right * b_left + b_right)
+
+        def scan_adapter(left, right):
+            a_l, b_l = left.chunk(2, dim=-1)
+            a_r, b_r = right.chunk(2, dim=-1)
+            a_out, b_out = associative_scan_func((a_l, b_l), (a_r, b_r))
+            return torch.cat([a_out, b_out], dim=-1)
+            
+        # Initialize with ones for decay multipliers, and zero state to prevent drift
+        init_packed = torch.cat([torch.ones_like(self.identity), torch.zeros_like(self.identity)], dim=-1)
+        scanned_packed_all = utils.pscan2(scan_input_all, scan_adapter, init_packed)
+        
+        _, q_scanned_all = scanned_packed_all.chunk(2, dim=-1)
+        q_scanned_plus, q_scanned_minus = q_scanned_all.chunk(2, dim=0)
+        
+        # 5. Indefinite Metric Reconstruction
+        q_scanned = q_scanned_plus - q_scanned_minus
+        
+        # 6. Output mapping & normalization
+        q_out = self.output_proj(q_scanned, w_out)
+        q_out = utils.rms_norm(q_out)
+        
+        Y = q_out * v 
+        Y = self.c_proj(Y)
+        Y = self.resid_dropout(Y)
+        
+        if get_q:
+            return Y, q_out
+        return Y
+
 class CrossAttention(nn.Module):
     def __init__(self, config):
         n_embd = config.n_embd

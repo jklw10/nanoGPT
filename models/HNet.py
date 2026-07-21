@@ -84,7 +84,260 @@ get_batch = utils.get_get_batch(block_size,batch_size,dataset,device,always_byte
 wn = torch.nn.utils.parametrizations.weight_norm
 
 
+class KreinCausalCrossAttention(nn.Module):
+    """
+    Drop-in continuous spacetime Causal Cross-Attention with zero clamps.
+    Internally projects feature embeddings to a low-dimensional coordinate manifold
+    and applies soft sigmoidal causal gating with continuous gradient flow.
+    """
+    def __init__(self, query_dim, key_dim, num_heads=4, pos_dim=16, init_c=1.0, delta=1e-4, tau=0.01):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = query_dim // num_heads
+        self.delta = delta
+        self.tau = tau
+        
+        # Feature projections
+        self.q_proj = nn.Linear(query_dim, query_dim, bias=False)
+        self.k_proj = nn.Linear(key_dim, query_dim, bias=False)
+        self.v_proj = nn.Linear(key_dim, query_dim, bias=False)
+        self.out_proj = nn.Linear(query_dim, query_dim, bias=False)
+        
+        # Projection from high-dimensional features to coordinate space
+        self.to_pos_q = nn.Linear(query_dim, pos_dim, bias=False)
+        self.to_pos_kv = nn.Linear(key_dim, pos_dim, bias=False)
+        
+        # Self-adjoint transformation matrix to prevent coordinate curl
+        self.pos_proj = nn.Parameter(torch.randn(pos_dim, pos_dim) * 0.02)
+        
+        # Learnable speed of causality propagation c
+        self.log_c = nn.Parameter(torch.tensor(math.log(init_c)))
+        
+        # Hyperbolic gradient censorship hook
+        if self.log_c.requires_grad:
+            self.log_c.register_hook(lambda grad: torch.tanh(grad) if grad is not None else None)
 
+    def forward(self, q_x, q_t, kv_x, kv_t):
+        B, L_q, D = q_x.shape
+        _, L_kv, _ = kv_x.shape
+        H = self.num_heads
+        d_k = self.head_dim
+        
+        # Standardize time tensor shapes to (B, L, 1) for broadcasting
+        if q_t.dim() == 2:
+            q_t = q_t.unsqueeze(-1)
+        if kv_t.dim() == 2:
+            kv_t = kv_t.unsqueeze(-1)
+            
+        # 1. Map features to raw coordinates
+        q_pos_raw = self.to_pos_q(q_x)
+        kv_pos_raw = self.to_pos_kv(kv_x)
+            
+        # 2. Symmetrize weight matrix to enforce self-adjointness (prevents curl)
+        W_symm = 0.5 * (self.pos_proj + self.pos_proj.t())
+        q_pos_proj = F.linear(q_pos_raw, W_symm)
+        kv_pos_proj = F.linear(kv_pos_raw, W_symm)
+        
+        # 3. Standard multi-head feature mapping
+        q = self.q_proj(q_x).view(B, L_q, H, d_k).transpose(1, 2)
+        k = self.k_proj(kv_x).view(B, L_kv, H, d_k).transpose(1, 2)
+        v = self.v_proj(kv_x).view(B, L_kv, H, d_k).transpose(1, 2)
+        
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d_k)
+        
+        # Temporal distance: dT = t_q - t_kv
+        dT = q_t - kv_t.transpose(1, 2)  # (B, L_q, L_kv)
+        
+        # 4. Enforce positive spatial distance via smooth softplus-splitting
+        s_q_norm = torch.sum(q_pos_proj**2, dim=-1, keepdim=True)
+        s_kv_norm = torch.sum(kv_pos_proj**2, dim=-1, keepdim=True).transpose(1, 2)
+        dot_s = torch.bmm(q_pos_proj, kv_pos_proj.transpose(1, 2))
+        raw_dist = s_q_norm + s_kv_norm - 2.0 * dot_s
+        
+        dS2 = 0.5 * (torch.sqrt(raw_dist**2 + self.delta) + raw_dist)
+        
+        # Apply smooth softsign distance scaling to resolve coordinate creases at 0
+        dS2_smooth = dS2 / (torch.sqrt(dS2 + self.delta) + 1.0)
+        
+        # Spacetime interval
+        c = torch.exp(self.log_c)
+        lorentzian_interval = dS2_smooth - (c * dT) ** 2  # (B, L_q, L_kv)
+        
+        # 5. Continuous Causal Gating
+        gate_temporal = torch.sigmoid(dT / self.tau)
+        gate_lorentzian = torch.sigmoid(-lorentzian_interval / self.tau)
+        causal_gate = (gate_temporal * gate_lorentzian).unsqueeze(1)  # (B, 1, L_q, L_kv)
+        
+        # Soft-penalize logits outside the past light cone (no hard boolean masks)
+        gated_logits = attn_logits - (1.0 - causal_gate) * 1e4
+        
+        # 6. Hyperbolic Boundary Deceleration
+        if self.training:
+            proximity = (1.0 / (torch.sqrt(lorentzian_interval**2 + self.delta) + 1.0)).detach()
+            scale_q = proximity.mean(dim=-1, keepdim=True)
+            scale_kv = proximity.mean(dim=-2, keepdim=True).transpose(1, 2)
+            
+            # Guard hooks against None gradients
+            q_pos_proj.register_hook(lambda grad: grad * scale_q if grad is not None else None)
+            kv_pos_proj.register_hook(lambda grad: grad * scale_kv if grad is not None else None)
+        
+        # Softmax and context projection
+        attn_weights = F.softmax(gated_logits, dim=-1)
+        context = torch.matmul(attn_weights, v)
+        context = context.transpose(1, 2).contiguous().view(B, L_q, D)
+        
+        return self.out_proj(context)
+    
+class Patcher2(nn.Module):
+    def __init__(self, outer_dim, inner_dim, outer_seq, inner_seq):
+        super().__init__()
+        self.inner_seq = inner_seq
+        self.outer_seq = outer_seq
+        self.sdim = 10
+
+        self.up_scan = modules.Block(outer_dim, 4, 0.0, False)
+        self.up_proj = Linear(outer_dim, inner_dim, bias=False)
+        if pattlin:
+            self.up_proj = modules.PattLayer(outer_dim, inner_dim, pattcount)
+            
+        self.AE = modules.Autoencoder(
+            inner_dim, inner_dim, inner_dim, inner_dim,
+            quantizer.threshotSTE_softmax
+        )
+        
+        if patt_AE:
+            self.AE = modules.PattLayer(inner_dim, inner_dim, pattcount)
+
+        self.resid_up = Linear(outer_dim, inner_dim, bias=False)
+        if pattlin:
+            self.resid_up = modules.PattLayer(outer_dim, inner_dim, pattcount)
+        self.resid_drop = nn.Dropout(dropout)
+        self.down_drop = nn.Dropout(dropout)
+        self.output_pos_emb = nn.Embedding(outer_seq, inner_dim)
+        
+        self.down_block = modules.Block(inner_dim, 4, 0.0, False)
+        self.down_scatter = modules.CombineBlock(inner_dim, 4, 0.0, False)
+        self.down_scatter2 = modules.CombineBlock(outer_dim, 4, 0.0, False)
+        self.down_proj = Linear(inner_dim, outer_dim, bias=False)
+        if pattlin:
+            self.down_proj = modules.PattLayer(inner_dim, outer_dim, pattcount)
+        self.down_scan = modules.Block(outer_dim, 4, 0.0, False)
+        
+        self.up_gate = nn.Sequential(
+            nn.Linear(outer_dim, outer_dim // 4, bias=False),
+            nn.GELU(),
+            nn.Linear(outer_dim // 4, 1)
+        )
+
+        self.down_gate = nn.Sequential(
+            nn.Linear(outer_dim, outer_dim // 4, bias=False),
+            nn.GELU(),
+            nn.Linear(outer_dim // 4, outer_seq)
+        )
+
+        self.res_norm = modules.LayerNorm(outer_dim, False)
+        self.down_norm = modules.LayerNorm(inner_dim, False)
+        self.gate_norm = modules.LayerNorm(outer_seq, False)
+
+        self.up_norm = modules.LayerNorm(outer_dim, False)
+        self.upgate_norm = modules.LayerNorm(outer_seq, False)
+        self.gather_norm = modules.LayerNorm(inner_dim, bias=False)
+        
+        self.query_block = modules.Block(outer_dim, 4, 0.0, False)
+        self.gather_block = modules.CombineBlock(outer_dim, 4, 0.0, False)
+        self.proj_block = modules.Block(inner_dim, 4, 0.0, False)
+        
+        # Initialize the Minkowski Causal Cross Attention block for upsampling
+        self.causal_upsampler = KreinCausalCrossAttention(inner_dim, inner_dim, num_heads=4)
+        
+    def abstract_up(self, x, conf=None):
+        B, L, D = x.shape
+        
+        # 1. Generate gate and gather candidate embeddings
+        gathered = self.query_block(x)
+        gate = self.up_gate(gathered).squeeze(-1)
+        gate = self.gate_norm(gate)
+        gathered = utils.rms_norm(gathered)
+        
+        # 2. Hyperbolic Gathering using KreinHyperbolicGBG
+        # This replaces RLMAXgbg5 with stabilized Lorentzian alignment
+        gathered, top_indices = gather.KreinHyperbolicGBG.apply(
+            gate, 
+            gathered, 
+            self.inner_seq,
+            0.1,             # tau
+            self.training,   # training
+            1e-12            # eps
+        )
+        
+        # 3. Sort indices to preserve strict chronological ordering
+        sorted_indices, sort_idx = torch.sort(top_indices, dim=-1)
+        
+        # Re-index gathered components and continuous timeline coords
+        gathered = torch.gather(gathered, 1, sort_idx.unsqueeze(-1).expand_as(gathered))
+        
+        # 4. Infer continuous spacetime coordinates on the fly
+        t_outer = torch.arange(L, device=x.device, dtype=x.dtype).view(1, -1, 1).expand(B, -1, -1)
+        t_inner = torch.gather(t_outer, 1, sorted_indices.unsqueeze(-1))
+        
+        # 5. Up-projections & AE checks
+        up = self.up_proj(gathered)
+        up = self.proj_block(up)
+        hot = None
+        aux = 0.0
+        if ael:
+            if patt_AE:
+                ae_up = self.AE(up)
+            else:
+                ae_up, hot = self.AE(up)
+            aux = F.mse_loss(up, ae_up)
+            up = ae_up
+            
+        # Append t_outer and t_inner to the residual tuple for abstract_down
+        return up, [x, ae_up, hot, gate, aux, t_outer, t_inner]
+    
+    def abstract_down(self, x, residual, decaying = None, conf=None):
+        residual_x, up_ae, hot, gate, upaux, t_outer, t_inner = residual
+        B = x.shape[0]
+        aux = 0
+        x = self.down_norm(x)
+        if ael:
+            if patt_AE:
+                aux = F.mse_loss(self.AE(x)[:,:-1,:], up_ae[:,1:,:].detach())
+            else:
+                aux = F.binary_cross_entropy(self.AE.quant(x)[:,:-1,:], hot.detach()[:,1:,:])
+        
+        pos = torch.arange(0, self.outer_seq, dtype=torch.long, device=device) 
+        pos_emb = self.output_pos_emb(pos).unsqueeze(0).expand(B, self.outer_seq, -1)
+       
+        # 6. Replace ScatterByGate with the Minkowski Causal Cross-Attention.
+        # Query: pos_emb (L_outer), Keys/Values: processed inner states x (L_inner)
+        scattered = self.causal_upsampler(pos_emb, t_outer, x, t_inner)
+        
+        pds = self.down_block(scattered)
+        pds = self.down_proj(pds)
+            
+        if resid:
+            query = self.res_norm(residual_x + pos_emb)
+        else:
+            query = self.down_proj(pos_emb)
+            query = self.res_norm(query)
+            
+        xout = self.down_scatter2(pds, query, causal=True)
+        if resid:
+            query = self.res_norm(residual_x)
+        else:
+            query = self.down_proj(pos_emb)
+            query = self.res_norm(query)
+        xout = self.down_scan(xout)
+        aux = aux + upaux
+        return xout, aux
+    
+    def forward(self, x, center, conf=None):
+        p_up, residual = self.abstract_up(x)
+        passed, aux = center(p_up)
+        p_down, aux2 = self.abstract_down(passed, residual)
+        return p_down, aux + aux2
 
 class Patcher(nn.Module):
     def __init__(self, outer_dim, inner_dim, outer_seq, inner_seq):
@@ -156,15 +409,15 @@ class Patcher(nn.Module):
         gate = self.up_gate(gathered).squeeze(-1)
         gate = self.gate_norm(gate)
         gathered = utils.rms_norm(gathered)
-        gathered, _ = gather.RLMAXgbg5.apply(
+        gathered, _ = gather.KreinHyperbolicGBG.apply(
             gate, 
             gathered, 
             self.inner_seq,
-            0.1,
-            #False,
-            self.training,
-            0.3
-            )
+            0.1,             # tau
+            self.training,   # training
+            1e-12            # eps
+        )
+        
         #noise =torch.randn_like(gathered,requires_grad=True)/(1.0+gathered.sum()) 
         #gsink = 
         #gathered= gathered+noise
