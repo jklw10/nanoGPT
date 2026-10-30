@@ -20,7 +20,8 @@ import os
 import time
 import math
 from contextlib import nullcontext
-
+#os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+#os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
 import torch
 import torch._dynamo
 import torch._inductor.config
@@ -42,6 +43,7 @@ torch._inductor.config.disable_cpp_codegen = True
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision('high')  
 
 
 # -----------------------------------------------------------------------------
@@ -96,7 +98,9 @@ device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
 
+optimizer: str = 'adam'
 
+disable_gc          = False
 force_gc            = False
 #switches
 best                = False
@@ -156,7 +160,7 @@ szcapow             = 2 #2, 10
 
 decay               = False
 decaying = 1.0
-
+decaying_enabled    = False
 eigenInit           = False
 
 lrfinder            = False
@@ -216,7 +220,7 @@ iter_num = 0
 best_val_loss = 3409349034 # good number for sure
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, optimizer=optimizer) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -526,7 +530,9 @@ running_mfu = -1.0
 
 scaler.is_enabled = False
 scaler = None
-if(force_gc):
+if disable_gc:
+    gc.disable()
+if force_gc :
     gc.collect()
     torch.cuda.empty_cache()
 itresetage = 5000
@@ -590,17 +596,19 @@ def model_step(iter_num, tl, best_val_loss, config):
         lr = get_lr(iter_num)
         #lr = utils.ramp(iter_num, learning_rate, warmup_iters) 
         #lr = utils.cosine_decay(iter_num, lr, min_lr, warmup_iters, lr_decay_iters)
-    
-    dec_start = 35000
-    dec_time = 1
-    decaying = utils.cosine_decay(iter_num, 1.0, 0.0, dec_time, dec_start)
+    decaying = None
+    if decaying_enabled:
+        dec_start = 35000
+        dec_time = 1
+        decaying = utils.cosine_decay(iter_num, 1.0, 0.0, dec_time, dec_start)
 
+        decaying = torch.tensor(decaying, dtype=ptdtype, device=device)
     size = block_size
     if sizejump:
-        if(iter_num == 25000):
+        if(iter_num == 5000):
             checkpoint = get_cpt()
             torch.save(checkpoint, os.path.join(out_dir, '25k.pt'))
-        if(iter_num > 25000):
+        if(iter_num > 5000):
 
             size = block_size*2
     
@@ -629,6 +637,8 @@ def model_step(iter_num, tl, best_val_loss, config):
     if iter_num % eval_interval == 0 and master_process: 
         if(iter_num > 0):
             
+            #gc.collect()
+            #torch.cuda.empty_cache()
             if(force_gc):
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -661,10 +671,14 @@ def model_step(iter_num, tl, best_val_loss, config):
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
             
             print(f"train loss {losses['train']:.4f}, val loss {losses['val']:.4f} : step {iter_num:{len(str(max_iters))}d} : saved {saved} , total time {(t1-tl)*1000:.2f}ms, validation time {(t2-t1)*1000:.2f}ms")
+        
             
         
         if(force_gc):
+            gc.collect()
             torch.cuda.empty_cache()
+        
+        #torch.cuda.empty_cache()
     if iter_num == 0 and eval_only:
         return 0, False, best_val_loss
     
@@ -684,20 +698,13 @@ def model_step(iter_num, tl, best_val_loss, config):
     #l1.mean().backward()
     #loss.backward()
     
-    if(force_gc):
-        torch.cuda.empty_cache()  
+    #if(force_gc):
+    #    torch.cuda.empty_cache()  
     
     for mod in model.modules():
         if isinstance(mod, optim.OptimizedLinear):
             pass
 
-    #if grokfast:
-    #    with torch.no_grad():
-    #        for p in model.parameters():
-    #            if p.requires_grad:
-    #                p.gema += 0.99 * (p.grad - p.gema)
-    #                p.grad += p.gema * 2
-    #                p.grad /= 3
     optimizer.step()
     if optimizer2 is not None:
         optimizer2.step()
@@ -720,6 +727,7 @@ def model_step(iter_num, tl, best_val_loss, config):
     optimizer.zero_grad(set_to_none=True)
     if optimizer2 is not None:
         optimizer2.zero_grad(set_to_none=True)
+    
     if iter_num > max_iters:
         return 0, False, best_val_loss
     return iter_num + 1, True, best_val_loss
@@ -734,7 +742,7 @@ while run:
 
 if endgen:
     print("sanity check")
-    X, Y = get_batch('train')
+    X, Y = get_batch('train', 64)
     with torch.no_grad():
         model.eval()
         outp = model.generate(X[0].unsqueeze(0), 100, temperature=1.0, top_k=1)

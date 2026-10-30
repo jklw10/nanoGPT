@@ -2,6 +2,8 @@
 import math
 import os
 import pickle
+import queue
+import threading
 
 import numpy as np
 import tiktoken
@@ -266,7 +268,9 @@ def unsoftsign(x):
 def unsoftishsign(x): 
     return x - (x / (1 + x*x))*0.99
 
-def sinkhorn_knopp(log_alpha,iter=5,dim=[-1,-2]):
+def sinkhorn_knopp(log_alpha,iter=5,dim=None):
+    if dim is None:
+        dim = [-1, -2]
     device = log_alpha.device
     d1, d2 = dim
     u = torch.zeros(log_alpha.shape[:d1] + (1,), device=device) # (batch, M, 1)
@@ -275,6 +279,7 @@ def sinkhorn_knopp(log_alpha,iter=5,dim=[-1,-2]):
         u = -torch.logsumexp(log_alpha + v, dim=d1, keepdim=True)
         v = -torch.logsumexp(log_alpha + u, dim=d2, keepdim=True)
     return torch.exp(log_alpha + u + v)
+
 def softsoftplus(x):
     return  torch.log1p(torch.exp(x)) / (2 + torch.abs(x))
 def log_softplus(x):
@@ -1488,7 +1493,7 @@ def gaussian_kernel_nd(features: int,
     kernel = torch.exp(-(indices - center).pow(2) / (2 * sigma**2))
     return kernel
 
-def apply_spectral_filter(signal: torch.Tensor, center_offset: float = 0.0, sigma_val: float = 0.15) -> torch.Tensor:
+def apply_spectral_filter2(signal: torch.Tensor, center_offset: float = 0.0, sigma_val: float = 0.15) -> torch.Tensor:
     # Compute RFFT along only the last dimension (no flattening)
     noise_fft = torch.fft.rfft(signal, dim=-1)
     
@@ -1504,6 +1509,41 @@ def apply_spectral_filter(signal: torch.Tensor, center_offset: float = 0.0, sigm
     # Broadcast-multiplication automatically scales the last dimension of any ND tensor
     filtered_fft = noise_fft * kernel
     return torch.fft.irfft(filtered_fft, n=signal.shape[-1], dim=-1)
+
+def apply_spectral_filter(noise: torch.Tensor, center_offset: float = 1.0, sigma_val: float = 0.5) -> torch.Tensor:
+    dim = noise.shape[-1]
+    device = noise.device
+    dtype = noise.dtype
+
+    kernel_size = min(31, dim if dim % 2 == 1 else dim - 1)
+    if kernel_size < 3:
+        return noise
+    half_k = kernel_size // 2
+
+    omega_0 = center_offset * math.pi
+
+    sigma_t = max(sigma_val * math.pi, 1e-4)
+
+    t = torch.arange(-half_k, half_k + 1, device=device, dtype=dtype)
+
+    # 4. Modulated Gaussian (Gabor) impulse response
+    envelope = torch.exp(-0.5 * (t * sigma_t) ** 2)
+    carrier = torch.cos(omega_0 * t)
+    kernel = envelope * carrier
+
+    # 5. Energy-preserving normalization (L2 norm = 1)
+    kernel = kernel / (torch.norm(kernel, p=2) + 1e-8)
+    kernel = kernel.view(1, 1, kernel_size)
+
+    # 6. Apply circular 1D convolution
+    orig_shape = noise.shape
+    x = noise.reshape(-1, 1, dim)
+    
+    # Circular padding preserves boundary periodicity identical to FFT
+    x_padded = F.pad(x, (half_k, half_k), mode='circular')
+    filtered = F.conv1d(x_padded, kernel)
+    
+    return filtered.reshape(orig_shape)
 
 @torch.compile(backend='inductor', mode='max-autotune')
 def wrapping_gaussian_kernel(activation_tensor: torch.Tensor, 
@@ -1878,11 +1918,87 @@ def get_get_batch_smart(block_size, batch_size, dataset, device):
     return get_batch
     
 
-#i found the name funny
 
+class GPUByteDecompressingLoader(nn.Module):
+    def __init__(self, filepath, block_size, batch_size, device='cuda', max_bytes_per_tok=32):
+        super().__init__()
+        self.block_size = block_size
+        self.batch_size = batch_size
+        self.device = device
+        self.max_bytes = max_bytes_per_tok
+        
+        # 1. Memory-map compact uint16 tokens directly from disk
+        file_size = os.path.getsize(filepath) // 2
+        self.tokens = torch.from_file(filepath, shared=True, size=file_size, dtype=torch.int16)
+        self.file_len = len(self.tokens)
+        
+        # 2. Build 1.6 MB GPU Byte Lookup Table once
+        print("Building Vectorized 1.6 MB GPU Byte Lookup Table...")
+        enc = tiktoken.get_encoding("gpt2")
+        
+        byte_table = torch.zeros((enc.n_vocab, max_bytes_per_tok), dtype=torch.uint8)
+        byte_lens = torch.zeros(enc.n_vocab, dtype=torch.int32)
+        
+        for i in range(enc.n_vocab):
+            b = bytes(enc.decode_bytes([i]))
+            l = min(len(b), max_bytes_per_tok)
+            byte_table[i, :l] = torch.tensor(list(b[:l]), dtype=torch.uint8)
+            byte_lens[i] = l
+            
+        self.register_buffer('gpu_byte_table', byte_table.to(device))
+        self.register_buffer('gpu_byte_lens', byte_lens.to(device))
+        
+        # --- PRE-ALLOCATED STATIC BUFFERS (Zero GPU allocations during training) ---
+        self.register_buffer('byte_offsets', torch.arange(max_bytes_per_tok, device=device))
+        self.register_buffer('batch_grid', torch.arange(batch_size, device=device).view(-1, 1, 1))
+
+    def get_batch(self, size):
+        fetch_tok_len = max(size, 128)
+        max_idx = self.file_len - fetch_tok_len
+        
+        ix = torch.randint(max_idx, (self.batch_size, 1))
+        offsets = torch.arange(fetch_tok_len)
+        block_idxs = ix + offsets 
+        
+        # PCIe Transfer (16 KB)
+        token_batch = (self.tokens[block_idxs].long() & 0xFFFF).to(self.device, non_blocking=True)
+        
+        padded_bytes = self.gpu_byte_table[token_batch] 
+        lens = self.gpu_byte_lens[token_batch]           
+        
+        start_offsets = torch.cumsum(lens, dim=1) - lens 
+        target_positions = start_offsets.unsqueeze(-1) + self.byte_offsets 
+        
+        valid_mask = (self.byte_offsets < lens.unsqueeze(-1)) & (target_positions < size + 1)
+        expanded_grid = self.batch_grid.expand_as(target_positions)
+        
+        data_bytes = torch.zeros((self.batch_size, size + 1), dtype=torch.uint8, device=self.device)
+        data_bytes[expanded_grid[valid_mask], target_positions[valid_mask]] = padded_bytes[valid_mask]
+        
+        data = data_bytes.long()
+        x = data[:, :size].contiguous()
+        y = data[:, 1:size+1].contiguous()
+        return x, y
+
+class AsyncGPUBytePrefetcher:
+    def __init__(self, loader, queue_size=3):
+        self.loader = loader
+        self.queue = queue.Queue(maxsize=queue_size)
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
+    def _worker(self):
+        while True:
+            # Runs GPU decompression asynchronously in the background thread
+            x, y = self.loader.get_batch(self.loader.block_size)
+            self.queue.put((x, y))
+
+    def get_batch(self, size=None):
+        if size is None or size == self.loader.block_size:
+            return self.queue.get()
+        return self.loader.get_batch(size)
+#i found the name funny
 def get_get_batch(block_size, batch_size, dataset, device, always_byte=False, skip=0, single=False):
-    # Keep the original signature completely unchanged.
-    # Detect if we are in multi-task mode (dict) or single-task mode (str).
     if isinstance(dataset, dict):
         datasets_dict = dataset
         default_task = list(dataset.keys())[0]
@@ -1890,6 +2006,29 @@ def get_get_batch(block_size, batch_size, dataset, device, always_byte=False, sk
         datasets_dict = {'pretrain': dataset}
         default_task = 'pretrain'
     
+    if always_byte:
+        # Build GPU byte loaders per task for both train and val splits
+        byte_loaders = {}
+        for task_name, dataset_name in datasets_dict.items():
+            data_dir = os.path.join('data', dataset_name)
+            train_path = os.path.join(data_dir, 'train.bin')
+            val_path = os.path.join(data_dir, 'val.bin')
+            byte_loaders[task_name] = {
+                'train': GPUByteDecompressingLoader(train_path, block_size, batch_size, device),
+                'val': GPUByteDecompressingLoader(val_path, block_size, batch_size, device)
+            }
+
+        def get_batch(split, size=None, index=None, task=None):
+            if task is None:
+                task = default_task
+            if size is None:
+                size = block_size
+            loader = byte_loaders[task][split]
+            return loader.get_batch(size)
+
+        return get_batch
+
+    # Non-byte path (np.uint16 memmaps)
     memmaps = {}
     for task_name, dataset_name in datasets_dict.items():
         data_dir = os.path.join('data', dataset_name)
@@ -1900,56 +2039,12 @@ def get_get_batch(block_size, batch_size, dataset, device, always_byte=False, sk
             'train': np.memmap(train_path, dtype=np.uint16, mode='r'),
             'val': np.memmap(val_path, dtype=np.uint16, mode='r')
         }
-        
-    if always_byte:
-        print("Building token-to-byte lookup table...")
-        enc = tiktoken.get_encoding("gpt2")
-        TOKEN_TO_BYTES = [torch.tensor(list(enc.decode_bytes([i])), dtype=torch.uint8) for i in range(enc.n_vocab)]
-        
-    def tok2byte(split, size=None, task=None):
-        if task is None:
-            task = default_task
-        if size is None:
-            size = block_size
-            
-        data_tokens = memmaps[task][split]
-        fetch_len = max(size, 32) 
-
-        ix = torch.randint(len(data_tokens) - fetch_len, (batch_size,))
-        batch_bytes = []
-
-        for i in ix:
-            token_chunk = data_tokens[i : i + fetch_len].astype(np.int64)
-            byte_seq = torch.cat([TOKEN_TO_BYTES[t] for t in token_chunk])
-
-            if len(byte_seq) < size + 1:
-                token_chunk = data_tokens[i : i + fetch_len * 2].astype(np.int64)
-                byte_seq = torch.cat([TOKEN_TO_BYTES[t] for t in token_chunk])
-
-            batch_bytes.append(byte_seq[:size + 1])
-
-        data = torch.stack(batch_bytes).to(torch.int64)
-
-        if device == 'cuda':
-            data = data.pin_memory().to(device, non_blocking=True)
-        else:
-            data = data.to(device)
-        
-        if single:
-            return data[:, :size]
-        x = data[:, :size].contiguous()
-        y = data[:, 1:size+1].contiguous()
-        return x, y
-
-    # Keep original positional arguments, adding 'task' as an optional keyword argument
+    
     def get_batch(split, size=None, index=None, task=None):
         if task is None:
             task = default_task
         if size is None:
             size = block_size
-        
-        if always_byte:
-            return tok2byte(split, size, task)
         
         data = memmaps[task][split]
         if index is None:

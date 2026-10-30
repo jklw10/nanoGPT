@@ -344,7 +344,7 @@ class Kattention(nn.Module):
     def __init__(self, config, h_dim=None):
         super().__init__()
         if h_dim:
-            assert config.n_embd % config.hdim == 0
+            assert config.n_embd % h_dim == 0
         else:
             assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch

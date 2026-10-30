@@ -47,75 +47,72 @@ wnll            = False
 patt            = False
 gen             = True
 lr_ramp         = False
-always_byte     = False
+always_byte     = True
 
 
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 train_logging = False
 exec(open('training_tools/configurator.py').read()) # overrides from command line or config file
 
-def apply_precond(g_2d, L_inv, R_inv, use_L, use_R):
-    if use_R:
-        res = torch.matmul(g_2d, R_inv)
-    else:
-        res = g_2d * R_inv  
-        
-    if use_L:
-        res = torch.matmul(L_inv, res)
-    else:
-        res = res * L_inv  
-    return res
-
-def get_rank1_approximation(G):
-    m, n = G.shape
-    device = G.device
-    dtype = G.dtype
-    
-    v = torch.sum(G, dim=0, keepdim=True).T
-    norm_v = torch.norm(v)
-    
-    v = torch.where(
-        norm_v > 1e-8,
-        v / (norm_v + 1e-12),
-        torch.randn((n, 1), dtype=dtype, device=device) / math.sqrt(n)
-    )
-        
-    u = torch.matmul(G, v)
-    norm_u = torch.norm(u)
-    u = torch.where(
-        norm_u > 1e-8,
-        u / (norm_u + 1e-12),
-        torch.randn((m, 1), dtype=dtype, device=device) / math.sqrt(m)
-    )
-        
-    v = torch.matmul(G.T, u)
-    norm_v = torch.norm(v)
-    v = torch.where(
-        norm_v > 1e-8,
-        v / (norm_v + 1e-12),
-        torch.randn((n, 1), dtype=dtype, device=device) / math.sqrt(n)
-    )
-        
-    return u, v
-
-
-
-def sherman_morrison_update(A_inv, x, beta, A_inv_init, leak):
-    """
-    Updates the inverse matrix A_inv under a rank-1 update with diagonal leakage
-    to prevent estimator wind-up and preserve positive-definiteness.
-    """
-    alpha = 1.0 - beta
-    Ax = torch.matmul(A_inv, x)  # (d, 1)
-    xAx = torch.matmul(x.T, Ax)
-    
-    num = alpha * torch.matmul(Ax, Ax.T)
-    denom = beta + alpha * xAx
-    
-    denom = torch.clamp(denom, min=1e-12)
-    A_inv_new = (A_inv - num / denom) / beta
-    
-    return (1.0 - leak) * A_inv_new + leak * A_inv_init
+#def apply_precond(g_2d, L_inv, R_inv, use_L, use_R):
+#    if use_R:
+#        res = torch.matmul(g_2d, R_inv)
+#    else:
+#        res = g_2d * R_inv  
+#        
+#    if use_L:
+#        res = torch.matmul(L_inv, res)
+#    else:
+#        res = res * L_inv  
+#    return res
+#
+#def get_rank1_approximation(G):
+#    m, n = G.shape
+#    device = G.device
+#    dtype = G.dtype
+#    
+#    v = torch.sum(G, dim=0, keepdim=True).T
+#    norm_v = torch.norm(v)
+#    
+#    v = torch.where(
+#        norm_v > 1e-8,
+#        v / (norm_v + 1e-12),
+#        torch.randn((n, 1), dtype=dtype, device=device) / math.sqrt(n)
+#    )
+#        
+#    u = torch.matmul(G, v)
+#    norm_u = torch.norm(u)
+#    u = torch.where(
+#        norm_u > 1e-8,
+#        u / (norm_u + 1e-12),
+#        torch.randn((m, 1), dtype=dtype, device=device) / math.sqrt(m)
+#    )
+#        
+#    v = torch.matmul(G.T, u)
+#    norm_v = torch.norm(v)
+#    v = torch.where(
+#        norm_v > 1e-8,
+#        v / (norm_v + 1e-12),
+#        torch.randn((n, 1), dtype=dtype, device=device) / math.sqrt(n)
+#    )
+#        
+#    return u, v
+#def sherman_morrison_update(A_inv, x, beta, A_inv_init, leak):
+#    """
+#    Updates the inverse matrix A_inv under a rank-1 update with diagonal leakage
+#    to prevent estimator wind-up and preserve positive-definiteness.
+#    """
+#    alpha = 1.0 - beta
+#    Ax = torch.matmul(A_inv, x)  # (d, 1)
+#    xAx = torch.matmul(x.T, Ax)
+#    
+#    num = alpha * torch.matmul(Ax, Ax.T)
+#    denom = beta + alpha * xAx
+#    
+#    denom = torch.clamp(denom, min=1e-12)
+#    A_inv_new = (A_inv - num / denom) / beta
+#    
+#    return (1.0 - leak) * A_inv_new + leak * A_inv_init
 
 
 class KreinKroneckerSM(torch.optim.Optimizer):
@@ -620,11 +617,6 @@ class KreinKroneckerSM4(torch.optim.Optimizer):
     def __init__(self, params, lr=1e-3, beta_cov=0.99, eps=1e-8,
                  damping=1e-5, gamma=1e-3, weight_decay=1e-2, 
                  R=None, kernel='softsign', max_kron_dim=2048, update_freq=10):
-        """
-        KreinKroneckerSM4: An optimized version of KreinKroneckerSM3 that uses 
-        Lazy Preconditioning (update_freq) to drastically reduce computational overhead 
-        on GPUs. All trust-region and memory protections of SM3 are preserved.
-        """
         if update_freq < 1:
             raise ValueError(f"Invalid update_freq: {update_freq}. Must be >= 1.")
             
@@ -846,6 +838,226 @@ class KreinKroneckerSM4(torch.optim.Optimizer):
                     max_allowed_update = torch.clamp(max_allowed_update, max=delta_limit)
 
                     # Clamp the proposed update with our safe, non-trapping trust limits
+                    final_update = torch.clamp(proposed_update, min=min_allowed_update, max=max_allowed_update)
+
+                    p_ch.add_(final_update, alpha=-step_size)
+                    p_ch.clamp_(min=1e-6)
+
+                state['p_plus'].copy_(p_plus)
+                state['p_minus'].copy_(p_minus)
+                p.copy_((p_plus - p_minus).to(p.dtype))
+
+        return loss
+
+def get_rank1_approximation(G):
+    m, n = G.shape
+    device, dtype = G.device, G.dtype
+    
+    v = torch.sum(G, dim=0, keepdim=True).T
+    norm_v = torch.norm(v)
+    
+    if norm_v > 1e-8:
+        v = v / (norm_v + 1e-12)
+    else:
+        v = torch.randn((n, 1), dtype=dtype, device=device) / math.sqrt(n)
+        
+    u = torch.matmul(G, v)
+    norm_u = torch.norm(u)
+    if norm_u > 1e-8:
+        u = u / (norm_u + 1e-12)
+    else:
+        u = torch.randn((m, 1), dtype=dtype, device=device) / math.sqrt(m)
+        
+    v = torch.matmul(G.T, u)
+    sigma = torch.norm(v)
+    if sigma > 1e-8:
+        v = v / (sigma + 1e-12)
+    else:
+        v = torch.randn((n, 1), dtype=dtype, device=device) / math.sqrt(n)
+        
+    sqrt_sigma = torch.sqrt(torch.clamp(sigma, min=1e-8))
+    return u * sqrt_sigma, v * sqrt_sigma
+
+
+def sherman_morrison_update(A_inv, x, beta, A_inv_init, leak):
+    alpha = 1.0 - beta
+    Ax = torch.matmul(A_inv, x)  # (d, 1)
+    xAx = torch.matmul(x.T, Ax)  # (1, 1)
+    
+    num = alpha * torch.matmul(Ax, Ax.T)
+    denom = torch.clamp(beta + alpha * xAx, min=1e-12)
+    
+    A_inv_new = (A_inv - num / denom) / beta
+    return (1.0 - leak) * A_inv_new + leak * A_inv_init
+
+
+class KreinKroneckerSM5(torch.optim.Optimizer):
+    def __init__(self, params, lr=1e-3, beta_cov=0.99, eps=1e-8,
+                 damping=1e-5, gamma=1e-3, weight_decay=1e-2, 
+                 kernel='softsign'):
+        defaults = dict(
+            lr=lr, beta_cov=beta_cov, eps=eps, damping=damping, gamma=gamma,
+            weight_decay=weight_decay, kernel=kernel
+        )
+        super(KreinKroneckerSM5, self).__init__(params, defaults)
+    
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group['lr']
+            beta_cov = group['beta_cov']
+            damping = group['damping']
+            gamma = group['gamma']
+            weight_decay = group['weight_decay']
+            kernel = group['kernel']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad
+                state = self.state[p]
+                eps_geom = 1e-12
+
+                orig_shape = p.shape
+                is_multidim = p.dim() > 1
+                
+                if is_multidim:
+                    m = orig_shape[0]
+                    n = p.numel() // m
+                else:
+                    m, n = p.numel(), 1
+
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['p_plus'] = torch.clamp(p.data, min=0.0).add_(1e-4)
+                    state['p_minus'] = torch.clamp(-p.data, min=0.0).add_(1e-4)
+                    
+                    # FIX 1: Correct 4th-root scaling for Kronecker factors
+                    scale_factor = 1.0 / (max(damping, eps_geom) ** 0.25)
+                    state['L_inv_init'] = scale_factor * torch.eye(m, dtype=p.dtype, device=p.device)
+                    state['R_inv_init'] = scale_factor * torch.eye(n, dtype=p.dtype, device=p.device)
+                    
+                    for ch in ['plus', 'minus']:
+                        state[f'L_inv_{ch}'] = state['L_inv_init'].clone()
+                        state[f'R_inv_{ch}'] = state['R_inv_init'].clone()
+
+                    state['ema_kl'] = 0.0
+                    max_init = p.data.abs().max().item() if p.numel() > 1 else p.data.abs().item()
+                    state['max_init'] = max(max_init, 1e-4)
+
+                state['step'] += 1
+
+                p_plus = state['p_plus'].to(torch.float32)
+                p_minus = state['p_minus'].to(torch.float32)
+                grad_fp32 = grad.to(torch.float32)
+
+                if is_multidim and weight_decay != 0:
+                    decay_factor = 1.0 - lr * weight_decay
+                    p_plus.mul_(decay_factor)
+                    p_minus.mul_(decay_factor)
+
+                g_plus = torch.clamp(grad_fp32, min=0.0)
+                g_minus = torch.clamp(-grad_fp32, min=0.0)
+                g_plus_2d = g_plus.view(m, n)
+                g_minus_2d = g_minus.view(m, n)
+
+                if is_multidim:
+                    leak = 1.05 * (1.0 - beta_cov)
+                    
+                    # FIX 4: Magnitude-aware rank-1 SVD update
+                    u_plus, v_plus = get_rank1_approximation(g_plus_2d)
+                    state['L_inv_plus'] = sherman_morrison_update(
+                        state['L_inv_plus'], u_plus, beta_cov, state['L_inv_init'], leak
+                    )
+                    state['R_inv_plus'] = sherman_morrison_update(
+                        state['R_inv_plus'], v_plus, beta_cov, state['R_inv_init'], leak
+                    )
+                    
+                    u_minus, v_minus = get_rank1_approximation(g_minus_2d)
+                    state['L_inv_minus'] = sherman_morrison_update(
+                        state['L_inv_minus'], u_minus, beta_cov, state['L_inv_init'], leak
+                    )
+                    state['R_inv_minus'] = sherman_morrison_update(
+                        state['R_inv_minus'], v_minus, beta_cov, state['R_inv_init'], leak
+                    )
+
+                    # Precondition raw gradients
+                    step_precond_plus_2d = torch.matmul(state['L_inv_plus'], torch.matmul(g_plus_2d, state['R_inv_plus']))
+                    step_precond_plus = step_precond_plus_2d.view_as(g_plus)
+                    
+                    step_precond_minus_2d = torch.matmul(state['L_inv_minus'], torch.matmul(g_minus_2d, state['R_inv_minus']))
+                    step_precond_minus = step_precond_minus_2d.view_as(g_minus)
+
+                    # Noise ratio estimation
+                    kl_rate = max(torch.sum(g_plus * step_precond_plus).item() + torch.sum(g_minus * step_precond_minus).item(), 1e-12)
+                    beta_noise = 0.99
+                    state['ema_kl'] = kl_rate if state['step'] == 1 else beta_noise * state['ema_kl'] + (1.0 - beta_noise) * kl_rate
+                    kl_ratio = kl_rate / (state['ema_kl'] + 1e-8)
+                    noise_ratio = kl_ratio / (kl_ratio + 1.0)
+
+                    # FIX 3: R_t based on absolute max (L_infinity norm) to prevent outlier weight freezing
+                    max_current = p.data.abs().max().item() if p.numel() > 1 else p.data.abs().item()
+                    scale_ref = max(state['max_init'], max_current)
+                    R_t = (1.25 + 0.5 * (1.0 - noise_ratio)) * scale_ref
+                else:
+                    step_precond_plus = None
+                    step_precond_minus = None
+                    R_t = None
+
+                channels = {
+                    'plus': (p_plus, g_plus, step_precond_plus),
+                    'minus': (p_minus, g_minus, step_precond_minus)
+                }
+
+                for ch_name, (p_ch, g_ch, step_precond) in channels.items():
+                    step_size = lr
+                    if not is_multidim:
+                        p_ch.add_(g_ch, alpha=-step_size)
+                        p_ch.clamp_(min=1e-6)
+                        continue
+
+                    r = torch.abs(p_ch)
+                    r_safe = torch.clamp(r, min=eps_geom, max=R_t - eps_geom)
+
+                    x_norm = r_safe / R_t
+                    if kernel == 'softsign':
+                        K_norm = x_norm / (x_norm + 1.0)
+                        K_prime = 1.0 / (x_norm + 1.0).square()
+                    elif kernel == 'tanh':
+                        K_norm = torch.tanh(x_norm)
+                        K_prime = 1.0 - K_norm.square()
+
+                    one_minus_K2 = torch.clamp(1.0 - K_norm.square(), min=eps_geom)
+                    scale = one_minus_K2.square() / (K_prime + damping * one_minus_K2.square())
+
+                    # FIX 2: Symmetrized product to eliminate non-conservative curl
+                    sqrt_scale = torch.sqrt(scale)
+                    g_scaled = g_ch * sqrt_scale
+                    g_scaled_2d = g_scaled.view(m, n)
+                    if ch_name == 'plus':
+                        step_nat_2d = torch.matmul(state['L_inv_plus'], torch.matmul(g_scaled_2d, state['R_inv_plus']))
+                    else:
+                        step_nat_2d = torch.matmul(state['L_inv_minus'], torch.matmul(g_scaled_2d, state['R_inv_minus']))
+                    step_natural = step_nat_2d.view_as(g_ch) * sqrt_scale
+
+                    gamma_stable = min(gamma, 1.9 / step_size) if step_size > 0 else 0.0
+                    coeff_num = K_norm * K_prime * one_minus_K2
+                    coeff_denom = torch.clamp(K_prime.square() + damping * one_minus_K2.square(), min=eps_geom)
+                    
+                    entropic_force = (gamma_stable * (coeff_num / coeff_denom)) * (p_ch / r_safe)
+                    proposed_update = step_natural + entropic_force
+
+                    # Safety clamping bounds
+                    delta_limit = 0.9 * R_t
+                    min_allowed_update = torch.clamp(-0.9 * torch.clamp(R_t - p_ch, min=1e-12), min=-delta_limit)
+                    max_allowed_update = torch.clamp(0.9 * p_ch, max=delta_limit)
+
                     final_update = torch.clamp(proposed_update, min=min_allowed_update, max=max_allowed_update)
 
                     p_ch.add_(final_update, alpha=-step_size)
@@ -1130,7 +1342,7 @@ class GPT(nn.Module):
         #    lr=lr, 
         #    mode="hypercube",
         #)
-        return KreinKroneckerSM4(
+        return KreinKroneckerSM5(
             optim_groups,
             lr=lr, 
         )

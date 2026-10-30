@@ -84,11 +84,34 @@ get_batch = utils.get_get_batch(block_size,batch_size,dataset,device,always_byte
 wn = torch.nn.utils.parametrizations.weight_norm
 
 
+class TanhGrad(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        return x
+    @staticmethod
+    def backward(ctx, grad_output):
+        if grad_output is None:
+            return None
+        return torch.tanh(grad_output)
+
+
+class ScaleGrad(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.save_for_backward(scale)
+        return x
+    @staticmethod
+    def backward(ctx, grad_output):
+        scale, = ctx.saved_tensors
+        if grad_output is None:
+            return None, None
+        return grad_output * scale, None
+
 class KreinCausalCrossAttention(nn.Module):
     """
     Drop-in continuous spacetime Causal Cross-Attention with zero clamps.
-    Internally projects feature embeddings to a low-dimensional coordinate manifold
-    and applies soft sigmoidal causal gating with continuous gradient flow.
+    Internally projects feature embeddings to a low-dimensional coordinate manifold,
+    utilizing custom autograd functions to handle boundary stabilization without hooks.
     """
     def __init__(self, query_dim, key_dim, num_heads=4, pos_dim=16, init_c=1.0, delta=1e-4, tau=0.01):
         super().__init__()
@@ -113,9 +136,9 @@ class KreinCausalCrossAttention(nn.Module):
         # Learnable speed of causality propagation c
         self.log_c = nn.Parameter(torch.tensor(math.log(init_c)))
         
-        # Hyperbolic gradient censorship hook
-        if self.log_c.requires_grad:
-            self.log_c.register_hook(lambda grad: torch.tanh(grad) if grad is not None else None)
+        # --- Value Manifold Partitioning ---
+        self.v_space_dim = self.head_dim // 2
+        self.v_time_dim = self.head_dim - self.v_space_dim
 
     def forward(self, q_x, q_t, kv_x, kv_t):
         B, L_q, D = q_x.shape
@@ -143,6 +166,9 @@ class KreinCausalCrossAttention(nn.Module):
         k = self.k_proj(kv_x).view(B, L_kv, H, d_k).transpose(1, 2)
         v = self.v_proj(kv_x).view(B, L_kv, H, d_k).transpose(1, 2)
         
+        # Partition V into spacelike and timelike vectors (Kratt B)
+        v_space, v_time = torch.split(v, [self.v_space_dim, self.v_time_dim], dim=-1)
+        
         attn_logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d_k)
         
         # Temporal distance: dT = t_q - t_kv
@@ -159,31 +185,43 @@ class KreinCausalCrossAttention(nn.Module):
         # Apply smooth softsign distance scaling to resolve coordinate creases at 0
         dS2_smooth = dS2 / (torch.sqrt(dS2 + self.delta) + 1.0)
         
-        # Spacetime interval
-        c = torch.exp(self.log_c)
+        # Spacetime interval (utilizing TanhGrad for log_c without register_hook)
+        log_c_stabilized = TanhGrad.apply(self.log_c)
+        c = torch.exp(log_c_stabilized)
         lorentzian_interval = dS2_smooth - (c * dT) ** 2  # (B, L_q, L_kv)
         
         # 5. Continuous Causal Gating
         gate_temporal = torch.sigmoid(dT / self.tau)
         gate_lorentzian = torch.sigmoid(-lorentzian_interval / self.tau)
-        causal_gate = (gate_temporal * gate_lorentzian).unsqueeze(1)  # (B, 1, L_q, L_kv)
         
-        # Soft-penalize logits outside the past light cone (no hard boolean masks)
-        gated_logits = attn_logits - (1.0 - causal_gate) * 1e4
+        # Spacelike gating vs Timelike gating
+        gate_space = (gate_temporal * (1.0 - gate_lorentzian)).unsqueeze(1)  # Spacelike channel
+        gate_time = (gate_temporal * gate_lorentzian).unsqueeze(1)           # Timelike channel
         
-        # 6. Hyperbolic Boundary Deceleration
+        # Soft-penalize logits outside the past light cone
+        gated_logits_space = attn_logits - (1.0 - gate_space) * 1e4
+        gated_logits_time = attn_logits - (1.0 - gate_time) * 1e4
+        
+        # 6. Hyperbolic Boundary Deceleration (utilizing ScaleGrad without register_hook)
         if self.training:
             proximity = (1.0 / (torch.sqrt(lorentzian_interval**2 + self.delta) + 1.0)).detach()
             scale_q = proximity.mean(dim=-1, keepdim=True)
             scale_kv = proximity.mean(dim=-2, keepdim=True).transpose(1, 2)
             
-            # Guard hooks against None gradients
-            q_pos_proj.register_hook(lambda grad: grad * scale_q if grad is not None else None)
-            kv_pos_proj.register_hook(lambda grad: grad * scale_kv if grad is not None else None)
+            # Re-route projections through the custom ScaleGrad autograd graph
+            q_pos_proj = ScaleGrad.apply(q_pos_proj, scale_q)
+            kv_pos_proj = ScaleGrad.apply(kv_pos_proj, scale_kv)
         
-        # Softmax and context projection
-        attn_weights = F.softmax(gated_logits, dim=-1)
-        context = torch.matmul(attn_weights, v)
+        # Softmax over distinct spacetime pathways
+        attn_weights_space = F.softmax(gated_logits_space, dim=-1)
+        attn_weights_time = F.softmax(gated_logits_time, dim=-1)
+        
+        # Aggregation over isolated value manifolds
+        context_space = torch.matmul(attn_weights_space, v_space)
+        context_time = torch.matmul(attn_weights_time, v_time)
+        
+        # Symmetrical concatenation back to query_dim
+        context = torch.cat([context_space, context_time], dim=-1)
         context = context.transpose(1, 2).contiguous().view(B, L_q, D)
         
         return self.out_proj(context)
@@ -303,6 +341,7 @@ class Patcher2(nn.Module):
         x = self.down_norm(x)
         if ael:
             if patt_AE:
+                #todo, use the better loss made in knll, use topkhot, and optimize the gram for it.
                 aux = F.mse_loss(self.AE(x)[:,:-1,:], up_ae[:,1:,:].detach())
             else:
                 aux = F.binary_cross_entropy(self.AE.quant(x)[:,:-1,:], hot.detach()[:,1:,:])

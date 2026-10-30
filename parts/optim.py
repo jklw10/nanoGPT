@@ -522,3 +522,355 @@ class EAdamW(torch.optim.Optimizer):
                 p.copy_(p_fp32.to(p.dtype))
 
         return loss
+    
+
+
+def get_rank1_approximation(G):
+    m, n = G.shape
+    device, dtype = G.device, G.dtype
+
+    v = torch.sum(G, dim=0, keepdim=True).T
+    norm_v = torch.norm(v)
+
+    v = torch.where(
+        norm_v > 1e-8,
+        v / (norm_v + 1e-12),
+        torch.randn((n, 1), dtype=dtype, device=device) / math.sqrt(n),
+    )
+
+    u = torch.matmul(G, v)
+    norm_u = torch.norm(u)
+    u = torch.where(
+        norm_u > 1e-8,
+        u / (norm_u + 1e-12),
+        torch.randn((m, 1), dtype=dtype, device=device) / math.sqrt(m),
+    )
+
+    v = torch.matmul(G.T, u)
+    norm_v = torch.norm(v)
+    v = torch.where(
+        norm_v > 1e-8,
+        v / (norm_v + 1e-12),
+        torch.randn((n, 1), dtype=dtype, device=device) / math.sqrt(n),
+    )
+
+    return u, v
+
+
+def sherman_morrison_update(A_inv, x, beta, A_inv_init, leak):
+    """Updates inverse covariance matrix under rank-1 perturbation with diagonal leakage."""
+    alpha = 1.0 - beta
+    Ax = torch.matmul(A_inv, x)  # (d, 1)
+    xAx = torch.matmul(x.T, Ax)  # (1, 1)
+
+    num = alpha * torch.matmul(Ax, Ax.T)
+    denom = torch.clamp(beta + alpha * xAx, min=1e-12)
+
+    A_inv_new = (A_inv - num / denom) / beta
+    return (1.0 - leak) * A_inv_new + leak * A_inv_init
+
+
+def apply_precond(g_2d, L_inv, R_inv, use_L, use_R):
+    """Memory-efficient preconditioner application supporting scalar fallbacks."""
+    if use_R:
+        res = torch.matmul(g_2d, R_inv)
+    else:
+        res = g_2d * R_inv
+
+    if use_L:
+        res = torch.matmul(L_inv, res)
+    else:
+        res = res * L_inv
+    return res
+
+
+class KreinKroneckerSM5(torch.optim.Optimizer):
+    def __init__(
+        self,
+        params,
+        lr=1e-3,
+        beta_cov=0.99,
+        eps=1e-8,
+        damping=1e-5,
+        gamma=1e-3,
+        weight_decay=1e-2,
+        kernel="softsign",
+        max_kron_dim=2048,
+        update_freq=10, 
+    ):
+        defaults = dict(
+            lr=lr,
+            beta_cov=beta_cov,
+            eps=eps,
+            damping=damping,
+            gamma=gamma,
+            weight_decay=weight_decay,
+            kernel=kernel,
+            max_kron_dim=max_kron_dim,
+            update_freq=update_freq,
+        )
+        super(KreinKroneckerSM5, self).__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            beta_cov = group["beta_cov"]
+            damping = group["damping"]
+            gamma = group["gamma"]
+            weight_decay = group["weight_decay"]
+            kernel = group["kernel"]
+            max_kron_dim = group["max_kron_dim"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad
+                state = self.state[p]
+                eps_geom = 1e-12
+
+                orig_shape = p.shape
+                is_multidim = p.dim() > 1
+
+                if is_multidim:
+                    m = orig_shape[0]
+                    n = p.numel() // m
+                else:
+                    m, n = p.numel(), 1
+
+                if len(state) == 0:
+                    state["step"] = 0
+                    # Maintain FP32 state tensors directly (prevents reallocation churn)
+                    state["p_plus"] = (
+                        torch.clamp(p.data, min=0.0).add_(1e-4).to(torch.float32)
+                    )
+                    state["p_minus"] = (
+                        torch.clamp(-p.data, min=0.0)
+                        .add_(1e-4)
+                        .to(torch.float32)
+                    )
+
+                    # Correct 4th-root scaling from SM5
+                    scale_factor = 1.0 / (max(damping, eps_geom) ** 0.25)
+
+                    state["use_L"] = is_multidim and (m <= max_kron_dim)
+                    state["use_R"] = is_multidim and (n <= max_kron_dim)
+
+                    if state["use_L"]:
+                        state["L_inv_init"] = scale_factor * torch.eye(
+                            m, dtype=torch.float32, device=p.device
+                        )
+                    else:
+                        state["L_inv_init"] = scale_factor
+
+                    if state["use_R"]:
+                        state["R_inv_init"] = scale_factor * torch.eye(
+                            n, dtype=torch.float32, device=p.device
+                        )
+                    else:
+                        state["R_inv_init"] = scale_factor
+
+                    for ch in ["plus", "minus"]:
+                        if state["use_L"]:
+                            state[f"L_inv_{ch}"] = state["L_inv_init"].clone()
+                        else:
+                            state[f"L_inv_{ch}"] = scale_factor
+
+                        if state["use_R"]:
+                            state[f"R_inv_{ch}"] = state["R_inv_init"].clone()
+                        else:
+                            state[f"R_inv_{ch}"] = scale_factor
+
+                    state["ema_kl"] = torch.tensor(
+                        0.0, device=p.device, dtype=torch.float32
+                    )
+                    max_init = (
+                        p.data.abs().max()
+                        if p.numel() > 1
+                        else p.data.abs().squeeze()
+                    )
+                    state["max_init"] = torch.clamp(
+                        max_init.to(torch.float32), min=1e-4
+                    )
+
+                state["step"] += 1
+
+                p_plus = state["p_plus"]
+                p_minus = state["p_minus"]
+                grad_fp32 = grad.to(torch.float32)
+
+                if is_multidim and weight_decay != 0:
+                    decay_factor = 1.0 - lr * weight_decay
+                    p_plus.mul_(decay_factor)
+                    p_minus.mul_(decay_factor)
+
+                g_plus = torch.clamp(grad_fp32, min=0.0)
+                g_minus = torch.clamp(-grad_fp32, min=0.0)
+                g_plus_2d = g_plus.view(m, n)
+                g_minus_2d = g_minus.view(m, n)
+
+                if is_multidim:
+                    leak = 1.05 * (1.0 - beta_cov)
+
+                    u_plus, v_plus = get_rank1_approximation(g_plus_2d)
+                    if state["use_L"]:
+                        state["L_inv_plus"] = sherman_morrison_update(
+                            state["L_inv_plus"],
+                            u_plus,
+                            beta_cov,
+                            state["L_inv_init"],
+                            leak,
+                        )
+                    if state["use_R"]:
+                        state["R_inv_plus"] = sherman_morrison_update(
+                            state["R_inv_plus"],
+                            v_plus,
+                            beta_cov,
+                            state["R_inv_init"],
+                            leak,
+                        )
+
+                    u_minus, v_minus = get_rank1_approximation(g_minus_2d)
+                    if state["use_L"]:
+                        state["L_inv_minus"] = sherman_morrison_update(
+                            state["L_inv_minus"],
+                            u_minus,
+                            beta_cov,
+                            state["L_inv_init"],
+                            leak,
+                        )
+                    if state["use_R"]:
+                        state["R_inv_minus"] = sherman_morrison_update(
+                            state["R_inv_minus"],
+                            v_minus,
+                            beta_cov,
+                            state["R_inv_init"],
+                            leak,
+                        )
+
+                    # GPU L_infinity boundary calculation
+                    max_current = (
+                        p.data.abs().max()
+                        if p.numel() > 1
+                        else p.data.abs().squeeze()
+                    )
+                    scale_ref = torch.maximum(state["max_init"], max_current)
+
+                    # Dynamic R_t based on previous step's ema_kl ratio
+                    kl_ratio = state["ema_kl"] / (state["ema_kl"] + 1e-8)
+                    noise_ratio = kl_ratio / (kl_ratio + 1.0)
+                    R_t = (1.25 + 0.5 * (1.0 - noise_ratio)) * scale_ref
+                else:
+                    R_t = None
+
+                channels = {
+                    "plus": (
+                        p_plus,
+                        g_plus,
+                        state["L_inv_plus"],
+                        state["R_inv_plus"],
+                    ),
+                    "minus": (
+                        p_minus,
+                        g_minus,
+                        state["L_inv_minus"],
+                        state["R_inv_minus"],
+                    ),
+                }
+
+                current_step_kl = torch.tensor(0.0, device=p.device)
+
+                for ch_name, (p_ch, g_ch, L_inv, R_inv) in channels.items():
+                    step_size = lr
+                    if not is_multidim:
+                        p_ch.add_(g_ch, alpha=-step_size)
+                        p_ch.clamp_(min=1e-6)
+                        continue
+
+                    r = torch.abs(p_ch)
+                    r_safe = torch.clamp(r, min=eps_geom, max=R_t - eps_geom)
+
+                    x_norm = r_safe / R_t
+                    if kernel == "softsign":
+                        K_norm = x_norm / (x_norm + 1.0)
+                        K_prime = 1.0 / (x_norm + 1.0).square()
+                    elif kernel == "tanh":
+                        K_norm = torch.tanh(x_norm)
+                        K_prime = 1.0 - K_norm.square()
+
+                    one_minus_K2 = torch.clamp(
+                        1.0 - K_norm.square(), min=eps_geom
+                    )
+                    scale = one_minus_K2.square() / (
+                        K_prime + damping * one_minus_K2.square()
+                    )
+
+                    # Symmetrized Jordan Product S^(1/2) P S^(1/2) (Only 2 matmuls total per channel!)
+                    sqrt_scale = torch.sqrt(scale)
+                    g_scaled_2d = (g_ch * sqrt_scale).view(m, n)
+
+                    step_nat_2d = apply_precond(
+                        g_scaled_2d,
+                        L_inv,
+                        R_inv,
+                        state["use_L"],
+                        state["use_R"],
+                    )
+                    step_natural = step_nat_2d.view_as(g_ch) * sqrt_scale
+
+                    # Accumulate KL rate directly without running redundant pre-matmuls!
+                    current_step_kl.add_(torch.sum(g_ch * step_natural))
+
+                    gamma_stable = (
+                        min(gamma, 1.9 / step_size) if step_size > 0 else 0.0
+                    )
+                    coeff_num = K_norm * K_prime * one_minus_K2
+                    coeff_denom = torch.clamp(
+                        K_prime.square() + damping * one_minus_K2.square(),
+                        min=eps_geom,
+                    )
+
+                    entropic_force = (
+                        gamma_stable * (coeff_num / coeff_denom)
+                    ) * (p_ch / r_safe)
+                    proposed_update = step_natural + entropic_force
+
+                    # Safety clamping bounds
+                    delta_limit = 0.9 * R_t
+                    min_allowed_update = torch.clamp(
+                        -0.9 * torch.clamp(R_t - p_ch, min=1e-12),
+                        min=-delta_limit,
+                    )
+                    max_allowed_update = torch.clamp(0.9 * p_ch, max=delta_limit)
+
+                    final_update = torch.clamp(
+                        proposed_update,
+                        min=min_allowed_update,
+                        max=max_allowed_update,
+                    )
+
+                    p_ch.add_(final_update, alpha=-step_size)
+                    p_ch.clamp_(min=1e-6)
+
+                if is_multidim:
+                    beta_noise = 0.99
+                    kl_rate = torch.clamp(current_step_kl, min=1e-12)
+                    if state["step"] == 1:
+                        state["ema_kl"] = kl_rate
+                    else:
+                        state["ema_kl"] = (
+                            beta_noise * state["ema_kl"]
+                            + (1.0 - beta_noise) * kl_rate
+                        )
+
+                p.copy_((p_plus - p_minus).to(p.dtype))
+
+        return loss
+    
+    

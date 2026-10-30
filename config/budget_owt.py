@@ -1,13 +1,12 @@
 
-out_dir = 'out-shakespeare-char'
-eval_interval = 1000 # keep frequent because we'll overfit
+out_dir = 'out-b-owt'
+eval_interval = 1000 
 eval_iters = 50
-log_interval = 1000 # don't print too too often
+log_interval = 1000 
 
-# we expect to overfit on this small dataset, so only save when val improves
 always_save_checkpoint = False
 
-wandb_log = False # override via command line if you like
+wandb_log = False
 wandb_project = 'budget-owt'
 wandb_run_name = 'mini-gpt'
 
@@ -24,12 +23,11 @@ n_embd = 228
 dropout = 0.0 
 
 learning_rate = 1e-3
-max_iters = 200000
+max_iters = 50000
 lr_decay_iters = 30000 
 min_lr = 1e-4 
 warmup_iters = 100
 
 beta2 = 0.999
 grad_clip=0.0    
-#warmup_iters = 100 
 

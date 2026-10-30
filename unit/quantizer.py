@@ -175,8 +175,8 @@ class debugAutoencoder(nn.Module):
         #    fused       = True,
         #    #weight_decay= 0.01
         #    )
-        #return torch.optim.AdamW(params=self.parameters(), lr=LR, fused=True)
-        return models.soloblock.EntropicAdamW2(params=self.parameters(), lr=LR)
+        return torch.optim.AdamW(params=self.parameters(), lr=LR, fused=True)
+        #return models.soloblock.EntropicAdamW2(params=self.parameters(), lr=LR)
     
 
 
@@ -207,10 +207,10 @@ def quantizer_run():
         #"btkhot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, BoltzmannTopKHot, nn.LeakyReLU, 32),
         #"tkhot 1":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, quantizer.TopKHot, nn.LeakyReLU, 32),
         #"tkhot 2":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, quantizer.TopKHotSM, nn.LeakyReLU, 32),
-        "thot 1":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, quantizer.topkhotSTE, nn.LeakyReLU, 32),
+        "tkhot 1":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, quantizer.topkhotSTE, nn.LeakyReLU, 32),
         "thot 1":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, quantizer.ThresHot, nn.LeakyReLU, 32),
-        #"thot 2":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, quantizer.threshotSTE_sigmoid, nn.LeakyReLU, 32),
-        #"thot 3":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, quantizer.threshotSTE_softmax, nn.LeakyReLU, 32),
+        "thot 2":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, quantizer.threshotSTE_sigmoid, nn.LeakyReLU, 32),
+        "thot 3":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, quantizer.threshotSTE_softmax, nn.LeakyReLU, 32),
         
         #"ahot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, quantizer.AvgHot, nn.LeakyReLU, 32),
         #"thot":  debugAutoencoder(INPUT_DIM, HIDDEN_DIM, EMBED_DIM, QUANT_DIM, quantizer.ThresHot, nn.LeakyReLU, 32),

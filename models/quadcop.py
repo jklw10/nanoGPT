@@ -5,6 +5,11 @@ import math
 import random
 import sys
 
+from unit import bench
+
+torch._inductor.config.disable_cpp_codegen = True
+
+
 def get_rank1_approximation(g_2d, steps=3):
     """Computes a rank-1 approximation (u, v) of a 2D gradient matrix."""
     m, n = g_2d.shape
@@ -304,7 +309,7 @@ def main():
 
     # Create both optimizers
     adam_opt = torch.optim.Adam(controller.parameters(), lr=1e-3)
-    krein_opt = KreinKroneckerSM(controller.parameters(), lr=1e-3, R=1.5)
+    krein_opt = bench.UnifiedKreinEntropicOptimizer(controller.parameters(), lr=1e-3,)
 
     active_opt_name = "KreinKroneckerSM (Safe Mode)"
     optimizer = krein_opt

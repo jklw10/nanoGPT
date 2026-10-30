@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from parts import quantizer
 import parts.utils as utils
+from unit import bench
 
 USE_DIMENSIONLESS_BOREDOM = True       # True: (1 - LP/MSE)^(gamma/2), False: exp(-50 * LP) [1]
 USE_ENTROPIC_RESTORING_FORCE = True    # True: Attractive drift to 0 that scales with (1 - boredom) [1]
@@ -767,16 +768,30 @@ class KreinKroneckerSM3(torch.optim.Optimizer):
         return loss
 
 
+
 def build_optimizer(params, hyper_cfg, lr):
-    return KreinKroneckerSM3(
+    return bench.UnifiedKreinEntropicOptimizer(
         params,
         lr=lr,
-        beta_cov=float(hyper_cfg.get('opt_beta_cov').item()),
-        damping=float(hyper_cfg.get('opt_damping').item()),
-        weight_decay=float(hyper_cfg.get('opt_decay').item()),
-        R=float(hyper_cfg.get('opt_R').item()),
         gamma=float(hyper_cfg.get('opt_gamma').item()),
-    )
+        damping=float(hyper_cfg.get('opt_damping').item()),
+        beta_cov=float(hyper_cfg.get('opt_beta_cov').item()),
+        use_adam= True,
+        use_kron = True,
+        use_krein_space = False,
+        use_grms = True,
+        kron_freq= 1,
+        weight_decay=0.1
+    ) 
+    #KreinKroneckerSM3(
+    #    params,
+    #    lr=lr,
+    #    beta_cov=float(hyper_cfg.get('opt_beta_cov').item()),
+    #    damping=float(hyper_cfg.get('opt_damping').item()),
+    #    weight_decay=float(hyper_cfg.get('opt_decay').item()),
+    #    R=float(hyper_cfg.get('opt_R').item()),
+    #    gamma=float(hyper_cfg.get('opt_gamma').item()),
+    #)
 
 def generate_low_rank_noise(shape, rank=4, device=None):
     if device is None:
@@ -920,6 +935,9 @@ class GradientOptimizer:
         return current_loss
 
     def _evaluate_rollout(self, env, P, pop_weights=None):
+        """
+        Evaluates rollouts purely based on predictive MSE loss (surprise minimization).
+        """
         B = env.batch_size
         device = env.device
         if pop_weights is not None:
@@ -929,32 +947,20 @@ class GradientOptimizer:
                 env.agent_pos.repeat(P, 1), env.food_grid.repeat(P, 1, 1), env.hunger.repeat(P),
                 env.steps.repeat(P), env.grid.repeat(P, 1, 1), env.needs_reset.repeat(P)
             ))
-            eval_batch_size = P * B
         else:
             vec_env = MazeEnvTensor(batch_size=B, size=env.size, grid=env.grid, food_density=env.food_density, device=device)
             vec_env.restore_state(env.get_state())
-            eval_batch_size = B
             P = 1
             
-        total_food_eaten = torch.zeros(P, device=device)
-        reached_goal_count = torch.zeros(P, device=device)
-        total_hunger = torch.zeros(P, device=device)
         steps_evaluated = 15
-        
-        def eval_callback(loss, s, o, e, l):
-            nonlocal total_food_eaten, reached_goal_count, total_hunger
-            total_food_eaten += vec_env.last_food_eaten.view(P, B).sum(dim=1).float()
-            total_hunger += vec_env.hunger.view(P, B).sum(dim=1)
-            batch_idx_vec = torch.arange(eval_batch_size, device=device)
-            at_goal = (vec_env.grid[batch_idx_vec, vec_env.agent_pos[:, 0], vec_env.agent_pos[:, 1]] == 2.0)
-            reached_goal_count += at_goal.view(P, B).sum(dim=1).float()
-            
         with torch.no_grad():
-            rollout_data = run_rollout(self.model, vec_env, num_steps=steps_evaluated, pop_weights=pop_weights, step_callback=eval_callback)
+            rollout_data = run_rollout(self.model, vec_env, num_steps=steps_evaluated, pop_weights=pop_weights)
+            
         stacked_losses = torch.stack(rollout_data['loss_w1'], dim=0)
         avg_pred_loss = stacked_losses.view(steps_evaluated, P, B, self.model.N, self.model.D).mean(dim=[0, 2, 3, 4])
-        avg_phys_success = ((total_food_eaten * 2.5) + (reached_goal_count * 15.0) - (total_hunger * 0.05)) / B
-        return -avg_pred_loss + 0.02 * avg_phys_success
+        
+        # Purely predictive MSE loss (negated so higher fitness = lower loss)
+        return -avg_pred_loss
 
     def _search_lookahead(self, env):
         P = self.es_pop_size
@@ -963,7 +969,6 @@ class GradientOptimizer:
         master_params = {p: p.clone() for p in self.model.parameters() if p.requires_grad}
         noise_dict, pop_weights = {}, {}
         for p, param_val in master_params.items():
-            # Apply identical low-rank noise generation and spectral filtering as in ES
             white_noise = torch.stack([
                 generate_low_rank_noise(param_val.shape, self.es_rank, device=param_val.device) 
                 for _ in range(half_P)
