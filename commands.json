@@ -5,5 +5,6 @@
     "quantizer":"python -m models.quantizer 2> logs/error_log.txt",
     "gather":"python -m parts.gather 2> logs/error_log.txt", 
     "llm hnet":"python -m models.HNet 2> logs/error_log.txt",
-    "llm corrector":"python -m models.corrector 2> logs/error_log.txt"
+    "llm corrector":"python -m models.corrector 2> logs/error_log.txt",
+    "bowt":"python -m training_tools.train config/budget_owt.py"
 }

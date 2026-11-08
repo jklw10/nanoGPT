@@ -22,6 +22,8 @@ n_head = 6
 n_embd = 228  
 dropout = 0.0 
 
+weight_decay = 0.1
+
 learning_rate = 1e-3
 max_iters = 50000
 lr_decay_iters = 30000 

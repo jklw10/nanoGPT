@@ -1510,6 +1510,7 @@ def apply_spectral_filter2(signal: torch.Tensor, center_offset: float = 0.0, sig
     filtered_fft = noise_fft * kernel
     return torch.fft.irfft(filtered_fft, n=signal.shape[-1], dim=-1)
 
+@torch.compile(backend='inductor', mode='max-autotune')
 def apply_spectral_filter(noise: torch.Tensor, center_offset: float = 1.0, sigma_val: float = 0.5) -> torch.Tensor:
     dim = noise.shape[-1]
     device = noise.device
@@ -2074,3 +2075,83 @@ def get_get_batch(block_size, batch_size, dataset, device, always_byte=False, sk
         return x, y
         
     return get_batch
+
+
+import torchvision
+from torch.utils.data import DataLoader, Subset
+import torchvision.transforms as transforms
+
+def get_cifar100_loaders(
+    data_dir: str = "./data",
+    batch_size: int = 128,
+    test_batch_size: int = 256,
+    flatten: bool = True,
+    max_train_samples: int = None,
+    max_test_samples: int = None,
+    num_workers: int = 2
+):
+    """
+    Reuses existing CIFAR-100 download from `data_dir`.
+    
+    Args:
+        data_dir: Path to directory containing CIFAR-100 (default: './data')
+        batch_size: Batch size for training
+        test_batch_size: Batch size for evaluation
+        flatten: If True, flattens (3, 32, 32) into a 3072-dim vector for KANs/MLPs.
+        max_train_samples: If set, slices a subset for rapid experimentation.
+        max_test_samples: If set, slices the test set.
+        num_workers: DataLoader background workers.
+        
+    Returns:
+        train_loader, test_loader, in_dim (3072 or (3,32,32)), num_classes (100)
+    """
+    # Standard CIFAR-100 channel statistics
+    cifar100_mean = (0.5071, 0.4867, 0.4408)
+    cifar100_std  = (0.2675, 0.2565, 0.2761)
+
+    transform_list = [
+        transforms.ToTensor(),
+        transforms.Normalize(cifar100_mean, cifar100_std)
+    ]
+    
+    # If using flat models (KAN / MLP), flatten directly inside the pipeline
+    if flatten:
+        transform_list.append(transforms.Lambda(lambda t: torch.flatten(t)))
+
+    transform = transforms.Compose(transform_list)
+
+    # Loads from existing data_dir without redownloading
+    train_set = torchvision.datasets.CIFAR100(
+        root=data_dir, train=True, download=True, transform=transform
+    )
+    test_set = torchvision.datasets.CIFAR100(
+        root=data_dir, train=False, download=True, transform=transform
+    )
+
+    # Optional subset slicing
+    if max_train_samples is not None and max_train_samples < len(train_set):
+        train_set = Subset(train_set, range(max_train_samples))
+
+    if max_test_samples is not None and max_test_samples < len(test_set):
+        test_set = Subset(test_set, range(max_test_samples))
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available()
+    )
+    
+    test_loader = DataLoader(
+        test_set,
+        batch_size=test_batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available()
+    )
+
+    in_dim = 3072 if flatten else (3, 32, 32)
+    num_classes = 100
+
+    return train_loader, test_loader, in_dim, num_classes

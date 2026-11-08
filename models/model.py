@@ -35,6 +35,14 @@ Plin = modules.ProbingLinear
 Orthlin = modules.OrthogonalLinear
 #settings :)
 #intest
+
+cardnewt        = False   
+rootkan         = True  
+rootkan_highdeg = False
+rootkan_pade    = False
+rootkan_glu     = False
+
+
 lmsa            = False
 msa             = False
 kratt           = False
@@ -1040,72 +1048,275 @@ class ShiftedReLU(nn.Module):
 
     def forward(self, x):
         return F.relu(x - self.shift)
-    
+
+
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.n_embd = config.n_embd
         up = 4
+        hidden_dim = up * config.n_embd
+
+        # -------------------------------------------------------------
+        # TOGGLES FOR THE 3 TESTS (Set exactly one to True)
+        # -------------------------------------------------------------
+        # rootkan_highdeg = True   # Option 1: Degree d=5 RootKAN + Safe Halley Solve
+        # rootkan_pade    = False  # Option 2: Padé Rational Root Function (bounded tails)
+        # rootkan_glu     = False  # Option 3: Root-Gated GLU (SwiGLU-style, one-sided gate)
+
         if pattmlp:
-            
             self.thing = modules.PattLayer(
                 config.n_embd,
                 config.n_embd,
                 mlp_ptok,
             )
-           
             return
-        
-        self.c_fc    = Linear(config.n_embd, up * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()
-        self.c_proj  = Linear( up * config.n_embd, config.n_embd, bias=config.bias)
-        if hcmlp:
-            self.c_fc = modules.HCLinear(config.n_embd, up*config.n_embd, 1.0, False)
-            self.c_proj = modules.HCLinear(up*config.n_embd, config.n_embd, 1.0, False)
-        if(qrot):
-            self.c_proj  = Linear( 2 * config.n_embd, config.n_embd, bias=config.bias)
-        
-        self.dropout = nn.Dropout(config.dropout)
-        self.dac = ShiftedReLU(config.n_embd*4)
-        self.univ = utils.Univfun(config.n_embd)
-        #self.dac = utils.Psinrelu(config.n_embd*4)
 
+        self.c_fc    = Linear(config.n_embd, hidden_dim, bias=config.bias)
+        self.gelu    = nn.GELU()
+        self.c_proj  = Linear(hidden_dim, config.n_embd, bias=config.bias)
+
+        if hcmlp:
+            self.c_fc = modules.HCLinear(config.n_embd, hidden_dim, 1.0, False)
+            self.c_proj = modules.HCLinear(hidden_dim, config.n_embd, 1.0, False)
+        if qrot:
+            self.c_proj  = Linear(2 * config.n_embd, config.n_embd, bias=config.bias)
+
+        # -------------------------------------------------------------
+        # 1. OPTION 1: HIGH DEGREE (d=5) ROOT-KAN PARAMETERS
+        # -------------------------------------------------------------
+        if rootkan_highdeg:
+            d = 5
+            k = torch.arange(1, d + 1, dtype=torch.float32)
+            cheb_nodes = torch.cos((2 * k - 1) / (2 * d) * math.pi)
+            self.kan_roots_d5 = nn.Parameter(cheb_nodes.view(d, 1).repeat(1, hidden_dim))
+            self.kan_scale_d5 = nn.Parameter(torch.randn(hidden_dim) * 0.0)
+
+        # -------------------------------------------------------------
+        # 2. OPTION 2: PADÉ RATIONAL ROOT PARAMETERS
+        # -------------------------------------------------------------
+        if rootkan_pade:
+            # Degree 2 numerator roots + learnable denominator stiffness
+            k = torch.arange(1, 3, dtype=torch.float32)
+            cheb_nodes = torch.cos((2 * k - 1) / (2 * 2) * math.pi)  # [+0.7071, -0.7071]
+            self.pade_roots = nn.Parameter(cheb_nodes.view(2, 1).repeat(1, hidden_dim))
+            self.pade_scale = nn.Parameter(torch.randn(hidden_dim) * 0.1)
+            self.pade_alpha = nn.Parameter(torch.zeros(hidden_dim))  # softplus(0) ~ 0.69
+
+        # -------------------------------------------------------------
+        # 3. OPTION 3: ROOT-GATED GLU (SwiGLU Style)
+        # -------------------------------------------------------------
+        if rootkan_glu:
+            k = torch.arange(1, 4, dtype=torch.float32)
+            cheb_nodes = torch.cos((2 * k - 1) / (2 * 3) * math.pi)  # [+0.866, 0.0, -0.866]
+            self.glu_roots = nn.Parameter(cheb_nodes.view(3, 1).repeat(1, hidden_dim))
+            self.glu_scale = nn.Parameter(torch.randn(hidden_dim) * 0.1)
+
+        # (Existing parameters for previous runs)
+        if cardnewt:
+            self.cardnewt_a = nn.Parameter(torch.zeros(hidden_dim))
+            self.cardnewt_sigma = nn.Parameter(torch.ones(hidden_dim) * 0.5)
+            k = torch.arange(1, 4, dtype=torch.float32)        
+            cheb_nodes = torch.cos((2 * k - 1) / (2 * 3) * math.pi)
+            self.kan_roots = nn.Parameter(cheb_nodes.view(3, 1).repeat(1, hidden_dim))
+            self.kan_scale = nn.Parameter(torch.randn(hidden_dim) * 0.1)
+            
+        if rootkan:
+            k = torch.arange(1, 4, dtype=torch.float32)
+            cheb_nodes = torch.cos((2 * k - 1) / (2 * 3) * math.pi)
+            self.kan_roots = nn.Parameter(cheb_nodes.view(3, 1).repeat(1, hidden_dim))
+            self.kan_scale = nn.Parameter(torch.randn(hidden_dim) * 0.1)
+
+        self.dropout = nn.Dropout(config.dropout)
+        self.dac = ShiftedReLU(hidden_dim)
+        self.univ = utils.Univfun(config.n_embd)
+
+    
+    def _rootkan_forward(self, u):
+        orig_dtype = u.dtype
+        u_f32 = u.float()
+
+        
+        roots = self.kan_roots.float()
+        scale = self.kan_scale.view(1, 1, -1).float()
+        d = 2
+
+        denom = torch.sqrt(1.0 + roots.pow(2))
+        prod = (u_f32 - roots[0].view(1, 1, -1)) / denom[0].view(1, 1, -1)
+        for k in range(1, d):
+            prod = prod * ((u_f32 - roots[k].view(1, 1, -1)) / denom[k].view(1, 1, -1))
+
+        v = prod * scale
+
+        return v.to(orig_dtype)
+
+    # -------------------------------------------------------------
+    # CUBIC ROOT-KAN
+    # -------------------------------------------------------------
+    def _rootkan_forward2(self, u):
+        orig_dtype = u.dtype
+        u_f32 = u.float()
+        roots = self.kan_roots.float()
+        scale = self.kan_scale.view(1, 1, -1).float()
+
+        denom = torch.sqrt(1.0 + roots.pow(2))
+        prod = (u_f32 - roots[0].view(1, 1, -1)) / denom[0].view(1, 1, -1)
+        for k in range(1, 3):
+            prod = prod * ((u_f32 - roots[k].view(1, 1, -1)) / denom[k].view(1, 1, -1))
+
+        v = prod * scale
+
+        cbrt_v_sq = (v.pow(2) + 1e-5).pow(1.0 / 3.0)
+        y = v / (1.0 + cbrt_v_sq)
+
+        #for _ in range(2):
+        #    y_sq = y.pow(2)
+        #    G = y_sq * y + y - v
+        #    G_prime = 3.0 * y_sq + 1.0
+        #    G_double_prime = 6.0 * y
+        #    num = 2.0 * G * G_prime
+        #    denom_h = 2.0 * G_prime.pow(2) - G * G_double_prime
+        #    y = y - num / denom_h
+
+        return y.to(orig_dtype)
+
+    # -----------------------------------------------------------------
+    # OPTION 1 FORWARD: Degree d=5 RootKAN with NaN-Safe Halley Solve
+    # -----------------------------------------------------------------
+    
+    def _highdeg_forward(self, u):
+        orig_dtype = u.dtype
+        u_f32 = u.float()
+        roots = self.kan_roots_d5.float()
+        scale = self.kan_scale_d5.view(1, 1, -1).float()
+
+        # 1. Bounded polynomial fluctuation
+        u_bounded = torch.tanh(u_f32)
+        denom = torch.sqrt(1.0 + roots.pow(2))
+        prod = (u_bounded - roots[0].view(1, 1, -1)) / denom[0].view(1, 1, -1)
+        for k in range(1, 5):
+            prod = prod * ((u_bounded - roots[k].view(1, 1, -1)) / denom[k].view(1, 1, -1))
+
+        # 2. Feed ONLY the polynomial fluctuation into the cubic compressor
+        v_poly = scale * prod
+
+        cbrt_v_sq = (v_poly.pow(2) + 1e-5).pow(1.0 / 3.0)
+        y = v_poly / (1.0 + cbrt_v_sq)
+
+        for _ in range(3):
+            y_sq = y.pow(2)
+            G = y_sq * y + y - v_poly
+            G_prime = 3.0 * y_sq + 1.0
+            G_double_prime = 6.0 * y
+            num = 2.0 * G * G_prime
+            denom_h = 2.0 * G_prime.pow(2) - G * G_double_prime
+            y = y - num / denom_h
+
+        # 3. True residual addition AFTER the solve
+        out = u_f32 + y
+        out = y
+        return out.to(orig_dtype)
+
+    # -----------------------------------------------------------------
+    # OPTION 2 FORWARD: Padé Rational Root Function (Bounded Asymptote)
+    # -----------------------------------------------------------------
+    def _pade_forward(self, u):
+        roots = self.pade_roots
+        scale = self.pade_scale.view(1, 1, -1)
+        alpha = F.softplus(self.pade_alpha).view(1, 1, -1)
+
+        denom_r = torch.sqrt(1.0 + roots.pow(2))
+        f1 = (u - roots[0].view(1, 1, -1)) / denom_r[0].view(1, 1, -1)
+        f2 = (u - roots[1].view(1, 1, -1)) / denom_r[1].view(1, 1, -1)
+
+        # Pure polynomial numerator (degree 2) / linear denominator (degree 1) => Linear Asymptote
+        num = scale * (f1 * f2)
+        den = torch.sqrt(1.0 + alpha * u.pow(2))
+        return num / den
+
+    # -----------------------------------------------------------------
+    # OPTION 3 FORWARD: Root-Gated Linear Unit (SwiGLU Style)
+    # -----------------------------------------------------------------
+    def _glu_forward(self, u):
+        roots = self.glu_roots
+        scale = self.glu_scale.view(1, 1, -1)
+
+        denom_r = torch.sqrt(1.0 + roots.pow(2))
+        prod = (u - roots[0].view(1, 1, -1)) / denom_r[0].view(1, 1, -1)
+        for k in range(1, 3):
+            prod = prod * ((u - roots[k].view(1, 1, -1)) / denom_r[k].view(1, 1, -1))
+
+        # Root polynomial modulates the opening threshold of the gate
+        gate = u + scale * prod
+        # u * sigmoid(gate) guarantees 0 on the left, linear identity on the right!
+        return u * torch.sigmoid(gate)
+
+    
+    def _cardnewt_forward(self, u):
+        orig_dtype = u.dtype
+        u_f32 = u.float()
+        
+        # 1. Cubic factor product (provides the u^2 numerator gradient!)
+        roots = self.kan_roots.float()
+        scale = self.kan_scale.view(1, 1, -1).float()
+        denom = torch.sqrt(1.0 + roots.pow(2))
+        
+        prod = (u_f32 - roots[0].view(1, 1, -1)) / denom[0].view(1, 1, -1)
+        for k in range(1, 3):
+            prod = prod * ((u_f32 - roots[k].view(1, 1, -1)) / denom[k].view(1, 1, -1))
+
+        # Target B is cubic in u: B ~ u^3
+        B = prod * scale
+
+        # 2. Cardano parameters
+        a = self.cardnewt_a.view(1, 1, -1).float()
+        sigma = self.cardnewt_sigma.view(1, 1, -1).float()
+        r_sq = (a.pow(2) / 3.0) + sigma.pow(2) + 1e-4
+
+        # 3. Pade seed: matches linear and cubic regimes
+        cbrt_B_sq = (B.pow(2) + 1e-5).pow(1.0 / 3.0)
+        y = B / (r_sq + cbrt_B_sq)
+
+        # 4. 3 unrolled Newton steps: G'(y) >= sigma^2 + 1e-4 > 0 strictly
+        for _ in range(3):
+            y_sq = y.pow(2)
+            G = (y_sq + a * y + r_sq) * y - B
+            G_prime = 3.0 * y_sq + 2.0 * a * y + r_sq
+            y = y - (G / G_prime)
+
+        return y.to(orig_dtype)
+    # -----------------------------------------------------------------
+    # Forward Pass Routing
+    # -----------------------------------------------------------------
     def forward(self, x):
         if testing_mlp:
             return self.univ(x)
         if pattmlp:
-            return (self.thing(x))
-            #return torch.sigmoid(self.thing(x))
+            return self.thing(x)
         if qrot:
             return self.qrot(x)
-        
+
         x = self.c_fc(x)
-        if diffac:
+
+        # Execute chosen test
+        if rootkan_highdeg:
+            x = self._highdeg_forward(x)
+        elif rootkan_pade:
+            x = self._pade_forward(x)
+        elif rootkan_glu:
+            x = self._glu_forward(x)
+        elif cardnewt:
+            x = self._cardnewt_forward(x)
+        elif rootkan:
+            x = self._rootkan_forward(x)
+        elif diffac:
             x = self.dac(x)
         else:
             x = self.gelu(x)
+
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
-
-    def qrot(self, x):
-        x = self.c_fc(x)
-        b, t, n = x.shape
-        x4d = x.view(b, t, self.n_embd, 4) # Reshape to (batch, seq_len, n_embd, 4)
-        x_norm = torch.clamp_min(x4d.norm(dim=-1, keepdim=True), 1e-10) # Calculate norm along the last dimension (dim=3 or -1), keep dimensions
-        x_normalized = x4d / x_norm             # Divide to normalize
-        rotors, rotated = x_normalized.chunk(2, dim=2) # Split along n_embd dimension
-            #xm,ym = x_norm.chunk(2, dim=2)
-        x_rotated = utils.quaternion_multiply(rotors, rotated) 
-            #x_rotated = x_rotated*self.gaprelu(x_norm-2)
-            # #*torch.sigmoid(xm+ym)#
-        x = x_rotated.view(b, t, 2 * self.n_embd)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
-        #masked_outputs = stacked_outputs * selection_mask
-        #return torch.sum(masked_outputs, dim=-1)
-
 class KreinSelfRelation(nn.Module):
     def __init__(self, config):
         super().__init__()
