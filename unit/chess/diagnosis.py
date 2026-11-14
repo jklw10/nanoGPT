@@ -9,7 +9,7 @@ import os
 import torch
 import torch.nn.functional as F
 
-from models.nodechess15 import (
+from models.nodenet.nodechess15 import (
     ChessNodeNet, 
     GuardrailedTorchChess, 
     HyperParamsConfig

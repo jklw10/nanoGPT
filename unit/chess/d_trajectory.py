@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from models.nodechess15 import ChessNodeNet, GuardrailedTorchChess, HyperParamsConfig
+from models.nodenet.nodechess15 import ChessNodeNet, GuardrailedTorchChess, HyperParamsConfig
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 cfg = HyperParamsConfig(device)

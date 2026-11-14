@@ -1,7 +1,7 @@
 import torch
 import random
 
-from models.mazenode4 import (
+from models.nodenet.mazenode4 import (
         StatelessNodeNet3,
         MazeEnvTensor,
         ExecutionConfig,
@@ -87,7 +87,7 @@ def test_env_step():
 def test_sparse_routing():
     # Profile routing and STE quantizations specifically
     route_logits = torch.randn(BATCH_SIZE, NUM_NODES, NUM_NODES, device=device)
-    from models.mazenode4 import sparse_route_diffusion
+    from models.nodenet.mazenode4 import sparse_route_diffusion
     sparse_route_diffusion(route_logits, NUM_NODES)
 
 def test_model_forward():
@@ -99,7 +99,7 @@ def test_action_selection():
 
 def test_full_rollout_step():
     global obs, state, output, error_ema, lp_ema
-    from models.mazenode4 import model_and_env_step
+    from models.nodenet.mazenode4 import model_and_env_step
     # Profile a unified network + environment step
     _, state, output, error_ema, lp_ema, _, _, obs = model_and_env_step(
         model, env, obs, state, output, error_ema, lp_ema

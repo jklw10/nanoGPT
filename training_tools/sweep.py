@@ -54,7 +54,7 @@ class Sweep2D:
             
         try:
             # Try returning the actual Dataclass so it perfectly fits type hints
-            from models.nodenet import HyperParamConfig
+            from models.nodenet.nodenet import HyperParamConfig
             import dataclasses
             valid_keys = {f.name for f in dataclasses.fields(HyperParamConfig)}
             filtered_dict = {k: v for k, v in config_dict.items() if k in valid_keys}
@@ -182,7 +182,7 @@ class Sweep3D:
             config_dict[key] = val_tensor
             
         try:
-            from models.nodenet import HyperParamConfig
+            from models.nodenet.nodenet import HyperParamConfig
             import dataclasses
             valid_keys = {f.name for f in dataclasses.fields(HyperParamConfig)}
             filtered_dict = {k: v for k, v in config_dict.items() if k in valid_keys}

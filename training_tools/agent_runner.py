@@ -4,7 +4,7 @@ import torch.nn as nn
 import numpy as np
 
 import copy
-from models import nodenet
+from models.nodenet import nodenet
 from environments.figure8 import run_vis as f8_rv
 from training_tools.sweep import Sweep2D
 from environments.gym_env import run_vis as gym_rv, get_random_baseline

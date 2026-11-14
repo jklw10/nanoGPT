@@ -9,7 +9,7 @@ import torch.nn.functional as F
 # Import model architecture & environment from your training script
 # (Assuming your training file is named 'agent.py' or similar; adjust import if needed)
 
-from models.nodechess9 import (
+from models.nodenet.nodechess9 import (
     ChessNodeNet, 
     GuardrailedTorchChess, 
     HyperParamsConfig,

@@ -7,7 +7,7 @@ import torchvision.transforms as transforms
 import time
 
 # IMPORT MODULAR ARCHITECTURES
-from models.KKanvs10 import (
+from models.Kan.KKanvs10 import (
     ModularRootKAN_Deep,
     ModernMLP_Deep
 )
