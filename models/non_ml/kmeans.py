@@ -63,16 +63,20 @@ def _emeans_step_cublas(B_X: torch.Tensor, C: torch.Tensor, S: torch.Tensor, N_s
     assign = torch.argmax(scores, dim=1)
     
     k = C.shape[0]
-    O = torch.zeros(B_X.shape[0], k, device=B_X.device, dtype=B_X.dtype)
+    O = torch.zeros(B_X.shape[0], k, device=B_X.device, dtype=torch.float32)
     O.scatter_(1, assign.unsqueeze(1), 1.0)
     
-    s_batch = O.T @ B_X
+    s_batch = O.T @ B_X.to(torch.float32)
     n_batch = O.sum(dim=0, keepdim=True).T
     
     S = (1.0 - alpha) * S + alpha * s_batch
     N_stat = (1.0 - alpha) * N_stat + alpha * n_batch
-    C = S / torch.clamp(N_stat, min=1e-6)
-    return C, S, N_stat, scores
+    
+    # Inactive centroids hold coordinates instead of collapsing to zero
+    valid = (N_stat.squeeze(1) > 1e-6)
+    new_C = (S / torch.clamp(N_stat, min=1e-6)).to(C.dtype)
+    C = torch.where(valid.unsqueeze(1), new_C, C)
+    return C, S, N_stat, assign, scores
 
 # =====================================================================
 # 3. Island Slicing Primitives
@@ -186,7 +190,7 @@ def run_divisive_tree(X: torch.Tensor, k: int, split_rule: str = "dense_island")
     return centroids
 
 # =====================================================================
-# e-means (Robustized Paper Implementation)
+# e-means (Modified vs Paper-Faithful)
 # =====================================================================
 
 def get_emeans_hyperparameters(n: int, k: int, epochs: float):
@@ -199,61 +203,114 @@ def get_emeans_hyperparameters(n: int, k: int, epochs: float):
     a0 = min(max(float(a0), 0.01), 1.0)
     return B, a0
 
-def run_emeans(X: torch.Tensor, k: int, epochs: float = 3.0, init_C: torch.Tensor = None) -> torch.Tensor:
+def run_modified_emeans(X: torch.Tensor, k: int, epochs: float = 3.0, init_C: torch.Tensor = None) -> torch.Tensor:
     n, d = X.shape
     B, a0 = get_emeans_hyperparameters(n, k, epochs)
     n_batches = max(1, int((n * epochs) // B))
 
     C = init_C.clone() if init_C is not None else X[torch.randperm(n, device=device)[:k]].clone()
-    N_stat = torch.full((k, 1), float(B) / float(k), device=device, dtype=X.dtype)
-    S = C * N_stat
+    
+    N_stat = torch.full((k, 1), 1e-10, device=device, dtype=torch.float32)
+    S = C.to(torch.float32) * 1e-10
 
     for step in range(n_batches):
         progress = float(step) / float(n_batches)
-        alpha = 0.1 * a0 + 0.5 * (1.0 - 0.1) * a0 * (1.0 + math.cos(math.pi * progress))
+        alpha = a0 * (0.1 + (1.0 - 0.1) * 0.5 * (1.0 + math.cos(math.pi * progress)))
 
         batch_idx = torch.randint(0, n, (B,), device=device)
         B_X = X[batch_idx]
 
-        C, S, N_stat, scores = _emeans_step_cublas(B_X, C, S, N_stat, alpha)
+        C, S, N_stat, assign, scores = _emeans_step_cublas(B_X, C, S, N_stat, alpha)
 
-        # Revival is active ONLY in the first 50% of batches to prevent late disruption
-        if (step + 1) % 5 == 0 and step < int(0.5 * n_batches):
+        # Dead-cluster revival during the first 75% of batches
+        if (step + 1) % 5 == 0 and step < int(0.75 * n_batches):
             mean_n = N_stat.mean().item()
             dead_mask = (N_stat.squeeze(1) < 0.1 * mean_n)
             dead_indices = torch.where(dead_mask)[0]
 
             if len(dead_indices) > 0:
-                # Compute batch point residual distances reusing scores
                 max_score, _ = torch.max(scores, dim=1)
                 bx_sq = (B_X * B_X).sum(dim=1)
                 residual_sq = torch.clamp(bx_sq - 2.0 * max_score, min=0.0)
 
-                # Filter extreme outliers (>6x median) to prevent hijacking centroids
-                med_res = torch.median(residual_sq)
-                valid_res = residual_sq < (6.0 * med_res + 1e-4)
-                weights = torch.where(valid_res, residual_sq, torch.zeros_like(residual_sq))
+                cap_val = torch.quantile(residual_sq, 0.99)
+                weights = torch.clamp(residual_sq, max=cap_val)
 
                 if weights.sum() > 0:
-                    num_to_sample = min(len(dead_indices), int((weights > 0).sum().item()))
+                    num_dead = len(dead_indices)
+                    num_to_sample = min(num_dead, int((weights > 0).sum().item()))
                     chosen_idx = torch.multinomial(weights, num_to_sample, replacement=False)
                     new_pts = B_X[chosen_idx]
 
-                    init_n = float(B) / float(k)
                     target_dead = dead_indices[:num_to_sample]
-                    N_stat[target_dead] = init_n
-                    S[target_dead] = new_pts * init_n
+                    N_stat[target_dead] = mean_n
+                    S[target_dead] = new_pts.to(torch.float32) * mean_n
                     C[target_dead] = new_pts
 
-    # Fast cuBLAS finalization step
+    C = _lloyd_step_cublas(X, C)
+    return C
+
+def run_original_emeans(X: torch.Tensor, k: int, epochs: float = 3.0, init_C: torch.Tensor = None) -> torch.Tensor:
+    """Paper-faithful implementation of Bessa et al. (arXiv:2611.09501).
+    Samples donors WITHOUT replacement (Appendix H.1) and vectorizes splitting."""
+    n, d = X.shape
+    B, a0 = get_emeans_hyperparameters(n, k, epochs)
+    n_batches = max(1, int((n * epochs) // B))
+
+    C = init_C.clone() if init_C is not None else X[torch.randperm(n, device=device)[:k]].clone()
+    
+    N_stat = torch.full((k, 1), 1e-10, device=device, dtype=torch.float32)
+    S = C.to(torch.float32) * 1e-10
+
+    fac = torch.ones(d, device=device, dtype=torch.float32)
+    fac[::2] += 1.0 / 1024.0
+    fac[1::2] -= 1.0 / 1024.0
+
+    for step in range(n_batches):
+        progress = float(step) / float(n_batches)
+        alpha = a0 * (0.1 + (1.0 - 0.1) * 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+        batch_idx = torch.randint(0, n, (B,), device=device)
+        B_X = X[batch_idx]
+
+        C, S, N_stat, assign, scores = _emeans_step_cublas(B_X, C, S, N_stat, alpha)
+
+        # Dead-cluster revival (Section 3.2 & Appendix H.1): without replacement
+        if (step + 1) % 5 == 0:
+            mean_n = N_stat.mean().item()
+            dead_mask = (N_stat.squeeze(1) < 0.1 * mean_n)
+            dead_indices = torch.where(dead_mask)[0]
+
+            if len(dead_indices) > 0:
+                active_weights = torch.clamp(N_stat.squeeze(1), min=0.0).clone()
+                active_weights[dead_mask] = 0.0
+                num_active = int((active_weights > 0).sum().item())
+
+                if num_active > 0:
+                    num_revive = min(len(dead_indices), num_active)
+                    donors = torch.multinomial(active_weights, num_revive, replacement=False)
+                    target_dead = dead_indices[:num_revive]
+
+                    half_n = 0.5 * N_stat[donors]
+                    c_donor = C[donors].to(torch.float32)
+                    c1 = c_donor * fac
+                    c2 = c_donor * (2.0 - fac)
+
+                    N_stat[donors] = half_n
+                    N_stat[target_dead] = half_n
+                    S[donors] = c1 * half_n
+                    S[target_dead] = c2 * half_n
+                    C[donors] = c1.to(X.dtype)
+                    C[target_dead] = c2.to(X.dtype)
+
     C = _lloyd_step_cublas(X, C)
     return C
 
 def run_hybrid_v3(X: torch.Tensor, k: int) -> torch.Tensor:
     seed_C = run_divisive_tree(X, k=k, split_rule="dense_island")
-    return run_emeans(X, k=k, epochs=1.0, init_C=seed_C)
+    return run_modified_emeans(X, k=k, epochs=1.0, init_C=seed_C)
 
-# 8-9. Engine v5 & HYBRID v5 (Residual Power Seeding)
+# 14-15. Engine v5 & HYBRID v5 (Residual Power Seeding)
 def run_engine_v5_residual(X: torch.Tensor, k: int) -> torch.Tensor:
     n, d = X.shape
     centroids = [X.mean(dim=0)]
@@ -302,61 +359,1186 @@ def run_engine_v5_residual(X: torch.Tensor, k: int) -> torch.Tensor:
 
 def run_hybrid_v5(X: torch.Tensor, k: int) -> torch.Tensor:
     seed_C = run_engine_v5_residual(X, k=k)
-    return run_emeans(X, k=k, epochs=1.0, init_C=seed_C)
+    return run_modified_emeans(X, k=k, epochs=1.0, init_C=seed_C)
 
 # =====================================================================
-# 5. Multi-Scale Benchmark Runner
+# Experiment Branches (v6, v7, v8-Spherical) — Non-invasive Add-ons
 # =====================================================================
 
-def evaluate_mse(X: torch.Tensor, centroids: torch.Tensor) -> float:
+def _masked_power_iteration_syncfree(
+    X_sub: torch.Tensor,
+    mask_f: torch.Tensor,
+    mask_sum: torch.Tensor,
+    iters: int = 2,
+) -> torch.Tensor:
+    d = X_sub.shape[1]
+    denom = torch.clamp(mask_sum, min=1.0)
+    mu = torch.mv(X_sub.T, mask_f) / denom
+    v = torch.randn(d, device=X_sub.device, dtype=X_sub.dtype)
+    v = v / (torch.linalg.norm(v) + 1e-9)
+    for _ in range(iters):
+        z = (torch.mv(X_sub, v) - torch.dot(mu, v)) * mask_f
+        v_next = torch.mv(X_sub.T, z) - z.sum() * mu
+        v = v_next / (torch.linalg.norm(v_next) + 1e-9)
+    return v
+
+
+def _split_dense_island_syncfree(
+    proj: torch.Tensor,
+    mask_bool: torch.Tensor,
+    bin_idxs: torch.Tensor,
+    tri: torch.Tensor,
+    num_bins: int = 64,
+) -> torch.Tensor:
+    large = 1e30
+    min_v = torch.where(mask_bool, proj, large).min()
+    max_v = torch.where(mask_bool, proj, -large).max()
+    safe_span = torch.clamp(max_v - min_v, min=1e-6)
+
+    norm_proj = ((proj - min_v) / safe_span * (num_bins - 1)).clamp(0, num_bins - 1).long()
+    counts = torch.zeros(num_bins, device=proj.device, dtype=torch.float32)
+    counts.scatter_add_(0, norm_proj, mask_bool.float())
+
+    is_dense = counts > (0.35 * counts.sum() / float(num_bins))
+    first = torch.where(is_dense, bin_idxs, num_bins).min()
+    last = torch.where(is_dense, bin_idxs, -1).max()
+
+    valid_mask = (bin_idxs >= first) & (bin_idxs <= last)
+    empty_between = (~is_dense) & valid_mask
+
+    # Longest contiguous empty gap via 64x64 prefix-sum table (zero syncs)
+    not_empty_cs = torch.cumsum((~empty_between).long(), dim=0)
+    cs_pad = torch.nn.functional.pad(not_empty_cs, (1, 0), value=0)
+    all_empty = ((cs_pad[1:].unsqueeze(0) - cs_pad[:-1].unsqueeze(1)) == 0) & tri
+
+    lengths = (bin_idxs.unsqueeze(0) - bin_idxs.unsqueeze(1) + 1) * all_empty.long()
+    flat_idx = torch.argmax(lengths.view(-1))
+    best_s = flat_idx // num_bins
+    best_e = flat_idx % num_bins
+    max_len = lengths.view(-1)[flat_idx]
+
+    best_center = 0.5 * (best_s + best_e).float()
+    gap_thresh = min_v + best_center * (safe_span / float(num_bins - 1))
+    mid_thresh = min_v + 0.5 * safe_span
+    return torch.where(max_len > 0, gap_thresh, mid_thresh).to(proj.dtype)
+
+
+# --- Branch v6: Sync-Free SSE + Dense-Island Seeding ---
+def run_engine_v6_sse(X: torch.Tensor, k: int, robust_cap_q: float = None) -> torch.Tensor:
+    n, d = X.shape
+    sub_n = min(16384, n)
+    sub_idx = torch.randint(0, n, (sub_n,), device=X.device)
+    X_sub = X[sub_idx]
+    x_sub_sq = (X_sub * X_sub).sum(dim=1)
+
+    C_buf = torch.empty((k, d), device=X.device, dtype=X.dtype)
+    C_buf[0] = X_sub.mean(dim=0)
+    cluster_sse = torch.zeros(k, device=X.device, dtype=torch.float32)
+
+    num_bins = 64
+    bin_idxs = torch.arange(num_bins, device=X.device)
+    tri = torch.triu(torch.ones(num_bins, num_bins, dtype=torch.bool, device=X.device))
+
+    for m in range(1, k):
+        C_curr = C_buf[:m]
+        c_half = 0.5 * (C_curr * C_curr).sum(dim=1)
+        scores = torch.addmm(-c_half, X_sub, C_curr.T)
+        max_score, assign = torch.max(scores, dim=1)
+
+        pt_sse = torch.clamp(x_sub_sq - 2.0 * max_score, min=0.0).float()
+        if robust_cap_q is not None:
+            pt_sse = torch.clamp(pt_sse, max=torch.quantile(pt_sse, robust_cap_q))
+
+        cluster_sse.zero_()
+        cluster_sse[:m].scatter_add_(0, assign, pt_sse)
+        target_cluster = torch.argmax(cluster_sse[:m])
+
+        mask_bool = (assign == target_cluster)
+        mask_cnt = mask_bool.sum()
+        mask_f = mask_bool.to(X_sub.dtype)
+        mask_sum = mask_f.sum()
+
+        v = _masked_power_iteration_syncfree(X_sub, mask_f, mask_sum, iters=2)
+        proj = torch.mv(X_sub, v)
+        thresh = _split_dense_island_syncfree(proj, mask_bool, bin_idxs, tri, num_bins=num_bins)
+
+        l_mask = (proj < thresh) & mask_bool
+        l_cnt = l_mask.sum()
+        r_cnt = mask_cnt - l_cnt
+        mean_proj = (proj * mask_f).sum() / torch.clamp(mask_sum, min=1.0)
+        thresh = torch.where((l_cnt < 1) | (r_cnt < 1), mean_proj, thresh)
+
+        l_mask = (proj < thresh) & mask_bool
+        r_mask = mask_bool & (~l_mask)
+        l_f = l_mask.to(X_sub.dtype)
+        r_f = r_mask.to(X_sub.dtype)
+        l_sum = l_f.sum()
+        r_sum = r_f.sum()
+
+        c_left = torch.mv(X_sub.T, l_f) / torch.clamp(l_sum, min=1.0)
+        c_right = torch.mv(X_sub.T, r_f) / torch.clamp(r_sum, min=1.0)
+
+        valid_split = (l_sum >= 1.0) & (r_sum >= 1.0)
+        C_buf[target_cluster] = torch.where(valid_split, c_left, C_buf[target_cluster])
+        C_buf[m] = torch.where(valid_split, c_right, X_sub[m % sub_n])
+
+    return C_buf
+
+
+def run_hybrid_v6(X: torch.Tensor, k: int, epochs: float = 1.0, robust_cap_q: float = None) -> torch.Tensor:
+    seed_C = run_engine_v6_sse(X, k=k, robust_cap_q=robust_cap_q)
+    return run_modified_emeans(X, k=k, epochs=epochs, init_C=seed_C)
+
+
+# --- Branch v7: Batched log2(k)-Round PDDP Seeding ---
+def run_engine_v7_batched_pddp(X: torch.Tensor, k: int, power_iters: int = 2) -> torch.Tensor:
+    n, d = X.shape
+    sub_n = min(16384, n)
+    X_sub = X[torch.randint(0, n, (sub_n,), device=X.device)]
+    x_sub_sq = (X_sub * X_sub).sum(dim=1)
+
+    C_buf = torch.empty((k, d), device=X.device, dtype=X.dtype)
+    C_buf[0] = X_sub.mean(dim=0)
+    m = 1
+
+    while m < k:
+        b = min(m, k - m)
+        C_curr = C_buf[:m]
+        c_half = 0.5 * (C_curr * C_curr).sum(dim=1)
+        scores = torch.addmm(-c_half, X_sub, C_curr.T)
+        max_score, assign = torch.max(scores, dim=1)
+
+        if b < m:
+            pt_sse = torch.clamp(x_sub_sq - 2.0 * max_score, min=0.0).float()
+            cluster_sse = torch.zeros(m, device=X.device, dtype=torch.float32)
+            cluster_sse.scatter_add_(0, assign, pt_sse)
+            _, split_ids = torch.topk(cluster_sse, b, largest=True)
+        else:
+            split_ids = torch.arange(m, device=X.device)
+
+        O = torch.zeros(sub_n, m, device=X.device, dtype=X.dtype)
+        O.scatter_(1, assign.unsqueeze(1), 1.0)
+        counts = O.sum(dim=0).clamp(min=1.0).unsqueeze(1)
+        M = (O.T @ X_sub) / counts
+
+        V = torch.randn(m, d, device=X.device, dtype=X.dtype)
+        V = V / (V.norm(dim=1, keepdim=True) + 1e-9)
+
+        for _ in range(power_iters):
+            dot_x_v = (X_sub @ V.T).gather(1, assign.unsqueeze(1)).squeeze(1)
+            dot_mu_v = (M * V).sum(dim=1)
+            z = dot_x_v - dot_mu_v[assign]
+            Z_mat = O * z.unsqueeze(1)
+            V_next = Z_mat.T @ X_sub - (Z_mat.sum(dim=0).unsqueeze(1)) * M
+            V = V_next / (V_next.norm(dim=1, keepdim=True) + 1e-9)
+
+        proj = (X_sub @ V.T).gather(1, assign.unsqueeze(1)).squeeze(1)
+        thresh_per_cluster = (M * V).sum(dim=1)
+        is_left = proj < thresh_per_cluster[assign]
+
+        O_left = O * is_left.to(X.dtype).unsqueeze(1)
+        O_right = O - O_left
+        cnt_left = O_left.sum(dim=0)
+        cnt_right = O_right.sum(dim=0)
+
+        C_left = (O_left.T @ X_sub) / cnt_left.clamp(min=1.0).unsqueeze(1)
+        C_right = (O_right.T @ X_sub) / cnt_right.clamp(min=1.0).unsqueeze(1)
+
+        valid = (cnt_left >= 1.0) & (cnt_right >= 1.0)
+        C_left_safe = torch.where(valid.unsqueeze(1), C_left, C_curr)
+        fallback_pts = X_sub[torch.arange(m, device=X.device) % sub_n]
+        C_right_safe = torch.where(valid.unsqueeze(1), C_right, fallback_pts)
+
+        C_buf[split_ids] = C_left_safe[split_ids]
+        C_buf[m : m + b] = C_right_safe[split_ids]
+        m += b
+
+    return C_buf
+
+
+def run_hybrid_v7(X: torch.Tensor, k: int, epochs: float = 1.0) -> torch.Tensor:
+    seed_C = run_engine_v7_batched_pddp(X, k=k)
+    return run_modified_emeans(X, k=k, epochs=epochs, init_C=seed_C)
+
+
+# --- Branch v8: Spherical (Cosine) Gradient-Direction Clustering ---
+def run_spherical_v8_grad(G: torch.Tensor, k: int, polish_iters: int = 3) -> torch.Tensor:
+    """Clusters gradients by cosine direction (immune to outlier gradient norms).
+    Returns unit-normalized centroids."""
+    G_unit = torch.nn.functional.normalize(G, p=2, dim=1)
+    C = run_engine_v7_batched_pddp(G_unit, k=k)
+    C = torch.nn.functional.normalize(C, p=2, dim=1)
+
+    n = G_unit.shape[0]
+    chunk_size = 65536
+    for _ in range(polish_iters):
+        new_C = torch.zeros_like(C)
+        counts = torch.zeros(k, 1, device=G.device, dtype=G.dtype)
+        for i in range(0, n, chunk_size):
+            chunk = G_unit[i : i + chunk_size]
+            assign = torch.argmax(chunk @ C.T, dim=1)
+            O = torch.zeros(chunk.shape[0], k, device=G.device, dtype=G.dtype)
+            O.scatter_(1, assign.unsqueeze(1), 1.0)
+            new_C += O.T @ chunk
+            counts += O.sum(dim=0, keepdim=True).T
+        valid = (counts.squeeze(1) > 0).unsqueeze(1)
+        C = torch.where(valid, torch.nn.functional.normalize(new_C, p=2, dim=1), C)
+    return C
+# =====================================================================
+# Experiment Branch v9: Batched Priority-SSE + Batched Dense-Island
+# =====================================================================
+
+def run_engine_v9_priority_island(
+    X: torch.Tensor,
+    k: int,
+    power_iters: int = 2,
+    robust_cap_q: float = 0.95,
+) -> torch.Tensor:
+    n, d = X.shape
+    sub_n = min(16384, n)
+    X_sub = X[torch.randint(0, n, (sub_n,), device=X.device)]
+    x_sub_sq = (X_sub * X_sub).sum(dim=1)
+
+    C_buf = torch.empty((k, d), device=X.device, dtype=X.dtype)
+    C_buf[0] = X_sub.mean(dim=0)
+
+    num_bins = 64
+    bin_idxs = torch.arange(num_bins, device=X.device)
+    tri = torch.triu(torch.ones(num_bins, num_bins, dtype=torch.bool, device=X.device))
+
+    m = 1
+    while m < k:
+        # Split top ~67% highest-SSE clusters each round (8 rounds for k=64)
+        b = min(m, max(1, (2 * m + 2) // 3), k - m)
+
+        C_curr = C_buf[:m]
+        c_half = 0.5 * (C_curr * C_curr).sum(dim=1)
+        scores = torch.addmm(-c_half, X_sub, C_curr.T)
+        max_score, assign = torch.max(scores, dim=1)
+
+        pt_sse = torch.clamp(x_sub_sq - 2.0 * max_score, min=0.0).float()
+        if robust_cap_q is not None:
+            pt_sse = torch.clamp(pt_sse, max=torch.quantile(pt_sse, robust_cap_q))
+
+        cluster_sse = torch.zeros(m, device=X.device, dtype=torch.float32)
+        cluster_sse.scatter_add_(0, assign, pt_sse)
+        _, split_ids = torch.topk(cluster_sse, b, largest=True)
+
+        # Map points into 0..b-1 for selected clusters, b for unselected
+        cluster_to_sel = torch.full((m,), b, device=X.device, dtype=torch.long)
+        cluster_to_sel[split_ids] = torch.arange(b, device=X.device)
+        sel_pos = cluster_to_sel[assign]
+        safe_pos = sel_pos.clamp(max=b - 1)
+        in_sel = (sel_pos < b).to(X.dtype)
+
+        O_full = torch.zeros(sub_n, b + 1, device=X.device, dtype=X.dtype)
+        O_full.scatter_(1, sel_pos.unsqueeze(1), 1.0)
+        O = O_full[:, :b]  # (sub_n, b)
+
+        counts = O.sum(dim=0).clamp(min=1.0).unsqueeze(1)
+        M = (O.T @ X_sub) / counts  # (b, d)
+
+        V = torch.randn(b, d, device=X.device, dtype=X.dtype)
+        V = V / (V.norm(dim=1, keepdim=True) + 1e-9)
+
+        for _ in range(power_iters):
+            dot_x_v = (X_sub @ V.T).gather(1, safe_pos.unsqueeze(1)).squeeze(1) * in_sel
+            dot_mu_v = (M * V).sum(dim=1)
+            z = (dot_x_v - dot_mu_v[safe_pos]) * in_sel
+            Z_mat = O * z.unsqueeze(1)
+            V_next = Z_mat.T @ X_sub - (Z_mat.sum(dim=0).unsqueeze(1)) * M
+            V = V_next / (V_next.norm(dim=1, keepdim=True) + 1e-9)
+
+        proj = (X_sub @ V.T).gather(1, safe_pos.unsqueeze(1)).squeeze(1)
+
+        # Batched 64-bin dense-island gap finder across all b selected clusters
+        O_bool = O > 0.5
+        min_v = torch.where(O_bool, proj.unsqueeze(1), 1e30).min(dim=0).values
+        max_v = torch.where(O_bool, proj.unsqueeze(1), -1e30).max(dim=0).values
+        safe_span = torch.clamp(max_v - min_v, min=1e-6)
+
+        bin_idx = ((proj - min_v[safe_pos]) / safe_span[safe_pos] * (num_bins - 1)).clamp(0, num_bins - 1).long()
+        flat_bin = sel_pos * num_bins + bin_idx
+        hist = torch.zeros((b + 1) * num_bins, device=X.device, dtype=torch.float32)
+        hist.scatter_add_(0, flat_bin, in_sel.float())
+        counts_hist = hist[: b * num_bins].view(b, num_bins)
+
+        is_dense = counts_hist > (0.35 * counts_hist.sum(dim=1, keepdim=True) / float(num_bins))
+        first = torch.where(is_dense, bin_idxs.unsqueeze(0), num_bins).min(dim=1, keepdim=True).values
+        last = torch.where(is_dense, bin_idxs.unsqueeze(0), -1).max(dim=1, keepdim=True).values
+
+        valid_mask = (bin_idxs.unsqueeze(0) >= first) & (bin_idxs.unsqueeze(0) <= last)
+        empty_between = (~is_dense) & valid_mask
+
+        not_empty_cs = torch.cumsum((~empty_between).long(), dim=1)
+        cs_pad = torch.nn.functional.pad(not_empty_cs, (1, 0), value=0)
+        all_empty = ((cs_pad[:, 1:].unsqueeze(1) - cs_pad[:, :-1].unsqueeze(2)) == 0) & tri.unsqueeze(0)
+
+        lengths = (bin_idxs.view(1, 1, num_bins) - bin_idxs.view(1, num_bins, 1) + 1) * all_empty.long()
+        max_len, flat_idx = torch.max(lengths.view(b, -1), dim=1)
+        best_s = flat_idx // num_bins
+        best_e = flat_idx % num_bins
+
+        best_center = 0.5 * (best_s + best_e).float()
+        gap_thresh = min_v + best_center * (safe_span / float(num_bins - 1))
+        mid_thresh = min_v + 0.5 * safe_span
+        thresh = torch.where(max_len > 0, gap_thresh, mid_thresh).to(X.dtype)
+
+        dot_mu_v = (M * V).sum(dim=1)
+        is_left = (proj < thresh[safe_pos]) & (sel_pos < b)
+        O_left = O * is_left.to(X.dtype).unsqueeze(1)
+        O_right = O - O_left
+        cnt_left = O_left.sum(dim=0)
+        cnt_right = O_right.sum(dim=0)
+
+        # Branchless fallback to cluster mean if gap-split left either side empty
+        bad = (cnt_left < 1.0) | (cnt_right < 1.0)
+        thresh_safe = torch.where(bad, dot_mu_v, thresh)
+        is_left = (proj < thresh_safe[safe_pos]) & (sel_pos < b)
+        O_left = O * is_left.to(X.dtype).unsqueeze(1)
+        O_right = O - O_left
+        cnt_left = O_left.sum(dim=0)
+        cnt_right = O_right.sum(dim=0)
+
+        C_left = (O_left.T @ X_sub) / cnt_left.clamp(min=1.0).unsqueeze(1)
+        C_right = (O_right.T @ X_sub) / cnt_right.clamp(min=1.0).unsqueeze(1)
+
+        valid = (cnt_left >= 1.0) & (cnt_right >= 1.0)
+        C_left_safe = torch.where(valid.unsqueeze(1), C_left, C_curr[split_ids])
+        fallback_pts = X_sub[torch.arange(b, device=X.device) % sub_n]
+        C_right_safe = torch.where(valid.unsqueeze(1), C_right, fallback_pts)
+
+        C_buf[split_ids] = C_left_safe
+        C_buf[m : m + b] = C_right_safe
+        m += b
+
+    return C_buf
+
+
+def _warm_emeans_refine(
+    X: torch.Tensor,
+    init_C: torch.Tensor,
+    epochs: float = 0.5,
+    a0: float = 0.35,
+) -> torch.Tensor:
+    """Refines seeded centroids without wiping them out on batch 0."""
+    n, d = X.shape
+    k = init_C.shape[0]
+    B, _ = get_emeans_hyperparameters(n, k, epochs)
+    n_batches = max(1, int((n * epochs) // B))
+
+    C = init_C.clone()
+    prior_n = max(1.0, 0.25 * (float(B) / float(k)))
+    N_stat = torch.full((k, 1), prior_n, device=X.device, dtype=torch.float32)
+    S = C.to(torch.float32) * prior_n
+
+    for step in range(n_batches):
+        progress = float(step) / float(n_batches)
+        alpha = a0 * (0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress)))
+        batch_idx = torch.randint(0, n, (B,), device=X.device)
+        C, S, N_stat, _, _ = _emeans_step_cublas(X[batch_idx], C, S, N_stat, alpha)
+
+    return _lloyd_step_cublas(X, C)
+
+
+def run_hybrid_v9_warm(X: torch.Tensor, k: int, epochs: float = 0.5) -> torch.Tensor:
+    seed_C = run_engine_v9_priority_island(X, k=k, robust_cap_q=0.95)
+    return _warm_emeans_refine(X, seed_C, epochs=epochs, a0=0.35)
+
+
+def run_hybrid_v9_2lloyd(X: torch.Tensor, k: int) -> torch.Tensor:
+    C = run_engine_v9_priority_island(X, k=k, robust_cap_q=0.95)
+    C = _lloyd_step_cublas(X, C)
+    return _lloyd_step_cublas(X, C)
+
+def run_engine_v9_ablation(X: torch.Tensor, k: int, use_island: bool = False, verbose: bool = False) -> torch.Tensor:
+    n, d = X.shape
+    sub_n = min(16384, n)
+    X_sub = X[torch.randint(0, n, (sub_n,), device=X.device)]
+    x_sub_sq = (X_sub * X_sub).sum(dim=1)
+
+    C_buf = torch.empty((k, d), device=X.device, dtype=X.dtype)
+    C_buf[0] = X_sub.mean(dim=0)
+
+    num_bins = 64
+    bin_idxs = torch.arange(num_bins, device=X.device)
+    tri = torch.triu(torch.ones(num_bins, num_bins, dtype=torch.bool, device=X.device))
+
+    m = 1
+    while m < k:
+        b = min(m, max(1, (2 * m + 2) // 3), k - m)
+        C_curr = C_buf[:m]
+        c_half = 0.5 * (C_curr * C_curr).sum(dim=1)
+        scores = torch.addmm(-c_half, X_sub, C_curr.T)
+        max_score, assign = torch.max(scores, dim=1)
+
+        pt_sse = torch.clamp(x_sub_sq - 2.0 * max_score, min=0.0).float()
+        pt_sse = torch.clamp(pt_sse, max=torch.quantile(pt_sse, 0.95))
+
+        cluster_sse = torch.zeros(m, device=X.device, dtype=torch.float32)
+        cluster_sse.scatter_add_(0, assign, pt_sse)
+        _, split_ids = torch.topk(cluster_sse, b, largest=True)
+
+        cluster_to_sel = torch.full((m,), b, device=X.device, dtype=torch.long)
+        cluster_to_sel[split_ids] = torch.arange(b, device=X.device)
+        sel_pos = cluster_to_sel[assign]
+        safe_pos = sel_pos.clamp(max=b - 1)
+        in_sel = (sel_pos < b).to(X.dtype)
+
+        O_full = torch.zeros(sub_n, b + 1, device=X.device, dtype=X.dtype)
+        O_full.scatter_(1, sel_pos.unsqueeze(1), 1.0)
+        O = O_full[:, :b]
+
+        counts = O.sum(dim=0).clamp(min=1.0).unsqueeze(1)
+        M = (O.T @ X_sub) / counts
+
+        V = torch.randn(b, d, device=X.device, dtype=X.dtype)
+        V = V / (V.norm(dim=1, keepdim=True) + 1e-9)
+
+        for _ in range(2):
+            dot_x_v = (X_sub @ V.T).gather(1, safe_pos.unsqueeze(1)).squeeze(1) * in_sel
+            dot_mu_v = (M * V).sum(dim=1)
+            z = (dot_x_v - dot_mu_v[safe_pos]) * in_sel
+            Z_mat = O * z.unsqueeze(1)
+            V_next = Z_mat.T @ X_sub - (Z_mat.sum(dim=0).unsqueeze(1)) * M
+            V = V_next / (V_next.norm(dim=1, keepdim=True) + 1e-9)
+
+        proj = (X_sub @ V.T).gather(1, safe_pos.unsqueeze(1)).squeeze(1)
+        dot_mu_v = (M * V).sum(dim=1)
+
+        if use_island:
+            O_bool = O > 0.5
+            min_v = torch.where(O_bool, proj.unsqueeze(1), 1e30).min(dim=0).values
+            max_v = torch.where(O_bool, proj.unsqueeze(1), -1e30).max(dim=0).values
+            safe_span = torch.clamp(max_v - min_v, min=1e-6)
+            bin_idx = ((proj - min_v[safe_pos]) / safe_span[safe_pos] * (num_bins - 1)).clamp(0, num_bins - 1).long()
+            flat_bin = sel_pos * num_bins + bin_idx
+            hist = torch.zeros((b + 1) * num_bins, device=X.device, dtype=torch.float32)
+            hist.scatter_add_(0, flat_bin, in_sel.float())
+            counts_hist = hist[: b * num_bins].view(b, num_bins)
+            is_dense = counts_hist > (0.35 * counts_hist.sum(dim=1, keepdim=True) / float(num_bins))
+            first = torch.where(is_dense, bin_idxs.unsqueeze(0), num_bins).min(dim=1, keepdim=True).values
+            last = torch.where(is_dense, bin_idxs.unsqueeze(0), -1).max(dim=1, keepdim=True).values
+            valid_mask = (bin_idxs.unsqueeze(0) >= first) & (bin_idxs.unsqueeze(0) <= last)
+            empty_between = (~is_dense) & valid_mask
+            not_empty_cs = torch.cumsum((~empty_between).long(), dim=1)
+            cs_pad = torch.nn.functional.pad(not_empty_cs, (1, 0), value=0)
+            all_empty = ((cs_pad[:, 1:].unsqueeze(1) - cs_pad[:, :-1].unsqueeze(2)) == 0) & tri.unsqueeze(0)
+            lengths = (bin_idxs.view(1, 1, num_bins) - bin_idxs.view(1, num_bins, 1) + 1) * all_empty.long()
+            max_len, flat_idx = torch.max(lengths.view(b, -1), dim=1)
+            best_s, best_e = flat_idx // num_bins, flat_idx % num_bins
+            gap_thresh = min_v + 0.5 * (best_s + best_e).float() * (safe_span / float(num_bins - 1))
+            mid_thresh = min_v + 0.5 * safe_span
+            thresh = torch.where(max_len > 0, gap_thresh, mid_thresh).to(X.dtype)
+        else:
+            thresh = dot_mu_v
+
+        is_left = (proj < thresh[safe_pos]) & (sel_pos < b)
+        O_left = O * is_left.to(X.dtype).unsqueeze(1)
+        O_right = O - O_left
+        cnt_left, cnt_right = O_left.sum(dim=0), O_right.sum(dim=0)
+
+        bad = (cnt_left < 1.0) | (cnt_right < 1.0)
+        thresh_safe = torch.where(bad, dot_mu_v, thresh)
+        is_left = (proj < thresh_safe[safe_pos]) & (sel_pos < b)
+        O_left = O * is_left.to(X.dtype).unsqueeze(1)
+        O_right = O - O_left
+        cnt_left, cnt_right = O_left.sum(dim=0), O_right.sum(dim=0)
+
+        if verbose:
+            print(f"m={m:2d} b={b:2d} | min_cnt={(cnt_left.min().item(), cnt_right.min().item())} | bad={bad.sum().item()}")
+
+        C_left = (O_left.T @ X_sub) / cnt_left.clamp(min=1.0).unsqueeze(1)
+        C_right = (O_right.T @ X_sub) / cnt_right.clamp(min=1.0).unsqueeze(1)
+        valid = (cnt_left >= 1.0) & (cnt_right >= 1.0)
+        C_buf[split_ids] = torch.where(valid.unsqueeze(1), C_left, C_curr[split_ids])
+        C_buf[m : m + b] = torch.where(valid.unsqueeze(1), C_right, X_sub[torch.arange(b, device=X.device) % sub_n])
+        m += b
+
+    return C_buf
+
+
+def run_engine_v10_fast(
+    X: torch.Tensor,
+    k: int,
+    use_guarded_island: bool = False,
+    robust_cap_q: float = 0.95,
+) -> torch.Tensor:
+    n, d = X.shape
+    sub_n = min(16384, n)
+    X_sub = X[torch.randint(0, n, (sub_n,), device=X.device)]
+    x_sub_sq = (X_sub * X_sub).sum(dim=1)
+
+    C_buf = torch.empty((k, d), device=X.device, dtype=X.dtype)
+    C_buf[0] = X_sub.mean(dim=0)
+
+    if use_guarded_island:
+        num_bins = 64
+        bin_idxs = torch.arange(num_bins, device=X.device)
+        tri = torch.triu(torch.ones(num_bins, num_bins, dtype=torch.bool, device=X.device))
+
+    m = 1
+    while m < k:
+        b = min(m, max(1, (2 * m + 2) // 3), k - m)
+        C_curr = C_buf[:m]
+        c_half = 0.5 * (C_curr * C_curr).sum(dim=1)
+        scores = torch.addmm(-c_half, X_sub, C_curr.T)
+        max_score, assign = torch.max(scores, dim=1)
+
+        pt_sse = torch.clamp(x_sub_sq - 2.0 * max_score, min=0.0).float()
+        if robust_cap_q is not None:
+            pt_sse = torch.clamp(pt_sse, max=torch.quantile(pt_sse, robust_cap_q))
+
+        cluster_sse = torch.zeros(m, device=X.device, dtype=torch.float32)
+        cluster_sse.scatter_add_(0, assign, pt_sse)
+        _, split_ids = torch.topk(cluster_sse, b, largest=True)
+
+        cluster_to_sel = torch.full((m,), b, device=X.device, dtype=torch.long)
+        cluster_to_sel[split_ids] = torch.arange(b, device=X.device)
+        sel_pos = cluster_to_sel[assign]
+        safe_pos = sel_pos.clamp(max=b - 1)
+        in_sel = (sel_pos < b).to(X.dtype)
+
+        O_full = torch.zeros(sub_n, b + 1, device=X.device, dtype=X.dtype)
+        O_full.scatter_(1, sel_pos.unsqueeze(1), 1.0)
+        O = O_full[:, :b]
+
+        total_cnt = O.sum(dim=0)
+        M = (O.T @ X_sub) / total_cnt.clamp(min=1.0).unsqueeze(1)
+
+        V = torch.randn(b, d, device=X.device, dtype=X.dtype)
+        V = V / (V.norm(dim=1, keepdim=True) + 1e-9)
+
+        for _ in range(2):
+            dot_x_v = (X_sub @ V.T).gather(1, safe_pos.unsqueeze(1)).squeeze(1) * in_sel
+            dot_mu_v = (M * V).sum(dim=1)
+            z = (dot_x_v - dot_mu_v[safe_pos]) * in_sel
+            Z_mat = O * z.unsqueeze(1)
+            V_next = Z_mat.T @ X_sub - (Z_mat.sum(dim=0).unsqueeze(1)) * M
+            V = V_next / (V_next.norm(dim=1, keepdim=True) + 1e-9)
+
+        proj = (X_sub @ V.T).gather(1, safe_pos.unsqueeze(1)).squeeze(1)
+        dot_mu_v = (M * V).sum(dim=1)
+
+        if use_guarded_island:
+            O_bool = O > 0.5
+            min_v = torch.where(O_bool, proj.unsqueeze(1), 1e30).min(dim=0).values
+            max_v = torch.where(O_bool, proj.unsqueeze(1), -1e30).max(dim=0).values
+            safe_span = torch.clamp(max_v - min_v, min=1e-6)
+
+            bin_idx = ((proj - min_v[safe_pos]) / safe_span[safe_pos] * (num_bins - 1)).clamp(0, num_bins - 1).long()
+            flat_bin = sel_pos * num_bins + bin_idx
+            hist = torch.zeros((b + 1) * num_bins, device=X.device, dtype=torch.float32)
+            hist.scatter_add_(0, flat_bin, in_sel.float())
+            counts_hist = hist[: b * num_bins].view(b, num_bins)
+
+            is_dense = counts_hist > (0.35 * counts_hist.sum(dim=1, keepdim=True) / float(num_bins))
+            first = torch.where(is_dense, bin_idxs.unsqueeze(0), num_bins).min(dim=1, keepdim=True).values
+            last = torch.where(is_dense, bin_idxs.unsqueeze(0), -1).max(dim=1, keepdim=True).values
+            valid_mask = (bin_idxs.unsqueeze(0) >= first) & (bin_idxs.unsqueeze(0) <= last)
+            empty_between = (~is_dense) & valid_mask
+
+            not_empty_cs = torch.cumsum((~empty_between).long(), dim=1)
+            cs_pad = torch.nn.functional.pad(not_empty_cs, (1, 0), value=0)
+            all_empty = ((cs_pad[:, 1:].unsqueeze(1) - cs_pad[:, :-1].unsqueeze(2)) == 0) & tri.unsqueeze(0)
+            lengths = (bin_idxs.view(1, 1, num_bins) - bin_idxs.view(1, num_bins, 1) + 1) * all_empty.long()
+            max_len, flat_idx = torch.max(lengths.view(b, -1), dim=1)
+            best_s, best_e = flat_idx // num_bins, flat_idx % num_bins
+
+            gap_thresh = min_v + 0.5 * (best_s + best_e).float() * (safe_span / float(num_bins - 1))
+            mid_thresh = min_v + 0.5 * safe_span
+            thresh = torch.where(max_len > 0, gap_thresh, mid_thresh).to(X.dtype)
+
+            is_left = (proj < thresh[safe_pos]) & (sel_pos < b)
+            O_left = O * is_left.to(X.dtype).unsqueeze(1)
+            cnt_left = O_left.sum(dim=0)
+            cnt_right = total_cnt - cnt_left
+
+            # 10% balance guard: reject edge-peeling cuts and fall back to mean-split
+            min_side = 0.10 * total_cnt
+            imbalanced = (cnt_left < min_side) | (cnt_right < min_side)
+            thresh = torch.where(imbalanced, dot_mu_v, thresh)
+        else:
+            thresh = dot_mu_v
+
+        is_left = (proj < thresh[safe_pos]) & (sel_pos < b)
+        O_left = O * is_left.to(X.dtype).unsqueeze(1)
+        O_right = O - O_left
+        cnt_left, cnt_right = O_left.sum(dim=0), O_right.sum(dim=0)
+
+        C_left = (O_left.T @ X_sub) / cnt_left.clamp(min=1.0).unsqueeze(1)
+        C_right = (O_right.T @ X_sub) / cnt_right.clamp(min=1.0).unsqueeze(1)
+        valid = (cnt_left >= 1.0) & (cnt_right >= 1.0)
+        C_buf[split_ids] = torch.where(valid.unsqueeze(1), C_left, C_curr[split_ids])
+        C_buf[m : m + b] = torch.where(valid.unsqueeze(1), C_right, X_sub[torch.arange(b, device=X.device) % sub_n])
+        m += b
+
+    return C_buf
+
+
+def run_hybrid_v10_1lloyd(X: torch.Tensor, k: int, use_guarded_island: bool = False) -> torch.Tensor:
+    C = run_engine_v10_fast(X, k=k, use_guarded_island=use_guarded_island)
+    return _lloyd_step_cublas(X, C)
+
+
+def run_hybrid_v10_warm(X: torch.Tensor, k: int, epochs: float = 0.5, use_guarded_island: bool = False) -> torch.Tensor:
+    seed_C = run_engine_v10_fast(X, k=k, use_guarded_island=use_guarded_island)
+    return _warm_emeans_refine(X, seed_C, epochs=epochs, a0=0.35)
+
+
+def _warm_emeans_refine_revive(
+    X: torch.Tensor,
+    init_C: torch.Tensor,
+    epochs: float = 0.5,
+    a0: float = 0.35,
+    revive_thresh: float = 0.15,
+    revive_cap_q: float = 0.96,
+) -> torch.Tensor:
+    n, d = X.shape
+    k = init_C.shape[0]
+    B, _ = get_emeans_hyperparameters(n, k, epochs)
+    n_batches = max(1, int((n * epochs) // B))
+
+    C = init_C.clone()
+    prior_n = max(1.0, 0.25 * (float(B) / float(k)))
+    N_stat = torch.full((k, 1), prior_n, device=X.device, dtype=torch.float32)
+    S = C.to(torch.float32) * prior_n
+
+    for step in range(n_batches):
+        progress = float(step) / float(n_batches)
+        alpha = a0 * (0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress)))
+        batch_idx = torch.randint(0, n, (B,), device=X.device)
+        B_X = X[batch_idx]
+
+        C, S, N_stat, _, scores = _emeans_step_cublas(B_X, C, S, N_stat, alpha)
+
+        if (step + 1) % 5 == 0 and step < int(0.75 * n_batches):
+            mean_n = N_stat.mean().item()
+            dead_indices = torch.where(N_stat.squeeze(1) < revive_thresh * mean_n)[0]
+            if len(dead_indices) > 0:
+                max_score, _ = torch.max(scores, dim=1)
+                bx_sq = (B_X * B_X).sum(dim=1)
+                residual_sq = torch.clamp(bx_sq - 2.0 * max_score, min=0.0)
+                cap_val = torch.quantile(residual_sq, revive_cap_q)
+                weights = torch.clamp(residual_sq, max=cap_val)
+                if weights.sum() > 0:
+                    num_to_sample = min(len(dead_indices), int((weights > 0).sum().item()))
+                    chosen_idx = torch.multinomial(weights, num_to_sample, replacement=False)
+                    new_pts = B_X[chosen_idx]
+                    target_dead = dead_indices[:num_to_sample]
+                    N_stat[target_dead] = mean_n
+                    S[target_dead] = new_pts.to(torch.float32) * mean_n
+                    C[target_dead] = new_pts
+
+    return _lloyd_step_cublas(X, C)
+
+
+def run_hybrid_v11(X: torch.Tensor, k: int, epochs: float = 0.5, revive_thresh: float = 0.15) -> torch.Tensor:
+    seed_C = run_engine_v10_fast(X, k=k, use_guarded_island=False)
+    return _warm_emeans_refine_revive(X, seed_C, epochs=epochs, a0=0.35, revive_thresh=revive_thresh, revive_cap_q=0.96)
+
+
+def run_engine_v12_pddp_d2(
+    X: torch.Tensor,
+    k: int,
+    tail_r: int = 8,
+    robust_cap_q: float = 0.95,
+) -> torch.Tensor:
+    n, d = X.shape
+    r = min(max(0, tail_r), max(0, k - 1))
+    k_pddp = k - r
+
+    sub_n = min(16384, n)
+    X_sub = X[torch.randint(0, n, (sub_n,), device=X.device)]
+    x_sub_sq = (X_sub * X_sub).sum(dim=1)
+
+    C_buf = torch.empty((k, d), device=X.device, dtype=X.dtype)
+    C_buf[0] = X_sub.mean(dim=0)
+
+    # Phase 1: Fast Batched Priority-SSE PDDP for k - r clusters
+    m = 1
+    while m < k_pddp:
+        b = min(m, max(1, (2 * m + 2) // 3), k_pddp - m)
+        C_curr = C_buf[:m]
+        c_half = 0.5 * (C_curr * C_curr).sum(dim=1)
+        scores = torch.addmm(-c_half, X_sub, C_curr.T)
+        max_score, assign = torch.max(scores, dim=1)
+
+        pt_sse = torch.clamp(x_sub_sq - 2.0 * max_score, min=0.0).float()
+        if robust_cap_q is not None:
+            pt_sse = torch.clamp(pt_sse, max=torch.quantile(pt_sse, robust_cap_q))
+
+        cluster_sse = torch.zeros(m, device=X.device, dtype=torch.float32)
+        cluster_sse.scatter_add_(0, assign, pt_sse)
+        _, split_ids = torch.topk(cluster_sse, b, largest=True)
+
+        cluster_to_sel = torch.full((m,), b, device=X.device, dtype=torch.long)
+        cluster_to_sel[split_ids] = torch.arange(b, device=X.device)
+        sel_pos = cluster_to_sel[assign]
+        safe_pos = sel_pos.clamp(max=b - 1)
+        in_sel = (sel_pos < b).to(X.dtype)
+
+        O_full = torch.zeros(sub_n, b + 1, device=X.device, dtype=X.dtype)
+        O_full.scatter_(1, sel_pos.unsqueeze(1), 1.0)
+        O = O_full[:, :b]
+
+        total_cnt = O.sum(dim=0)
+        M = (O.T @ X_sub) / total_cnt.clamp(min=1.0).unsqueeze(1)
+
+        V = torch.randn(b, d, device=X.device, dtype=X.dtype)
+        V = V / (V.norm(dim=1, keepdim=True) + 1e-9)
+
+        for _ in range(2):
+            dot_x_v = (X_sub @ V.T).gather(1, safe_pos.unsqueeze(1)).squeeze(1) * in_sel
+            dot_mu_v = (M * V).sum(dim=1)
+            z = (dot_x_v - dot_mu_v[safe_pos]) * in_sel
+            Z_mat = O * z.unsqueeze(1)
+            V_next = Z_mat.T @ X_sub - (Z_mat.sum(dim=0).unsqueeze(1)) * M
+            V = V_next / (V_next.norm(dim=1, keepdim=True) + 1e-9)
+
+        proj = (X_sub @ V.T).gather(1, safe_pos.unsqueeze(1)).squeeze(1)
+        dot_mu_v = (M * V).sum(dim=1)
+
+        is_left = (proj < dot_mu_v[safe_pos]) & (sel_pos < b)
+        O_left = O * is_left.to(X.dtype).unsqueeze(1)
+        O_right = O - O_left
+        cnt_left, cnt_right = O_left.sum(dim=0), O_right.sum(dim=0)
+
+        C_left = (O_left.T @ X_sub) / cnt_left.clamp(min=1.0).unsqueeze(1)
+        C_right = (O_right.T @ X_sub) / cnt_right.clamp(min=1.0).unsqueeze(1)
+        valid = (cnt_left >= 1.0) & (cnt_right >= 1.0)
+        C_buf[split_ids] = torch.where(valid.unsqueeze(1), C_left, C_curr[split_ids])
+        C_buf[m : m + b] = torch.where(valid.unsqueeze(1), C_right, X_sub[torch.arange(b, device=X.device) % sub_n])
+        m += b
+
+    # Phase 2: Capped-D2 Residual Tail for remaining r centroids
+    if r > 0:
+        C_pddp = C_buf[:k_pddp]
+        c_half = 0.5 * (C_pddp * C_pddp).sum(dim=1)
+        max_score = torch.max(torch.addmm(-c_half, X_sub, C_pddp.T), dim=1).values
+        min_sq = torch.clamp(x_sub_sq - 2.0 * max_score, min=0.0).float()
+
+        for j in range(k_pddp, k):
+            cap_val = torch.quantile(min_sq, robust_cap_q if robust_cap_q is not None else 0.99)
+            w = torch.clamp(min_sq, max=cap_val) + 1e-12
+            idx = torch.multinomial(w, 1).squeeze(0)
+            new_c = X_sub[idx]
+            C_buf[j] = new_c
+            new_sq = torch.clamp(x_sub_sq + (new_c * new_c).sum() - 2.0 * torch.mv(X_sub, new_c), min=0.0).float()
+            min_sq = torch.minimum(min_sq, new_sq)
+
+    return C_buf
+
+
+def run_hybrid_v12(X: torch.Tensor, k: int, tail_frac: float = 0.125, epochs: float = 0.5) -> torch.Tensor:
+    r = max(2, int(round(k * tail_frac)))
+    seed_C = run_engine_v12_pddp_d2(X, k=k, tail_r=r, robust_cap_q=0.95)
+    return _warm_emeans_refine(X, seed_C, epochs=epochs, a0=0.35)
+
+
+def _damped_warm_emeans_refine(
+    X: torch.Tensor,
+    init_C: torch.Tensor,
+    epochs: float = 0.5,
+    a0: float = 0.35,
+    damp_quantile_scale: float = 2.0,
+) -> torch.Tensor:
+    n, d = X.shape
+    k = init_C.shape[0]
+    B, _ = get_emeans_hyperparameters(n, k, epochs)
+    n_batches = max(1, int((n * epochs) // B))
+
+    C = init_C.clone()
+    prior_n = max(1.0, 0.25 * (float(B) / float(k)))
+    N_stat = torch.full((k, 1), prior_n, device=X.device, dtype=torch.float32)
+    S = C.to(torch.float32) * prior_n
+
+    # Estimate scale λ once from a small probe so damping adapts to task variance
+    probe = X[torch.randint(0, n, (min(4096, n),), device=X.device)]
+    c_half0 = 0.5 * (C * C).sum(dim=1)
+    max_sc0 = torch.max(torch.addmm(-c_half0, probe, C.T), dim=1).values
+    probe_sq = torch.clamp((probe * probe).sum(dim=1) - 2.0 * max_sc0, min=0.0)
+    lam = torch.clamp(damp_quantile_scale * torch.median(probe_sq), min=1e-4)
+
+    for step in range(n_batches):
+        progress = float(step) / float(n_batches)
+        alpha = a0 * (0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress)))
+        B_X = X[torch.randint(0, n, (B,), device=X.device)]
+
+        c_half = 0.5 * (C * C).sum(dim=1)
+        scores = torch.addmm(-c_half, B_X, C.T)
+        max_score, assign = torch.max(scores, dim=1)
+
+        # Globally bounded force weight: w_i = λ / (||x - c||² + λ)
+        # Ensures |w_i * (x - c)| ≤ √λ / 2 (damped_force_globally_bounded)
+        dist_sq = torch.clamp((B_X * B_X).sum(dim=1) - 2.0 * max_score, min=0.0).float()
+        w = (lam / (dist_sq + lam)).unsqueeze(1)
+
+        O = torch.zeros(B_X.shape[0], k, device=X.device, dtype=torch.float32)
+        O.scatter_(1, assign.unsqueeze(1), 1.0)
+        O_w = O * w
+
+        s_batch = O_w.T @ B_X.to(torch.float32)
+        n_batch = O_w.sum(dim=0, keepdim=True).T
+
+        S = (1.0 - alpha) * S + alpha * s_batch
+        N_stat = (1.0 - alpha) * N_stat + alpha * n_batch
+        valid = (N_stat.squeeze(1) > 1e-6)
+        C = torch.where(valid.unsqueeze(1), (S / torch.clamp(N_stat, min=1e-6)).to(C.dtype), C)
+
+    return _lloyd_step_cublas(X, C)
+
+
+def run_hybrid_v13_damped(X: torch.Tensor, k: int, epochs: float = 0.5) -> torch.Tensor:
+    seed_C = run_engine_v10_fast(X, k=k, use_guarded_island=False)
+    return _damped_warm_emeans_refine(X, seed_C, epochs=epochs, a0=0.35)
+
+
+def _multiscale_damped_emeans_refine(
+    X: torch.Tensor,
+    init_C: torch.Tensor,
+    epochs: float = 0.5,
+    num_branches: int = 4,
+    damp_quantile_scale: float = 2.0,
+) -> torch.Tensor:
+    n, d = X.shape
+    k = init_C.shape[0]
+    B, _ = get_emeans_hyperparameters(n, k, epochs)
+    n_batches = max(1, int((n * epochs) // B))
+
+    C = init_C.clone()
+    prior_n = max(1.0, 0.25 * (float(B) / float(k)))
+
+    # Multi-scale decay rates mirroring LinearMetricSimplexAttention (slow memory -> fast tracker)
+    rates = torch.logspace(-2.0, -0.35, steps=num_branches, device=X.device, dtype=torch.float32)  # (M,)
+    N_branches = torch.full((num_branches, k, 1), prior_n, device=X.device, dtype=torch.float32)
+    S_branches = C.to(torch.float32).unsqueeze(0).expand(num_branches, k, d).clone() * prior_n
+
+    probe = X[torch.randint(0, n, (min(4096, n),), device=X.device)]
+    c_half0 = 0.5 * (C * C).sum(dim=1)
+    max_sc0 = torch.max(torch.addmm(-c_half0, probe, C.T), dim=1).values
+    probe_sq = torch.clamp((probe * probe).sum(dim=1) - 2.0 * max_sc0, min=0.0)
+    lam = torch.clamp(damp_quantile_scale * torch.median(probe_sq), min=1e-4)
+
+    for step in range(n_batches):
+        progress = float(step) / float(n_batches)
+        cosine_scale = 0.2 + 0.8 * 0.5 * (1.0 + math.cos(math.pi * progress))
+        B_X = X[torch.randint(0, n, (B,), device=X.device)]
+
+        c_half = 0.5 * (C * C).sum(dim=1)
+        scores = torch.addmm(-c_half, B_X, C.T)
+        max_score, assign = torch.max(scores, dim=1)
+
+        dist_sq = torch.clamp((B_X * B_X).sum(dim=1) - 2.0 * max_score, min=0.0).float()
+        w = (lam / (dist_sq + lam)).unsqueeze(1)
+
+        O = torch.zeros(B_X.shape[0], k, device=X.device, dtype=torch.float32)
+        O.scatter_(1, assign.unsqueeze(1), 1.0)
+        O_w = O * w
+
+        s_batch = O_w.T @ B_X.to(torch.float32)     # (k, d)
+        n_batch = O_w.sum(dim=0, keepdim=True).T     # (k, 1)
+
+        # Update all M decay timescales simultaneously
+        alphas = (rates * cosine_scale).view(num_branches, 1, 1)
+        S_branches = (1.0 - alphas) * S_branches + alphas * s_batch.unsqueeze(0)
+        N_branches = (1.0 - alphas) * N_branches + alphas * n_batch.unsqueeze(0)
+
+        # Activity-gated branch simplex: busy clusters use fast branches, rare clusters lean on slow memory
+        activity = n_batch / torch.clamp(n_batch.mean(), min=1e-6)  # (k, 1)
+        branch_logits = (activity.squeeze(1).unsqueeze(0) - 1.0) * torch.linspace(-1.5, 1.5, num_branches, device=X.device).unsqueeze(1)
+        branch_w = torch.softmax(branch_logits, dim=0).unsqueeze(-1)  # (M, k, 1)
+
+        C_branches = S_branches / torch.clamp(N_branches, min=1e-6)
+        C = (branch_w * C_branches).sum(dim=0).to(C.dtype)
+
+    return _lloyd_step_cublas(X, C)
+
+
+def run_hybrid_v14_multiscale(X: torch.Tensor, k: int, epochs: float = 0.5) -> torch.Tensor:
+    seed_C = run_engine_v10_fast(X, k=k, use_guarded_island=False)
+    return _multiscale_damped_emeans_refine(X, seed_C, epochs=epochs)
+
+# =====================================================================
+# Experiment Branch v15: Chunked Damped-Lloyd (Benchmarked on (N, D))
+# =====================================================================
+
+def _estimate_damping_lam(X: torch.Tensor, C: torch.Tensor, damp_scale: float = 2.0) -> torch.Tensor:
+    n = X.shape[0]
+    probe = X[torch.randint(0, n, (min(4096, n),), device=X.device)].float()
+    C_f32 = C.float()
+    c_half = 0.5 * (C_f32 * C_f32).sum(dim=1)
+    max_score = torch.max(torch.addmm(-c_half, probe, C_f32.T), dim=1).values
+    dist_sq = torch.clamp((probe * probe).sum(dim=1) - 2.0 * max_score, min=0.0)
+    return torch.clamp(damp_scale * torch.median(dist_sq), min=1e-4)
+
+
+def _damped_lloyd_step_cublas(
+    X: torch.Tensor,
+    C: torch.Tensor,
+    damp_scale: float = 2.0,
+    lam: torch.Tensor = None,
+    chunk_size: int = 65536,
+) -> torch.Tensor:
+    n, d = X.shape
+    k = C.shape[0]
+    if lam is None:
+        lam = _estimate_damping_lam(X, C, damp_scale=damp_scale)
+
+    C_f32 = C.float()
+    c_half_norm = 0.5 * (C_f32 * C_f32).sum(dim=1)
+
+    new_C = torch.zeros(k, d, device=X.device, dtype=torch.float32)
+    counts = torch.zeros(k, 1, device=X.device, dtype=torch.float32)
+
+    for i in range(0, n, chunk_size):
+        X_chunk = X[i : i + chunk_size]
+        X_f32 = X_chunk.float() if X_chunk.dtype != torch.float32 else X_chunk
+        scores = torch.addmm(-c_half_norm, X_f32, C_f32.T)
+        max_score, assign = torch.max(scores, dim=1)
+
+        x_sq = (X_f32 * X_f32).sum(dim=1)
+        dist_sq = torch.clamp(x_sq - 2.0 * max_score, min=0.0)
+        w = (lam / (dist_sq + lam)).to(X_chunk.dtype)
+
+        O_chunk = torch.zeros(X_chunk.shape[0], k, device=X.device, dtype=X_chunk.dtype)
+        O_chunk.scatter_(1, assign.unsqueeze(1), w.unsqueeze(1))
+
+        new_C += (O_chunk.T @ X_chunk).float()
+        counts += O_chunk.float().sum(dim=0, keepdim=True).T
+
+    dead_mask = (counts < 1e-6)
+    updated_C = new_C / torch.clamp(counts, min=1e-6)
+    return torch.where(dead_mask, C_f32, updated_C).to(C.dtype)
+
+
+def run_damped_lloyd_kmeans(X: torch.Tensor, k: int, iters: int = 15, damp_scale: float = 2.0) -> torch.Tensor:
+    n = X.shape[0]
+    C = X[torch.randint(0, n, (k,), device=X.device)].clone()
+    for _ in range(iters):
+        C = _damped_lloyd_step_cublas(X, C, damp_scale=damp_scale)
+    return C
+
+
+def run_hybrid_v15_damped_2lloyd(X: torch.Tensor, k: int, damp_scale: float = 2.0) -> torch.Tensor:
+    C = run_engine_v10_fast(X, k=k, use_guarded_island=False)
+    C = _damped_lloyd_step_cublas(X, C, damp_scale=damp_scale)
+    return _damped_lloyd_step_cublas(X, C, damp_scale=damp_scale)
+
+
+
+def run_hybrid_v13_damped_lloyd(X: torch.Tensor, k: int, damp_scale: float = 2.0) -> torch.Tensor:
+    seed_C = run_engine_v10_fast(X, k=k, use_guarded_island=False)
+    return _damped_lloyd_step_cublas(X, seed_C, damp_scale=damp_scale)
+
+
+# =====================================================================
+# 5. Diverse Task Generators
+# =====================================================================
+
+def make_task_isolated_blobs(N: int, D: int, K: int):
+    """Task 1: Separated isotropic Gaussian islands + 20 extreme outliers."""
+    total_n = N + 20
+    X = torch.empty((total_n, D), device=device, dtype=torch.float32)
+    pts_per_k = N // K
+    for i in range(K):
+        center = torch.randn(D, device=device) * 4.0
+        torch.randn(pts_per_k, D, device=device, out=X[i * pts_per_k : (i + 1) * pts_per_k])
+        X[i * pts_per_k : (i + 1) * pts_per_k].add_(center)
+    if pts_per_k * K < N:
+        X[pts_per_k * K : N] = X[: N - pts_per_k * K]
+    torch.randn(20, D, device=device, out=X[N:]).mul_(35.0)
+    core_mask = torch.zeros(total_n, dtype=torch.bool, device=device)
+    core_mask[:N] = True
+    return X, core_mask
+
+def make_task_l2_manifold(N: int, D: int, K: int):
+    """Task 2: Continuous L2-normalized embedding manifold with Zipfian hubs (DINO/CLIP-like)."""
+    latent_rank = 64
+    num_topics = 256
+    # Orthonormal projection from 64D latent manifold into D=1024
+    Q, _ = torch.linalg.qr(torch.randn(D, latent_rank, device=device))
+    U = Q.T  # (64, D)
+
+    topic_centers = torch.randn(num_topics, latent_rank, device=device)
+    topic_centers /= topic_centers.norm(dim=1, keepdim=True)
+
+    # Zipfian topic popularity
+    probs = (torch.arange(num_topics, device=device, dtype=torch.float32) + 2.0) ** -1.1
+    probs /= probs.sum()
+    topic_ids = torch.multinomial(probs, N, replacement=True)
+
+    # Overlapping manifold spread + slight ambient noise, then L2-normalized
+    Z = topic_centers[topic_ids] + torch.randn(N, latent_rank, device=device) * 0.42
+    X = Z @ U + torch.randn(N, D, device=device) * 0.015
+    X /= torch.clamp(X.norm(dim=1, keepdim=True), min=1e-8)
+    return X, None
+
+def make_task_anisotropic_subspace(N: int, D: int, K: int):
+    """Task 3: Rotated high-condition-number subspace ('pancakes & needles')."""
+    Q, _ = torch.linalg.qr(torch.randn(D, D, device=device))
+    eig_scales = 10.0 * (0.985 ** torch.arange(D, device=device, dtype=torch.float32)) + 0.15
+
+    X = torch.empty((N, D), device=device, dtype=torch.float32)
+    pts_per_k = N // K
+    for i in range(K):
+        center = (torch.randn(D, device=device) * eig_scales) @ Q
+        local_scales = eig_scales * 0.25
+        noise = (torch.randn(pts_per_k, D, device=device) * local_scales) @ Q
+        X[i * pts_per_k : (i + 1) * pts_per_k] = noise + center
+    if pts_per_k * K < N:
+        X[pts_per_k * K : N] = X[: N - pts_per_k * K]
+
+    perm = torch.randperm(N, device=device)
+    return X[perm], None
+
+def make_task_heavy_tail_trap(N: int, D: int, K: int):
+    """Task 4: 96% tight core clusters + 4% diffuse noise (exceeds 99th-percentile cap)."""
+    n_core = int(0.96 * N)
+    n_noise = N - n_core
+
+    X = torch.empty((N, D), device=device, dtype=torch.float32)
+    pts_per_k = n_core // K
+    for i in range(K):
+        center = torch.randn(D, device=device) * 3.0
+        torch.randn(pts_per_k, D, device=device, out=X[i * pts_per_k : (i + 1) * pts_per_k])
+        X[i * pts_per_k : (i + 1) * pts_per_k].add_(center)
+    if pts_per_k * K < n_core:
+        X[pts_per_k * K : n_core] = X[: n_core - pts_per_k * K]
+
+    # 4% diffuse background clutter
+    torch.randn(n_noise, D, device=device, out=X[n_core:]).mul_(10.0)
+
+    core_mask = torch.zeros(N, dtype=torch.bool, device=device)
+    core_mask[:n_core] = True
+
+    perm = torch.randperm(N, device=device)
+    return X[perm], core_mask[perm]
+
+def make_task_extreme_imbalance(N: int, D: int, K: int):
+    """Task 5: 75% of points in 2 wide giants + 25% in (K-2) tight dwarfs."""
+    n_giants = int(0.75 * N)
+    n_dwarfs = N - n_giants
+    X = torch.empty((N, D), device=device, dtype=torch.float32)
+
+    # 2 giant wide clouds
+    g_pts = n_giants // 2
+    for g in range(2):
+        center = torch.randn(D, device=device) * 4.0
+        start = g * g_pts
+        end = (g + 1) * g_pts if g == 0 else n_giants
+        torch.randn(end - start, D, device=device, out=X[start:end]).mul_(3.2).add_(center)
+
+    # (K - 2) small tight clusters
+    num_dwarfs = max(1, K - 2)
+    d_pts = n_dwarfs // num_dwarfs
+    for i in range(num_dwarfs):
+        center = torch.randn(D, device=device) * 4.0
+        start = n_giants + i * d_pts
+        end = n_giants + (i + 1) * d_pts if i < num_dwarfs - 1 else N
+        torch.randn(end - start, D, device=device, out=X[start:end]).mul_(0.6).add_(center)
+
+    perm = torch.randperm(N, device=device)
+    return X[perm], None
+
+# =====================================================================
+# 6. Multi-Task Benchmark Runner
+# =====================================================================
+
+def evaluate_mse(X: torch.Tensor, centroids: torch.Tensor, core_mask: torch.Tensor = None):
     chunk_size = 32768
-    total_mse = 0.0
+    total_sq = 0.0
+    core_sq = 0.0
     n = X.shape[0]
     for i in range(0, n, chunk_size):
         chunk = X[i:i + chunk_size]
         dists = torch.cdist(chunk, centroids, p=2)
-        total_mse += torch.min(dists * dists, dim=1).values.sum().item()
-    return total_mse / n
+        min_sq = torch.min(dists * dists, dim=1).values
+        total_sq += min_sq.sum().item()
+        if core_mask is not None:
+            core_sq += min_sq[core_mask[i:i + chunk_size]].sum().item()
+    total_mse = total_sq / n
+    core_mse = (core_sq / core_mask.sum().item()) if core_mask is not None else None
+    return total_mse, core_mse
 
 def run_benchmark():
-    configs = [
-        {"N": 640000, "D": 1024, "K": 16},
-        {"N": 640000, "D": 1024, "K": 64},
+    tasks = [
+        {"title": "Task 1a: Isolated Gaussian Blobs + 20 Outliers", "fn": make_task_isolated_blobs, "N": 640000, "D": 1024, "K": 16},
+        {"title": "Task 1b: Isolated Gaussian Blobs + 20 Outliers", "fn": make_task_isolated_blobs, "N": 640000, "D": 1024, "K": 64},
+        {"title": "Task 2: L2-Normalized Manifold (Zipfian Hubs)",   "fn": make_task_l2_manifold,      "N": 640000, "D": 1024, "K": 64},
+        {"title": "Task 3: Rotated Anisotropic Subspace",            "fn": make_task_anisotropic_subspace, "N": 640000, "D": 1024, "K": 64},
+        {"title": "Task 4: 96% Tight Core + 4% Heavy-Tail Clutter",  "fn": make_task_heavy_tail_trap,  "N": 640000, "D": 1024, "K": 64},
+        {"title": "Task 5: Extreme Imbalance (2 Giants + 62 Dwarfs)","fn": make_task_extreme_imbalance,"N": 640000, "D": 1024, "K": 64},
     ]
-    
+
     print(f"Hardware: {device.type.upper()} ({torch.cuda.get_device_name(0) if device.type == 'cuda' else 'CPU'})")
 
     algos = [
-        ("1. Classic Lloyd k-means (15 iters)", lambda x, k: run_lloyd_kmeans(x, k, iters=15)),
-        ("2. Annoy Divisive (Power-Iter + Midpoint)", lambda x, k: run_divisive_tree(x, k, split_rule="midpoint")),
-        ("3. RP-Tree Divisive (Power-Iter + Median)", lambda x, k: run_divisive_tree(x, k, split_rule="median")),
-        ("4. Engine v3 (Sequential Island Slicing)", lambda x, k: run_divisive_tree(x, k, split_rule="dense_island")),
-        ("5. HYBRID v3 (Engine v3 -> e-means 1.0ep)", lambda x, k: run_hybrid_v3(x, k)),
-        ("6. Raw e-means (1.0 epochs)", lambda x, k: run_emeans(x, k, epochs=1.0)),
-        ("7. Raw e-means (2.0 epochs)", lambda x, k: run_emeans(x, k, epochs=2.0)),
-        ("8. Raw e-means (3.0 epochs)", lambda x, k: run_emeans(x, k, epochs=3.0)),
-        ("9. Raw e-means (5.0 epochs)", lambda x, k: run_emeans(x, k, epochs=5.0)),
-        ("10. Engine v5 (Residual Power Seeding)", lambda x, k: run_engine_v5_residual(x, k)),
-        ("11. HYBRID v5 (Engine v5 -> e-means 1.0ep)", lambda x, k: run_hybrid_v5(x, k)),
+        #("1. Classic Lloyd k-means (15 iters)",         lambda x, k: run_lloyd_kmeans(x, k, iters=15)),
+        #("2. Annoy Divisive (Power-Iter + Midpoint)", lambda x, k: run_divisive_tree(x, k, split_rule="midpoint")),
+        #("3. RP-Tree Divisive (Power-Iter + Median)", lambda x, k: run_divisive_tree(x, k, split_rule="median")),
+        ##("4. Engine v3 (Sequential Island Slicing)",  lambda x, k: run_divisive_tree(x, k, split_rule="dense_island")),
+        ##("5. HYBRID v3 (Engine v3 -> e-means 1.0ep)", lambda x, k: run_hybrid_v3(x, k)),
+        #("10. og e-means (1.0 epochs)",               lambda x, k: run_original_emeans(x, k, epochs=1.0)),#unstable over more than 1 epoch
+        #("11. og e-means (2.0 epochs)",               lambda x, k: run_original_emeans(x, k, epochs=2.0)),
+        #("12. og e-means (3.0 epochs)",               lambda x, k: run_original_emeans(x, k, epochs=3.0)),
+        #("13. og e-means (5.0 epochs)",               lambda x, k: run_original_emeans(x, k, epochs=5.0)),
+        #("6. mod e-means (1.0 epochs)",               lambda x, k: run_modified_emeans(x, k, epochs=1.0)),#more stable
+        #("7. mod e-means (2.0 epochs)",               lambda x, k: run_modified_emeans(x, k, epochs=2.0)),#more stable
+        #("8. mod e-means (3.0 epochs)",               lambda x, k: run_modified_emeans(x, k, epochs=3.0)),#more stable
+        #("9. mod e-means (5.0 epochs)",               lambda x, k: run_modified_emeans(x, k, epochs=5.0)),#more stable
+        #("14. Engine v5 (Residual Power Seeding)",      lambda x, k: run_engine_v5_residual(x, k)), #best fast
+        #("15. HYBRID v5 (Engine v5 -> e-means 1.0ep)",  lambda x, k: run_hybrid_v5(x, k)),          #fast and most robust, half the mse in task3 vs anything else.
+        #("16. Engine v6 (Sync-Free SSE + Island)",      lambda x, k: run_engine_v6_sse(x, k)),
+        #("17. HYBRID v6 (v6 -> e-means 1.0ep)",         lambda x, k: run_hybrid_v6(x, k, epochs=1.0)),
+        #("18. HYBRID v6-rob (q95 SSE -> e-means 1ep)",lambda x, k: run_hybrid_v6(x, k, epochs=1.0, robust_cap_q=0.95)),
+        #("19. Engine v7 (Batched log2 PDDP)",         lambda x, k: run_engine_v7_batched_pddp(x, k)),
+        #("20. HYBRID v7 (v7 -> e-means 1.0ep)",       lambda x, k: run_hybrid_v7(x, k, epochs=1.0)),
+        #("21. HYBRID v7-fast (v7 -> e-means 0.5ep)",  lambda x, k: run_hybrid_v7(x, k, epochs=0.5)),
+        #("22. Engine v9 (Batched Priority + Island)", lambda x, k: run_engine_v9_priority_island(x, k)),
+        #("23. HYBRID v9-warm (v9 -> warm 0.5ep)",     lambda x, k: run_hybrid_v9_warm(x, k, epochs=0.5)),
+        #("24. HYBRID v9-2lloyd (v9 -> 2x Lloyd)",     lambda x, k: run_hybrid_v9_2lloyd(x, k)),
+        #("24. HYBRID abl islands",                      lambda x, k: run_engine_v9_ablation(x, k,use_island=True,verbose=True)),
+        #("24. HYBRID abl no islands",                   lambda x, k: run_engine_v9_ablation(x, k,verbose=True)),
+        #("25. Engine v10 (No-Island Priority PDDP)",  lambda x, k: run_engine_v10_fast(x, k, use_guarded_island=False)),
+        #("26. HYBRID v10-1lloyd (No-Island -> 1xL)",  lambda x, k: run_hybrid_v10_1lloyd(x, k, use_guarded_island=False)),
+        #("27. HYBRID v10-warm (No-Island -> 0.5ep)",  lambda x, k: run_hybrid_v10_warm(x, k, epochs=0.5, use_guarded_island=False)),
+        #("28. HYBRID v10-guard (10%-Guard -> 0.5ep)", lambda x, k: run_hybrid_v10_warm(x, k, epochs=0.5, use_guarded_island=True)),
+        #("29. HYBRID v11 (v10 -> warm+rev0.15 0.5ep)", lambda x, k: run_hybrid_v11(x, k, epochs=0.5, revive_thresh=0.15)),
+        #("30. HYBRID v11-fast (v10 -> warm+rev 0.35ep)",lambda x, k: run_hybrid_v11(x, k, epochs=0.35, revive_thresh=0.15)),
+        #("31. HYBRID v12-1/8 (PDDP+q95 D2 -> 0.5ep)",   lambda x, k: run_hybrid_v12(x, k, tail_frac=0.125, epochs=0.5)),
+        #("32. HYBRID v12-1/4 (PDDP+q95 D2 -> 0.5ep)",   lambda x, k: run_hybrid_v12(x, k, tail_frac=0.25, epochs=0.5)),
+        #("33. HYBRID v13",                               lambda x, k: run_hybrid_v13_damped(x, k, epochs=0.5)),
+        #("34. HYBRID v14",                               lambda x, k: run_hybrid_v14_multiscale(x, k, epochs=0.5)),
+        ("35. Damped Lloyd k-means (15 iters)",          lambda x, k: run_damped_lloyd_kmeans(x, k, iters=15)),
+        ("36. HYBRID v15 (v10 -> 2x Damped Lloyd)",      lambda x, k: run_hybrid_v15_damped_2lloyd(x, k)),
+        ("36. HYBRID v13 (v10 -> 1x Damped Lloyd)",      lambda x, k: run_hybrid_v13_damped_lloyd(x, k)),
+
     ]
 
-    for cfg in configs:
+    compiled_warmup = False
+
+    for cfg in tasks:
         N, D, K = cfg["N"], cfg["D"], cfg["K"]
-        print(f"\nData scale: N={N:,} points | Dimension={D} | Target Clusters k={K}")
-        print(f"{'Algorithm':<44} | {'Time (ms)':<10} | {'MSE (Distortion)':<16} | {'Speedup'}")
-        print("-" * 84)
-
         torch.manual_seed(42)
-        total_n = N + 20
-        X = torch.empty((total_n, D), device=device, dtype=torch.float32)
-        pts_per_k = N // K
-        for i in range(K):
-            center = torch.randn(D, device=device) * 4.0
-            torch.randn(pts_per_k, D, device=device, out=X[i * pts_per_k : (i + 1) * pts_per_k])
-            X[i * pts_per_k : (i + 1) * pts_per_k].add_(center)
-        torch.randn(20, D, device=device, out=X[N:]).mul_(35.0)
+        X, core_mask = cfg["fn"](N, D, K)
+        has_core = core_mask is not None
 
-        _ = power_iteration_step_compiled(X[:4096], torch.randn(D, device=device, dtype=X.dtype), X[:4096].mean(dim=0))
+        if not compiled_warmup:
+            _ = power_iteration_step_compiled(
+                X[:4096],
+                torch.randn(D, device=device, dtype=X.dtype),
+                X[:4096].mean(dim=0),
+            )
+            compiled_warmup = True
+
+        print(f"\n=== {cfg['title']} (N={X.shape[0]:,} | D={D} | k={K}) ===")
+        if has_core:
+            print(f"{'Algorithm':<44} | {'Time (ms)':<10} | {'Total MSE':<13} | {'Core MSE':<13} | {'Speedup'}")
+            print("-" * 100)
+        else:
+            print(f"{'Algorithm':<44} | {'Time (ms)':<10} | {'MSE (Distortion)':<16} | {'Speedup'}")
+            print("-" * 84)
 
         if device.type == "cuda":
             torch.cuda.synchronize()
@@ -376,14 +1558,262 @@ def run_benchmark():
             if "Lloyd" in name:
                 lloyd_time = elapsed_ms
 
-            mse = evaluate_mse(X, centroids)
+            total_mse, core_mse = evaluate_mse(X, centroids, core_mask)
             speedup_str = f"{lloyd_time / elapsed_ms:.1f}x" if (lloyd_time and elapsed_ms > 0) else "1.0x"
-            print(f"{name:<44} | {elapsed_ms:<10.2f} | {mse:<16.3f} | {speedup_str}")
 
-        del X
+            if has_core:
+                print(f"{name:<44} | {elapsed_ms:<10.2f} | {total_mse:<13.4f} | {core_mse:<13.4f} | {speedup_str}")
+            else:
+                print(f"{name:<44} | {elapsed_ms:<10.2f} | {total_mse:<16.4f} | {speedup_str}")
+
+        del X, core_mask
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     torch.set_float32_matmul_precision('high')
     run_benchmark()
+
+#results
+
+#Hardware: CUDA (NVIDIA GeForce RTX 3060)
+#
+#=== Task 1a: Isolated Gaussian Blobs + 20 Outliers (N=640,020 | D=1024 | k=16) ===
+#Algorithm                                    | Time (ms)  | Total MSE     | Core MSE      | Speedup
+#----------------------------------------------------------------------------------------------------
+#1. Classic Lloyd k-means (15 iters)          | 378.13     | 3041.6110     | 3001.9409     | 1.0x
+#2. Annoy Divisive (Power-Iter + Midpoint)    | 186.84     | 1106.6349     | 1066.8946     | 2.0x
+#3. RP-Tree Divisive (Power-Iter + Median)    | 178.47     | 1097.6849     | 1057.9424     | 2.1x
+#4. Engine v3 (Sequential Island Slicing)     | 194.74     | 1099.2204     | 1059.4727     | 1.9x
+#5. HYBRID v3 (Engine v3 -> e-means 1.0ep)    | 272.34     | 1063.0791     | 1023.3272     | 1.4x
+#10. og e-means (1.0 epochs)                  | 120.63     | 3040.0420     | 3000.3691     | 3.1x
+#11. og e-means (2.0 epochs)                  | 116.66     | 2040.8099     | 2001.1078     | 3.2x
+#12. og e-means (3.0 epochs)                  | 165.39     | 1063.0791     | 1023.3272     | 2.3x
+#13. og e-means (5.0 epochs)                  | 218.58     | 2975.1917     | 2935.5485     | 1.7x
+#6. mod e-means (1.0 epochs)                  | 134.01     | 1063.0791     | 1023.3272     | 2.8x
+#7. mod e-means (2.0 epochs)                  | 113.68     | 1063.0791     | 1023.3272     | 3.3x
+#8. mod e-means (3.0 epochs)                  | 163.08     | 1063.0791     | 1023.3272     | 2.3x
+#9. mod e-means (5.0 epochs)                  | 241.17     | 2988.6904     | 2949.0220     | 1.6x
+#14. Engine v5 (Residual Power Seeding)       | 86.61      | 1066.3125     | 1026.5592     | 4.4x
+#15. HYBRID v5 (Engine v5 -> e-means 1.0ep)   | 160.80     | 1063.0791     | 1023.3272     | 2.4x
+#16. Engine v6 (Sync-Free SSE + Island)       | 80.73      | 1063.5214     | 1023.7722     | 4.7x
+#17. HYBRID v6 (v6 -> e-means 1.0ep)          | 128.48     | 1063.0791     | 1023.3272     | 2.9x
+#18. HYBRID v6-rob (q95 SSE -> e-means 1ep)   | 138.63     | 1063.0791     | 1023.3272     | 2.7x
+#19. Engine v7 (Batched log2 PDDP)            | 11.00      | 3143.7210     | 3104.0673     | 34.4x
+#20. HYBRID v7 (v7 -> e-means 1.0ep)          | 91.57      | 1063.0791     | 1023.3272     | 4.1x
+#21. HYBRID v7-fast (v7 -> e-means 0.5ep)     | 72.32      | 1063.0791     | 1023.3272     | 5.2x
+#22. Engine v9 (Batched Priority + Island)    | 17.23      | 7071.8569     | 7032.3531     | 22.0x
+#23. HYBRID v9-warm (v9 -> warm 0.5ep)        | 67.88      | 9121.4248     | 9083.6752     | 5.6x
+#24. HYBRID v9-2lloyd (v9 -> 2x Lloyd)        | 55.49      | 6076.3200     | 6040.8466     | 1.0x
+#24. HYBRID abl islands                       | 17.52      | 6135.8884     | 6096.3444     | 3.2x
+#24. HYBRID abl no islands                    | 14.56      | 1065.9065     | 1026.1533     | 3.8x
+#25. Engine v10 (No-Island Priority PDDP)     | 14.25      | 1124.9178     | 1085.1676     | 3.9x
+#26. HYBRID v10-1lloyd (No-Island -> 1xL)     | 34.62      | 1063.1051     | 1023.3529     | 1.6x
+#27. HYBRID v10-warm (No-Island -> 0.5ep)     | 65.37      | 1063.0791     | 1023.3272     | 0.8x
+#28. HYBRID v10-guard (10%-Guard -> 0.5ep)    | 75.27      | 5058.8175     | 5019.2358     | 0.7x
+#29. HYBRID v11 (v10 -> warm+rev0.15 0.5ep)   | 77.71      | 1063.0791     | 1023.3272     | 0.7x
+#30. HYBRID v11-fast (v10 -> warm+rev 0.35ep) | 76.21      | 1063.0791     | 1023.3272     | 0.7x
+#31. HYBRID v12-1/8 (PDDP+q95 D2 -> 0.5ep)    | 73.28      | 1063.0791     | 1023.3272     | 0.8x
+#32. HYBRID v12-1/4 (PDDP+q95 D2 -> 0.5ep)    | 69.07      | 2048.0626     | 2010.2307     | 0.8x
+#33. HYBRID v13                               | 75.69      | 1063.0791     | 1023.3272     | 0.7x
+#33. HYBRID v14                               | 98.44      | 1063.0791     | 1023.3272     | 0.6x
+#
+#=== Task 1b: Isolated Gaussian Blobs + 20 Outliers (N=640,020 | D=1024 | k=64) ===
+#Algorithm                                    | Time (ms)  | Total MSE     | Core MSE      | Speedup
+#----------------------------------------------------------------------------------------------------
+#1. Classic Lloyd k-means (15 iters)          | 382.30     | 3758.4617     | 3722.7886     | 1.0x
+#2. Annoy Divisive (Power-Iter + Midpoint)    | 652.19     | 1652.4726     | 1612.6413     | 0.6x
+#3. RP-Tree Divisive (Power-Iter + Median)    | 573.78     | 2552.7824     | 2512.9937     | 0.7x
+#4. Engine v3 (Sequential Island Slicing)     | 666.86     | 1582.1265     | 1542.2817     | 0.6x
+#5. HYBRID v3 (Engine v3 -> e-means 1.0ep)    | 758.41     | 1064.0215     | 1024.1551     | 0.5x
+#10. og e-means (1.0 epochs)                  | 84.63      | 1800.6818     | 1760.8436     | 4.5x
+#11. og e-means (2.0 epochs)                  | 136.21     | 1806.7110     | 1766.8753     | 2.8x
+#12. og e-means (3.0 epochs)                  | 166.12     | 1825.6972     | 1785.8607     | 2.3x
+#13. og e-means (5.0 epochs)                  | 239.09     | 2273.3734     | 2233.5403     | 1.6x
+#6. mod e-means (1.0 epochs)                  | 87.72      | 1064.0215     | 1024.1551     | 4.4x
+#7. mod e-means (2.0 epochs)                  | 127.82     | 1064.0215     | 1024.1551     | 3.0x
+#8. mod e-means (3.0 epochs)                  | 169.88     | 1064.0215     | 1024.1551     | 2.3x
+#9. mod e-means (5.0 epochs)                  | 253.77     | 1064.0215     | 1024.1551     | 1.5x
+#14. Engine v5 (Residual Power Seeding)       | 257.72     | 1335.6925     | 1297.7965     | 1.5x
+#15. HYBRID v5 (Engine v5 -> e-means 1.0ep)   | 328.20     | 1064.0215     | 1024.1551     | 1.2x
+#16. Engine v6 (Sync-Free SSE + Island)       | 213.26     | 1067.3763     | 1027.5016     | 1.8x
+#17. HYBRID v6 (v6 -> e-means 1.0ep)          | 291.14     | 1064.0215     | 1024.1551     | 1.3x
+#18. HYBRID v6-rob (q95 SSE -> e-means 1ep)   | 314.24     | 1064.0271     | 1024.1607     | 1.2x
+#19. Engine v7 (Batched log2 PDDP)            | 16.04      | 3872.1659     | 3832.4051     | 23.8x
+#20. HYBRID v7 (v7 -> e-means 1.0ep)          | 100.99     | 1064.0271     | 1024.1607     | 3.8x
+#21. HYBRID v7-fast (v7 -> e-means 0.5ep)     | 78.46      | 1064.0215     | 1024.1551     | 4.9x
+#22. Engine v9 (Batched Priority + Island)    | 27.08      | 13084.8307    | 13045.2330    | 14.1x
+#23. HYBRID v9-warm (v9 -> warm 0.5ep)        | 78.65      | 13609.0989    | 13581.0844    | 4.9x
+#24. HYBRID v9-2lloyd (v9 -> 2x Lloyd)        | 81.26      | 14072.7642    | 14044.0030    | 1.0x
+#24. HYBRID abl islands                       | 26.06      | 14332.5983    | 14293.0381    | 3.1x
+#24. HYBRID abl no islands                    | 23.25      | 1077.8967     | 1038.0261     | 3.5x
+#25. Engine v10 (No-Island Priority PDDP)     | 23.40      | 1086.4295     | 1046.5583     | 3.5x
+#26. HYBRID v10-1lloyd (No-Island -> 1xL)     | 49.95      | 1064.0057     | 1024.1387     | 1.6x
+#27. HYBRID v10-warm (No-Island -> 0.5ep)     | 75.30      | 1064.0215     | 1024.1551     | 1.1x
+#28. HYBRID v10-guard (10%-Guard -> 0.5ep)    | 79.67      | 3607.6144     | 3567.8434     | 1.0x
+#29. HYBRID v11 (v10 -> warm+rev0.15 0.5ep)   | 81.31      | 1064.0271     | 1024.1607     | 1.0x
+#30. HYBRID v11-fast (v10 -> warm+rev 0.35ep) | 78.97      | 1064.0271     | 1024.1607     | 1.0x
+#31. HYBRID v12-1/8 (PDDP+q95 D2 -> 0.5ep)    | 80.05      | 1817.5128     | 1779.4492     | 1.0x
+#32. HYBRID v12-1/4 (PDDP+q95 D2 -> 0.5ep)    | 86.23      | 2560.4578     | 2522.5154     | 0.9x
+#33. HYBRID v13                               | 90.27      | 1064.0016     | 1024.1351     | 0.9x
+#33. HYBRID v14                               | 102.20     | 1064.0215     | 1024.1551     | 0.8x
+#
+#=== Task 2: L2-Normalized Manifold (Zipfian Hubs) (N=640,000 | D=1024 | k=64) ===
+#Algorithm                                    | Time (ms)  | MSE (Distortion) | Speedup
+#------------------------------------------------------------------------------------
+#1. Classic Lloyd k-means (15 iters)          | 380.60     | 0.8976           | 1.0x
+#2. Annoy Divisive (Power-Iter + Midpoint)    | 574.58     | 0.9141           | 0.7x
+#3. RP-Tree Divisive (Power-Iter + Median)    | 574.77     | 0.9147           | 0.7x
+#4. Engine v3 (Sequential Island Slicing)     | 655.96     | 0.9139           | 0.6x
+#5. HYBRID v3 (Engine v3 -> e-means 1.0ep)    | 753.84     | 0.8956           | 0.5x
+#10. og e-means (1.0 epochs)                  | 79.87      | 0.8956           | 4.8x
+#11. og e-means (2.0 epochs)                  | 120.68     | 0.8948           | 3.2x
+#12. og e-means (3.0 epochs)                  | 158.97     | 0.8944           | 2.4x
+#13. og e-means (5.0 epochs)                  | 233.16     | 0.8942           | 1.6x
+#6. mod e-means (1.0 epochs)                  | 78.97      | 0.8956           | 4.8x
+#7. mod e-means (2.0 epochs)                  | 117.77     | 0.8948           | 3.2x
+#8. mod e-means (3.0 epochs)                  | 159.65     | 0.8945           | 2.4x
+#9. mod e-means (5.0 epochs)                  | 232.34     | 0.8941           | 1.6x
+#14. Engine v5 (Residual Power Seeding)       | 233.61     | 0.9179           | 1.6x
+#15. HYBRID v5 (Engine v5 -> e-means 1.0ep)   | 335.72     | 0.8956           | 1.1x
+#16. Engine v6 (Sync-Free SSE + Island)       | 229.12     | 0.9198           | 1.7x
+#17. HYBRID v6 (v6 -> e-means 1.0ep)          | 299.65     | 0.8953           | 1.3x
+#18. HYBRID v6-rob (q95 SSE -> e-means 1ep)   | 311.88     | 0.8954           | 1.2x
+#19. Engine v7 (Batched log2 PDDP)            | 16.05      | 0.9079           | 23.7x
+#20. HYBRID v7 (v7 -> e-means 1.0ep)          | 93.30      | 0.8956           | 4.1x
+#21. HYBRID v7-fast (v7 -> e-means 0.5ep)     | 74.72      | 0.8968           | 5.1x
+#22. Engine v9 (Batched Priority + Island)    | 27.20      | 0.9184           | 14.0x
+#23. HYBRID v9-warm (v9 -> warm 0.5ep)        | 78.82      | 0.8975           | 4.8x
+#24. HYBRID v9-2lloyd (v9 -> 2x Lloyd)        | 77.80      | 0.9042           | 1.0x
+#24. HYBRID abl islands                       | 26.52      | 0.9178           | 2.9x
+#24. HYBRID abl no islands                    | 23.54      | 0.9077           | 3.3x
+#25. Engine v10 (No-Island Priority PDDP)     | 23.96      | 0.9078           | 3.2x
+#26. HYBRID v10-1lloyd (No-Island -> 1xL)     | 49.85      | 0.9057           | 1.6x
+#27. HYBRID v10-warm (No-Island -> 0.5ep)     | 75.66      | 0.8973           | 1.0x
+#28. HYBRID v10-guard (10%-Guard -> 0.5ep)    | 78.54      | 0.8974           | 1.0x
+#29. HYBRID v11 (v10 -> warm+rev0.15 0.5ep)   | 82.00      | 0.8976           | 0.9x
+#30. HYBRID v11-fast (v10 -> warm+rev 0.35ep) | 78.45      | 0.8975           | 1.0x
+#31. HYBRID v12-1/8 (PDDP+q95 D2 -> 0.5ep)    | 80.50      | 0.9000           | 1.0x
+#32. HYBRID v12-1/4 (PDDP+q95 D2 -> 0.5ep)    | 86.27      | 0.9039           | 0.9x
+#33. HYBRID v13                               | 90.38      | 0.8974           | 0.9x
+#33. HYBRID v14                               | 94.54      | 0.9004           | 0.8x
+#
+#=== Task 3: Rotated Anisotropic Subspace (N=640,000 | D=1024 | k=64) ===
+#Algorithm                                    | Time (ms)  | MSE (Distortion) | Speedup
+#------------------------------------------------------------------------------------
+#1. Classic Lloyd k-means (15 iters)          | 381.45     | 830.6502         | 1.0x
+#2. Annoy Divisive (Power-Iter + Midpoint)    | 575.71     | 452.7610         | 0.7x
+#3. RP-Tree Divisive (Power-Iter + Median)    | 575.82     | 810.5841         | 0.7x
+#4. Engine v3 (Sequential Island Slicing)     | 666.56     | 471.5156         | 0.6x
+#5. HYBRID v3 (Engine v3 -> e-means 1.0ep)    | 761.17     | 278.3763         | 0.5x
+#10. og e-means (1.0 epochs)                  | 81.29      | 808.6921         | 4.7x
+#11. og e-means (2.0 epochs)                  | 120.11     | 731.8621         | 3.2x
+#12. og e-means (3.0 epochs)                  | 162.04     | 831.1373         | 2.4x
+#13. og e-means (5.0 epochs)                  | 233.92     | 747.8395         | 1.6x
+#6. mod e-means (1.0 epochs)                  | 80.57      | 538.8471         | 4.7x
+#7. mod e-means (2.0 epochs)                  | 118.95     | 520.9680         | 3.2x
+#8. mod e-means (3.0 epochs)                  | 159.39     | 696.1522         | 2.4x
+#9. mod e-means (5.0 epochs)                  | 233.16     | 431.9281         | 1.6x
+#14. Engine v5 (Residual Power Seeding)       | 233.21     | 233.6015         | 1.6x
+#15. HYBRID v5 (Engine v5 -> e-means 1.0ep)   | 311.22     | 224.0490         | 1.2x
+#16. Engine v6 (Sync-Free SSE + Island)       | 214.88     | 224.7501         | 1.8x
+#17. HYBRID v6 (v6 -> e-means 1.0ep)          | 295.18     | 224.0490         | 1.3x
+#18. HYBRID v6-rob (q95 SSE -> e-means 1ep)   | 299.20     | 224.0490         | 1.3x
+#19. Engine v7 (Batched log2 PDDP)            | 16.02      | 652.4964         | 23.8x
+#20. HYBRID v7 (v7 -> e-means 1.0ep)          | 94.12      | 772.4771         | 4.1x
+#21. HYBRID v7-fast (v7 -> e-means 0.5ep)     | 75.19      | 565.8873         | 5.1x
+#22. Engine v9 (Batched Priority + Island)    | 27.15      | 2288.3363        | 14.1x
+#23. HYBRID v9-warm (v9 -> warm 0.5ep)        | 78.59      | 2341.9356        | 4.9x
+#24. HYBRID v9-2lloyd (v9 -> 2x Lloyd)        | 78.44      | 2477.5437        | 1.0x
+#24. HYBRID abl islands                       | 27.81      | 2191.5099        | 2.8x
+#24. HYBRID abl no islands                    | 23.57      | 265.3283         | 3.3x
+#25. Engine v10 (No-Island Priority PDDP)     | 23.88      | 226.2767         | 3.3x
+#26. HYBRID v10-1lloyd (No-Island -> 1xL)     | 50.15      | 224.0490         | 1.6x
+#27. HYBRID v10-warm (No-Island -> 0.5ep)     | 75.71      | 224.0490         | 1.0x
+#28. HYBRID v10-guard (10%-Guard -> 0.5ep)    | 78.43      | 702.1773         | 1.0x
+#29. HYBRID v11 (v10 -> warm+rev0.15 0.5ep)   | 81.46      | 224.0490         | 1.0x
+#30. HYBRID v11-fast (v10 -> warm+rev 0.35ep) | 79.01      | 224.0490         | 1.0x
+#31. HYBRID v12-1/8 (PDDP+q95 D2 -> 0.5ep)    | 80.28      | 397.3358         | 1.0x
+#32. HYBRID v12-1/4 (PDDP+q95 D2 -> 0.5ep)    | 85.83      | 524.0550         | 0.9x
+#33. HYBRID v13                               | 90.50      | 224.0490         | 0.9x
+#33. HYBRID v14                               | 95.07      | 224.0490         | 0.8x
+#
+#=== Task 4: 96% Tight Core + 4% Heavy-Tail Clutter (N=640,000 | D=1024 | k=64) ===
+#Algorithm                                    | Time (ms)  | Total MSE     | Core MSE      | Speedup
+#----------------------------------------------------------------------------------------------------
+#1. Classic Lloyd k-means (15 iters)          | 383.55     | 7124.4656     | 3159.3019     | 1.0x
+#2. Annoy Divisive (Power-Iter + Midpoint)    | 571.67     | 5567.2200     | 1479.1834     | 0.7x
+#3. RP-Tree Divisive (Power-Iter + Median)    | 575.97     | 6005.8590     | 1956.4526     | 0.7x
+#4. Engine v3 (Sequential Island Slicing)     | 673.09     | 5566.3277     | 1509.3250     | 0.6x
+#5. HYBRID v3 (Engine v3 -> e-means 1.0ep)    | 761.80     | 5359.0160     | 1315.6774     | 0.5x
+#10. og e-means (1.0 epochs)                  | 85.86      | 5475.8609     | 1437.2246     | 4.5x
+#11. og e-means (2.0 epochs)                  | 124.63     | 5593.4384     | 1559.7034     | 3.1x
+#12. og e-means (3.0 epochs)                  | 164.87     | 5612.9800     | 1586.1772     | 2.3x
+#13. og e-means (5.0 epochs)                  | 243.14     | 5984.3224     | 1970.5811     | 1.6x
+#6. mod e-means (1.0 epochs)                  | 89.94      | 5341.5785     | 1297.5102     | 4.3x
+#7. mod e-means (2.0 epochs)                  | 138.13     | 5427.5293     | 1357.9196     | 2.8x
+#8. mod e-means (3.0 epochs)                  | 179.20     | 5200.7462     | 1150.6325     | 2.1x
+#9. mod e-means (5.0 epochs)                  | 261.03     | 5315.5823     | 1240.4467     | 1.5x
+#14. Engine v5 (Residual Power Seeding)       | 274.27     | 6328.1127     | 2317.9993     | 1.4x
+#15. HYBRID v5 (Engine v5 -> e-means 1.0ep)   | 338.12     | 5483.5851     | 1445.4321     | 1.1x
+#16. Engine v6 (Sync-Free SSE + Island)       | 223.98     | 6634.2581     | 2636.3545     | 1.7x
+#17. HYBRID v6 (v6 -> e-means 1.0ep)          | 309.79     | 5762.9465     | 1736.7685     | 1.2x
+#18. HYBRID v6-rob (q95 SSE -> e-means 1ep)   | 309.41     | 5492.3508     | 1454.5676     | 1.2x
+#19. Engine v7 (Batched log2 PDDP)            | 15.99      | 6574.8395     | 2488.0144     | 24.0x
+#20. HYBRID v7 (v7 -> e-means 1.0ep)          | 108.48     | 5704.0355     | 1641.2879     | 3.5x
+#21. HYBRID v7-fast (v7 -> e-means 0.5ep)     | 83.40      | 5697.0095     | 1630.8148     | 4.6x
+#22. Engine v9 (Batched Priority + Island)    | 26.70      | 11015.9013    | 7199.4084     | 14.4x
+#23. HYBRID v9-warm (v9 -> warm 0.5ep)        | 78.50      | 11981.4977    | 8206.7373     | 4.9x
+#24. HYBRID v9-2lloyd (v9 -> 2x Lloyd)        | 78.45      | 11689.7293    | 7902.3886     | 1.0x
+#24. HYBRID abl islands                       | 27.75      | 11573.1809    | 7780.7832     | 2.8x
+#24. HYBRID abl no islands                    | 23.19      | 5302.8123     | 1105.2206     | 3.4x
+#25. Engine v10 (No-Island Priority PDDP)     | 24.25      | 5298.2623     | 1107.1407     | 3.2x
+#26. HYBRID v10-1lloyd (No-Island -> 1xL)     | 50.53      | 5239.8568     | 1059.9437     | 1.6x
+#27. HYBRID v10-warm (No-Island -> 0.5ep)     | 75.80      | 5175.1992     | 1096.6964     | 1.0x
+#28. HYBRID v10-guard (10%-Guard -> 0.5ep)    | 78.67      | 6490.8700     | 2457.2787     | 1.0x
+#29. HYBRID v11 (v10 -> warm+rev0.15 0.5ep)   | 82.09      | 5182.3268     | 1102.1594     | 1.0x
+#30. HYBRID v11-fast (v10 -> warm+rev 0.35ep) | 79.01      | 5175.4473     | 1096.9541     | 1.0x
+#31. HYBRID v12-1/8 (PDDP+q95 D2 -> 0.5ep)    | 80.66      | 5749.6010     | 1722.3728     | 1.0x
+#32. HYBRID v12-1/4 (PDDP+q95 D2 -> 0.5ep)    | 89.54      | 5878.1100     | 1856.5742     | 0.9x
+#33. HYBRID v13                               | 90.78      | 5256.0061     | 1033.6168     | 0.9x
+#33. HYBRID v14                               | 95.23      | 5256.3858     | 1034.4922     | 0.8x
+#
+#=== Task 5: Extreme Imbalance (2 Giants + 62 Dwarfs) (N=640,000 | D=1024 | k=64) ===
+#Algorithm                                    | Time (ms)  | MSE (Distortion) | Speedup
+#------------------------------------------------------------------------------------
+#1. Classic Lloyd k-means (15 iters)          | 383.69     | 10888.7694       | 1.0x
+#2. Annoy Divisive (Power-Iter + Midpoint)    | 572.69     | 11017.1746       | 0.7x
+#3. RP-Tree Divisive (Power-Iter + Median)    | 572.61     | 10991.9225       | 0.7x
+#4. Engine v3 (Sequential Island Slicing)     | 660.34     | 10740.6822       | 0.6x
+#5. HYBRID v3 (Engine v3 -> e-means 1.0ep)    | 746.09     | 9045.8929        | 0.5x
+#10. og e-means (1.0 epochs)                  | 85.48      | 9799.0886        | 4.5x
+#11. og e-means (2.0 epochs)                  | 123.73     | 10250.8893       | 3.1x
+#12. og e-means (3.0 epochs)                  | 162.98     | 10567.1745       | 2.4x
+#13. og e-means (5.0 epochs)                  | 236.38     | 10394.0012       | 1.6x
+#6. mod e-means (1.0 epochs)                  | 102.49     | 8791.0535        | 3.7x
+#7. mod e-means (2.0 epochs)                  | 134.80     | 9240.6504        | 2.8x
+#8. mod e-means (3.0 epochs)                  | 179.62     | 9598.2402        | 2.1x
+#9. mod e-means (5.0 epochs)                  | 263.11     | 9983.4797        | 1.5x
+#14. Engine v5 (Residual Power Seeding)       | 230.44     | 10027.3399       | 1.7x
+#15. HYBRID v5 (Engine v5 -> e-means 1.0ep)   | 342.55     | 9121.2601        | 1.1x
+#16. Engine v6 (Sync-Free SSE + Island)       | 217.86     | 10547.2951       | 1.8x
+#17. HYBRID v6 (v6 -> e-means 1.0ep)          | 306.06     | 9150.0017        | 1.3x
+#18. HYBRID v6-rob (q95 SSE -> e-means 1ep)   | 310.04     | 8909.9975        | 1.2x
+#19. Engine v7 (Batched log2 PDDP)            | 16.03      | 10941.3298       | 23.9x
+#20. HYBRID v7 (v7 -> e-means 1.0ep)          | 105.39     | 9243.2547        | 3.6x
+#21. HYBRID v7-fast (v7 -> e-means 0.5ep)     | 84.22      | 9279.0798        | 4.6x
+#22. Engine v9 (Batched Priority + Island)    | 26.70      | 11478.2692       | 14.4x
+#23. HYBRID v9-warm (v9 -> warm 0.5ep)        | 78.30      | 11261.4052       | 4.9x
+#24. HYBRID v9-2lloyd (v9 -> 2x Lloyd)        | 77.90      | 11346.9463       | 1.0x
+#24. HYBRID abl islands                       | 25.93      | 11417.8217       | 3.0x
+#24. HYBRID abl no islands                    | 24.50      | 10739.3337       | 3.2x
+#25. Engine v10 (No-Island Priority PDDP)     | 23.88      | 10740.8417       | 3.3x
+#26. HYBRID v10-1lloyd (No-Island -> 1xL)     | 49.95      | 10704.7045       | 1.6x
+#27. HYBRID v10-warm (No-Island -> 0.5ep)     | 75.56      | 10725.4398       | 1.0x
+#28. HYBRID v10-guard (10%-Guard -> 0.5ep)    | 79.29      | 10370.9170       | 1.0x
+#29. HYBRID v11 (v10 -> warm+rev0.15 0.5ep)   | 90.27      | 10649.8447       | 0.9x
+#30. HYBRID v11-fast (v10 -> warm+rev 0.35ep) | 87.66      | 9887.4050        | 0.9x
+#31. HYBRID v12-1/8 (PDDP+q95 D2 -> 0.5ep)    | 80.58      | 10650.4379       | 1.0x
+#32. HYBRID v12-1/4 (PDDP+q95 D2 -> 0.5ep)    | 85.59      | 10671.7108       | 0.9x
+#33. HYBRID v13                               | 89.95      | 10593.6522       | 0.9x
+#33. HYBRID v14                               | 96.06      | 10776.0818       | 0.8x

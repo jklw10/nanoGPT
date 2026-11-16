@@ -218,6 +218,26 @@ class TopKHot(torch.autograd.Function):
         grad_x = F.sigmoid(x) - hard_target
         return grad_x,  None
 
+
+class SparseTopKHot(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x,  k):
+        _, indices = torch.topk(x, k=k, dim=-1)
+        k_hot = torch.zeros_like(x).scatter_(-1, indices, 1.0)
+        ctx.save_for_backward(x)
+        ctx.k = k
+        return k_hot
+
+    @staticmethod
+    def backward(ctx, g):
+        x, = ctx.saved_tensors
+        k = ctx.k
+        with torch.no_grad():
+            _, topk_indices = torch.topk(-g, k=k, dim=-1)
+            hard_target = torch.zeros_like(x).scatter_(-1, topk_indices, 1.0)
+        grad_x = F.sigmoid(x) - hard_target
+        return grad_x,  None
+
 class IMLETopKFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, logits, k, noise_scale, lambda_scale, num_samples):

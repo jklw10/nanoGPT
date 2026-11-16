@@ -1,46 +1,46 @@
 # =====================================================================
 # chess_bot.py
-# High-Throughput Dialectic PATT Chess Bot & Parallel Environment
+# High-Throughput Dialectic PATT Chess Bot (Champion Architecture)
 # =====================================================================
 
 import argparse
 import math
 import os
+import queue
 import shutil
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 # ==========================================
-# 0. CHESS ENVIRONMENT (For Eval & Sparring)
+# 0. CHESS ENVIRONMENT (Fast Tensor Engine)
 # ==========================================
-PIECE_TO_FEN = {
-    0: '', 1: 'P', 2: 'N', 3: 'B', 4: 'R', 5: 'Q', 6: 'K',
-    7: 'p', 8: 'n', 9: 'b', 10: 'r', 11: 'q', 12: 'k'
-}
+PIECE_CHARS = ["", "P", "N", "B", "R", "Q", "K", "p", "n", "b", "r", "q", "k"]
 
-def board_to_fen(board, turn, rights, ep=-1, halfc=0, fulln=1):
+def fast_board_to_fen(board_np, is_w, rights_np, ep, halfc, fulln):
     rows = []
     for r in range(7, -1, -1):
-        empty, r_s = 0, ""
+        empty = 0
+        r_chars = []
         for c in range(8):
-            p = int(board[r, c].item())
+            p = board_np[r, c]
             if p == 0:
                 empty += 1
             else:
                 if empty:
-                    r_s += str(empty)
+                    r_chars.append(str(empty))
                     empty = 0
-                r_s += PIECE_TO_FEN.get(p, '')
+                r_chars.append(PIECE_CHARS[p])
         if empty:
-            r_s += str(empty)
-        rows.append(r_s)
-    c_s = "".join([s for s, has in zip("KQkq", rights) if has]) or "-"
+            r_chars.append(str(empty))
+        rows.append("".join(r_chars))
+    c_s = "".join([c for c, has in zip("KQkq", rights_np) if has]) or "-"
     ep_s = f"{chr(ord('a') + (ep % 8))}{(ep // 8) + 1}" if ep >= 0 else "-"
-    return f"{'/'.join(rows)} {'w' if turn == 0 else 'b'} {c_s} {ep_s} {halfc} {fulln}"
+    return f"{'/'.join(rows)} {'w' if is_w else 'b'} {c_s} {ep_s} {halfc} {fulln}"
 
 def uci_to_action(uci_str):
     if not uci_str or len(uci_str) < 4:
@@ -268,65 +268,92 @@ class GuardrailedTorchChess:
         return dones | w_res | b_res | draws, winners
 
 # ==========================================
-# 1. OPTIMIZED DIALECTIC PATT ARCHITECTURE
+# 1. CHAMPION PATT ARCHITECTURE
 # ==========================================
-def tokenformer_theta(scores: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    scale = 1.0 / math.sqrt(scores.shape[-1])
-    return F.softmax(scores * scale, dim=dim)
-
-class PattLayer(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int, num_tokens: int):
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_f = x.float()
+        out = (x_f * torch.rsqrt(x_f.pow(2).mean(dim=-1, keepdim=True) + self.eps)).to(x.dtype)
+        return out * self.weight
+
+class FlexPattLayer(nn.Module):
+    def __init__(self, input_dim: int, output_dim: int, num_tokens: int, cosine_patt: bool = True):
+        super().__init__()
+        self.cosine_patt = cosine_patt
         self.key_tokens = nn.Parameter(torch.empty(num_tokens, input_dim))
         self.val_tokens = nn.Parameter(torch.empty(num_tokens, output_dim))
         nn.init.kaiming_uniform_(self.key_tokens, a=math.sqrt(5))
-        nn.init.kaiming_uniform_(self.val_tokens, a=math.sqrt(5))
+        if cosine_patt:
+            self.logit_scale = nn.Parameter(torch.tensor(math.log(10.0)))
+            nn.init.normal_(self.val_tokens, std=1.0 / math.sqrt(output_dim))
+        else:
+            nn.init.kaiming_uniform_(self.val_tokens, a=math.sqrt(5))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        scores = x @ self.key_tokens.T
-        attn = tokenformer_theta(scores, dim=-1)
+        if self.cosine_patt:
+            x_n = F.normalize(x.float(), dim=-1).to(x.dtype)
+            k_n = F.normalize(self.key_tokens.float(), dim=-1).to(x.dtype)
+            scale = self.logit_scale.exp().clamp(max=50.0).to(x.dtype)
+            scores = (x_n @ k_n.T) * scale
+        else:
+            scores = (x @ self.key_tokens.T) / math.sqrt(self.key_tokens.shape[0])
+        attn = F.softmax(scores.float(), dim=-1).to(self.val_tokens.dtype)
         return attn @ self.val_tokens
 
-class PattAttentionLayer(nn.Module):
-    def __init__(self, dim: int = 64, num_patt_tokens: int = 128, num_heads: int = 4):
+class SwiGLUFFN(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        hidden = max(32, ((int(dim * 8 / 3) + 15) // 16) * 16)
+        self.w13 = nn.Linear(dim, hidden * 2, bias=False)
+        self.w2 = nn.Linear(hidden, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate, val = self.w13(x).chunk(2, dim=-1)
+        return self.w2(F.silu(gate) * val)
+
+class ModernPattAttentionLayer(nn.Module):
+    """Post-LN + RMSNorm + Wo + QKNorm + SwiGLU + CosinePatt Engine."""
+    def __init__(self, dim: int = 128, num_patt_tokens: int = 256, num_heads: int = 8):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
 
-        self.patt_q = PattLayer(input_dim=dim, output_dim=dim, num_tokens=num_patt_tokens)
-        self.patt_k = PattLayer(input_dim=dim, output_dim=dim, num_tokens=num_patt_tokens)
+        self.patt_q = FlexPattLayer(dim, dim, num_patt_tokens, cosine_patt=True)
+        self.patt_k = FlexPattLayer(dim, dim, num_patt_tokens, cosine_patt=True)
         self.proj_v = nn.Linear(dim, dim, bias=False)
+        self.proj_o = nn.Linear(dim, dim, bias=False)
 
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * 4),
-            nn.SiLU(),
-            nn.Linear(dim * 4, dim)
-        )
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+        self.mlp = SwiGLUFFN(dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, N, D = x.shape
-        x_norm = self.norm1(x)
+        self.norm1 = RMSNorm(dim)
+        self.norm2 = RMSNorm(dim)
 
-        q = self.patt_q(x_norm)
-        k = self.patt_k(x_norm)
-        v = self.proj_v(x_norm)
+    def _attn(self, h: torch.Tensor) -> torch.Tensor:
+        B, N, D = h.shape
+        q = self.patt_q(h).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.patt_k(h).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.proj_v(h).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        q, k = self.q_norm(q), self.k_norm(k)
+        ctx = F.scaled_dot_product_attention(q, k, v)
+        ctx = ctx.transpose(1, 2).reshape(B, N, D)
+        return self.proj_o(ctx)
 
-        q = q.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-
-        context = F.scaled_dot_product_attention(q, k, v)
-        context = context.transpose(1, 2).reshape(B, N, D)
-
-        x = x + context
-        x = x + self.mlp(self.norm2(x))
+    def forward(self, x: torch.Tensor, depth_token: torch.Tensor = None) -> torch.Tensor:
+        h = (x + depth_token) if depth_token is not None else x
+        x = self.norm1(x + self._attn(h))
+        x = self.norm2(x + self.mlp(x))
         return x
 
 class DialecticPattChessBot(nn.Module):
-    def __init__(self, dim: int = 64, num_patt_tokens: int = 128, rollout_steps: int = 4, head_dim: int = 32):
+    def __init__(self, dim: int = 128, num_patt_tokens: int = 256, rollout_steps: int = 6, num_heads: int = 8, head_dim: int = 16):
         super().__init__()
         self.dim = dim
         self.head_dim = head_dim
@@ -337,14 +364,14 @@ class DialecticPattChessBot(nn.Module):
         self.file_embed = nn.Embedding(8, dim)
         self.turn_embed = nn.Embedding(2, dim)
         self.castling_proj = nn.Linear(4, dim, bias=False)
-        self.norm = nn.LayerNorm(dim)
+        self.ply_embed = nn.Embedding(16, dim)
+        self.register_buffer("ply_indices", torch.arange(16), persistent=False)
 
-        self.rollout_layers = nn.ModuleList([
-            PattAttentionLayer(dim=dim, num_patt_tokens=num_patt_tokens, num_heads=4)
-            for _ in range(rollout_steps)
-        ])
+        # Weight-Tied Thesis & Antithesis engines
+        self.thesis_engine = ModernPattAttentionLayer(dim=dim, num_patt_tokens=num_patt_tokens, num_heads=num_heads)
+        self.antithesis_engine = ModernPattAttentionLayer(dim=dim, num_patt_tokens=num_patt_tokens, num_heads=num_heads)
 
-        self.final_norm = nn.LayerNorm(dim)
+        self.final_norm = RMSNorm(dim)
         self.proj_from = nn.Linear(dim, head_dim, bias=False)
         self.proj_to = nn.Linear(dim, head_dim, bias=False)
         self.bias_from = nn.Linear(dim, 1, bias=False)
@@ -365,9 +392,12 @@ class DialecticPattChessBot(nn.Module):
         if castling_rights is not None:
             tokens = tokens + self.castling_proj(castling_rights.float()).unsqueeze(1)
 
-        x = self.norm(tokens)
-        for layer in self.rollout_layers:
-            x = layer(x)
+        x = tokens
+        for ply in range(self.rollout_steps):
+            depth_token = self.ply_embed(self.ply_indices[ply]).view(1, 1, self.dim)
+            engine = self.thesis_engine if (ply % 2 == 0) else self.antithesis_engine
+            x = engine(x, depth_token=depth_token)
+
         x = self.final_norm(x)
 
         q_fr = self.proj_from(x)
@@ -391,8 +421,9 @@ class DialecticPattChessBot(nn.Module):
         return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 # ==========================================
-# 2. STOCKFISH ENGINE INTERFACE
+# 2. FAST STOCKFISH ENGINE & WORKER POOL
 # ==========================================
+#hard error on failure, this is used everywhere. silent stupid is worthless.
 class StockfishEngine:
     def __init__(self, stockfish_path="stockfish", threads=4, hash_mb=128):
         self.path = stockfish_path
@@ -402,192 +433,172 @@ class StockfishEngine:
         self.current_mode = None
         self._spawn()
 
+    def _wait_ready(self, context="isready"):
+        while True:
+            line = self.proc.stdout.readline()
+            if not line:
+                rc = self.proc.poll()
+                raise RuntimeError(f"Stockfish EOF during {context} (exit_code={rc})")
+            if "readyok" in line:
+                return
+
     def _spawn(self):
         if self.proc:
-            try: self.proc.terminate()
-            except Exception: pass
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
         self.proc = subprocess.Popen(
             [self.path],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
-            bufsize=1
+            bufsize=1,
         )
         self._send([
             "uci",
             f"setoption name Threads value {self.threads}",
             f"setoption name Hash value {self.hash_mb}",
-            "isready"
+            "isready",
         ])
-        while "readyok" not in self.proc.stdout.readline():
-            pass
+        self._wait_ready("_spawn")
 
     def _send(self, commands):
+        if self.proc is None or self.proc.poll() is not None:
+            rc = None if self.proc is None else self.proc.poll()
+            raise RuntimeError(f"Cannot send to dead Stockfish process (exit_code={rc})")
         try:
             self.proc.stdin.write("\n".join(commands) + "\n")
             self.proc.stdin.flush()
-        except Exception:
-            pass
+        except Exception as e:
+            raise RuntimeError(f"Stockfish stdin write failed ({commands}): {e}") from e
 
-    def _read_bestmove(self):
+    def _read_bestmove(self, fen=""):
         while True:
             line = self.proc.stdout.readline()
             if not line:
-                return None
+                rc = self.proc.poll()
+                raise RuntimeError(f"Stockfish EOF in _read_bestmove (exit_code={rc}, fen={fen!r})")
             line = line.strip()
             if line.startswith("bestmove"):
                 parts = line.split()
-                return parts[1] if len(parts) > 1 and parts[1] not in ("(none)", "0000") else None
+                bm = parts[1] if len(parts) > 1 else None
+                if not bm or bm in ("(none)", "0000"):
+                    raise RuntimeError(f"Stockfish returned empty bestmove={bm!r} for FEN={fen!r}")
+                return bm
+
+    def _validate_fen_kings(self, fen: str):
+        board_part = fen.split()[0]
+        if "K" not in board_part or "k" not in board_part:
+            raise RuntimeError(f"Corrupted FEN (missing King): {fen!r}")
 
     def set_elo(self, elo: int):
-        """
-        Configures Stockfish to limit its strength to the requested Elo rating.
-        Synchronizes with the engine via 'isready' -> 'readyok'.
-        """
         elo = int(elo)
         mode_key = f"elo_{elo}"
         if self.current_mode == mode_key:
             return
-
         self._send([
             "setoption name UCI_LimitStrength value true",
             f"setoption name UCI_Elo value {elo}",
-            "isready"
+            "isready",
         ])
-        while True:
-            line = self.proc.stdout.readline()
-            if not line or "readyok" in line:
-                break
-
+        self._wait_ready(f"set_elo({elo})")
         self.current_mode = mode_key
 
-    # USE CASE 1: MATCH PLAY (Elo Calibrated)
-    def get_elo_move(self, fen: str, elo: int = 1350, movetime_ms: int = 50):
-        """
-        Stockfish Elo mode: Uses Stockfish's calibrated strength limiter.
-        Does NOT constrain nodes, allowing the Elo curve to function properly.
-        """
-        if "K" not in fen.split()[0] or "k" not in fen.split()[0]:
-            return None
-
+    
+    def get_elo_move(self, fen: str, elo: int = 1350):
+        self._validate_fen_kings(fen)
+        elo = int(elo)
         if self.current_mode != f"elo_{elo}":
             self.set_elo(elo)
+            if elo > 2000:
+                print(
+                    f"[Warning] Elo {elo} > 2000: Skill::pick_best may require depth > 8 "
+                    f"(playing at capped depth 8 instead)."
+                )
+        self._send([f"position fen {fen}", "go depth 8"])
+        return self._read_bestmove(fen=fen)
 
-        self._send([f"position fen {fen}", f"go movetime {movetime_ms}"])
-        return self._read_bestmove()
-
-    # USE CASE 2: DATASET TEACHER (Full Strength, Pure Search)
     def get_teacher_move(self, fen: str, nodes: int = 10000):
-        """
-        Pure Teacher mode: UCI_LimitStrength is completely disabled.
-        Search is dictated purely by the exact node budget.
-        """
-        if "K" not in fen.split()[0] or "k" not in fen.split()[0]:
-            return None
-
+        self._validate_fen_kings(fen)
         if self.current_mode != "teacher":
             self._send([
                 "setoption name UCI_LimitStrength value false",
-                "isready"
+                "isready",
             ])
-            while "readyok" not in self.proc.stdout.readline():
-                pass
+            self._wait_ready("get_teacher_move")
             self.current_mode = "teacher"
-
         self._send([f"position fen {fen}", f"go nodes {nodes}"])
-        return self._read_bestmove()
+        return self._read_bestmove(fen=fen)
 
-    def get_move(self, fen: str, nodes: int = None, movetime_ms: int = None, elo: int = None, **kwargs):
+    def get_move(self, fen: str, nodes: int = None, depth: int = 8, movetime_ms: int = None, elo: int = None, **kwargs):
         if nodes is not None:
             return self.get_teacher_move(fen, nodes=nodes)
-        return self.get_elo_move(fen, elo=elo or 1350, movetime_ms=movetime_ms or 20)
+        return self.get_elo_move(fen, elo=elo or 1350, depth=depth, movetime_ms=movetime_ms)
 
     def close(self):
         if self.proc:
             try:
-                self._send(["quit"])
+                if self.proc.poll() is None:
+                    self.proc.stdin.write("quit\n")
+                    self.proc.stdin.flush()
                 self.proc.terminate()
             except Exception:
                 pass
             self.proc = None
 
-# ==========================================
-# 3. HIGH-SPEED COMPILED TRAINER
-# ==========================================
-def train_offline_stockfish(model, dataset, epochs=10, batch_size=2048, lr=2e-3, device="cuda"):
-    print("\n" + "=" * 90)
-    print(f" ULTRA-FAST OFFLINE TRAINING (Batch: {batch_size} | Pure Unmasked CE)")
-    print("=" * 90)
+class FastStockfishEvalPool:
+    def __init__(self, sf_path, num_workers=8, hash_mb=32):
+        self.num_workers = num_workers
+        self.engine_queue = queue.Queue()
+        self.engines = []
+        for _ in range(num_workers):
+            eng = StockfishEngine(sf_path, threads=1, hash_mb=hash_mb)
+            self.engines.append(eng)
+            self.engine_queue.put(eng)
+        self.pool = ThreadPoolExecutor(max_workers=num_workers)
+        self.current_elo = None
 
-    boards = dataset["boards"]
-    is_white = dataset["is_white"]
-    targets = dataset["targets"]
-    castling = dataset.get("castling_rights", None)
-    dataset_size = targets.shape[0]
+    def set_elo(self, elo: int):
+        elo = int(elo)
+        if self.current_elo == elo:
+            return
+        for eng in self.engines:
+            eng.set_elo(elo)
+        self.current_elo = elo
 
-    effective_size = dataset_size - (dataset_size % batch_size)
-    steps_per_epoch = effective_size // batch_size
-    total_steps = steps_per_epoch * epochs
+    def play_batch(self, tasks, elo: int, movetime_ms: int = 20):
+        if not tasks:
+            return {}
+        self.set_elo(elo)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4, fused=True)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=lr * 0.05)
+        def query(task):
+            idx, fen, legals = task
+            eng = self.engine_queue.get()
+            try:
+                bm = eng.get_elo_move(fen, elo=elo, movetime_ms=movetime_ms)
+                act = uci_to_action(bm) if bm else None
+                return idx, (act if (act is not None and act in legals) else legals[0])
+            finally:
+                self.engine_queue.put(eng)
 
-    amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32
-    print(f"  [Setup] CUDA Device: {torch.cuda.get_device_name(0)} | AMP Type: {amp_dtype}")
-    print(f"  [Volume] {effective_size:,} pos/epoch * {epochs} epochs = {effective_size * epochs:,} total pos")
+        return dict(self.pool.map(query, tasks))
 
-    compiled_model = torch.compile(model, mode="reduce-overhead")
-    compiled_model.train()
-
-    start_t = time.time()
-    global_step = 0
-
-    for epoch in range(1, epochs + 1):
-        perm = torch.randperm(effective_size, device=device)
-        epoch_start_t = time.time()
-        last_loss = 0.0
-
-        for i in range(0, effective_size, batch_size):
-            global_step += 1
-            idx = perm[i:i + batch_size]
-            b, w, y = boards[idx], is_white[idx], targets[idx]
-            c = castling[idx] if castling is not None else None
-
-            optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=(amp_dtype != torch.float32)):
-                logits = compiled_model(b, w, castling_rights=c)
-                loss = F.cross_entropy(logits, y)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            scheduler.step()
-
-            last_loss = loss.item()
-
-            if global_step % max(1, steps_per_epoch // 2) == 0:
-                elapsed = time.time() - start_t
-                pos_processed = global_step * batch_size
-                rate = pos_processed / max(1e-4, elapsed)
-                print(f"   Epoch [{epoch:02d}/{epochs:02d}] Step [{global_step:05d}/{total_steps:05d}] | "
-                      f"Loss: {last_loss:.4f} | Throughput: {rate:8.0f} pos/sec")
-
-        dt = time.time() - epoch_start_t
-        print(f"  --> Epoch {epoch:02d} Completed in {dt:.2f}s ({(effective_size / max(1e-4, dt)):.0f} pos/s) | Final Loss: {last_loss:.4f}")
-
-    total_time = time.time() - start_t
-    print(f"\n[Training Finished] Processed {effective_size * epochs:,} positions in {total_time:.2f}s "
-          f"({(effective_size * epochs / max(1e-4, total_time)):.0f} avg pos/sec)")
+    def close(self):
+        self.pool.shutdown(wait=True)
+        for eng in self.engines:
+            eng.close()
 
 # ==========================================
-# 4. EVALUATION & BENCHMARKING
+# 3. FAST EVALUATION GAUNTLET
 # ==========================================
 @torch.no_grad()
-def evaluate_model_elo(model, sf_engine, elo=1350, games=32, max_plies=400, device="cuda"):
+def evaluate_model_elo(model, sf_pool: FastStockfishEvalPool, elo=1350, games=64, max_plies=400, movetime_ms=20, device="cuda"):
     model.eval()
-    sf_engine.set_elo(elo)
+    sf_pool.set_elo(elo)
 
-    env = GuardrailedTorchChess(games, device=device, halfmove_limit=max_plies)
+    env = GuardrailedTorchChess(games, device=device, halfmove_limit=min(100, max_plies))
     bot_is_white = torch.arange(games, device=device) < (games // 2)
 
     dones = torch.zeros(games, dtype=torch.bool, device=device)
@@ -602,48 +613,57 @@ def evaluate_model_elo(model, sf_engine, elo=1350, games=32, max_plies=400, devi
         is_w = (env.players == 0)
         is_bot = active & (is_w == bot_is_white)
         is_sf = active & (~is_bot)
+        in_chk_all = env.is_in_check(env.players, env.boards)
 
-        # 1. Batched GPU inference for bot
         if is_bot.any():
             has_legals = (l_mask > -1e8).any(dim=-1)
             bot_terminal = is_bot & (~has_legals)
 
             if bot_terminal.any():
                 dones = dones | bot_terminal
-                in_chk = env.is_in_check(env.players, env.boards)
-                opp_wins = torch.where(is_w, 2, 1)  # White mated -> Black (2) wins; Black mated -> White (1) wins
-                winners = torch.where(bot_terminal, torch.where(in_chk, opp_wins, 3), winners)
+                opp_wins = torch.where(is_w, 2, 1)
+                winners = torch.where(bot_terminal, torch.where(in_chk_all, opp_wins, 3), winners)
                 is_bot = is_bot & has_legals
 
             if is_bot.any():
-                bot_acts = model.select_action(
-                    env.boards, is_w, l_mask, castling_rights=env.castling_rights, temperature=0.0
-                )
+                bot_acts = model.select_action(env.boards, is_w, l_mask, castling_rights=env.castling_rights, temperature=0.0)
                 actions[is_bot] = bot_acts[is_bot]
 
-        # 2. Stockfish inference (Elo-calibrated)
         if is_sf.any():
-            for i in torch.nonzero(is_sf).squeeze(-1).tolist():
-                legals = torch.nonzero(l_mask[i] > -1e8).squeeze(-1).tolist()
+            sf_indices = torch.nonzero(is_sf).squeeze(-1).tolist()
+            boards_np = env.boards.cpu().numpy()
+            is_w_list = is_w.cpu().tolist()
+            rights_np = env.castling_rights.cpu().numpy()
+            ep_list = env.en_passant_sq.cpu().tolist()
+            half_list = env.halfmove_clock.cpu().tolist()
+            plies_list = plies.cpu().tolist()
+            chk_list = in_chk_all.cpu().tolist()
+
+            nz_cpu = torch.nonzero(l_mask > -1e8).cpu()
+            legals_map = {i: [] for i in sf_indices}
+            sf_set = set(sf_indices)
+            for b_i, act in nz_cpu.tolist():
+                if b_i in sf_set:
+                    legals_map[b_i].append(act)
+
+            sf_tasks = []
+            for i in sf_indices:
+                legals = legals_map[i]
                 if not legals:
                     dones[i] = True
-                    in_chk = env.is_in_check(env.players[i:i+1], env.boards[i:i+1]).item()
-                    winners[i] = (2 if is_w[i] else 1) if in_chk else 3
-                    continue
+                    winners[i] = (2 if is_w_list[i] else 1) if chk_list[i] else 3
+                else:
+                    fen = fast_board_to_fen(boards_np[i], is_w_list[i], rights_np[i], ep_list[i], half_list[i], (plies_list[i] // 2) + 1)
+                    sf_tasks.append((i, fen, legals))
 
-                fen = board_to_fen(
-                    env.boards[i], 0 if is_w[i] else 1, env.castling_rights[i].tolist(),
-                    int(env.en_passant_sq[i].item()), int(env.halfmove_clock[i].item()),
-                    int(plies[i].item() // 2 + 1)
-                )
-                bm = sf_engine.get_elo_move(fen, elo=elo, movetime_ms=20)
-                act = uci_to_action(bm) if bm else None
-                actions[i] = act if (act is not None and act in legals) else legals[0]
+            if sf_tasks:
+                sf_moves = sf_pool.play_batch(sf_tasks, elo=elo, movetime_ms=movetime_ms)
+                for idx, act in sf_moves.items():
+                    actions[idx] = act
 
         dones, winners = env.step(actions, dones, winners, legal_mask=l_mask)
         plies[active] += 1
 
-        # Timeout adjudication (+/- 200 cp)
         over = (plies >= max_plies) & (~dones)
         if over.any():
             dones = dones | over
@@ -667,40 +687,127 @@ def evaluate_model_elo(model, sf_engine, elo=1350, games=32, max_plies=400, devi
     }
 
 # ==========================================
+# 4. COMPILED TRAINING PIPELINE
+# ==========================================
+def train_model(model, dataset, epochs=25, batch_size=2048, lr=1.0e-3, device="cuda"):
+    print("\n" + "=" * 90)
+    print(f" TRAINING CHAMPION DIALECTIC PATT BOT ({epochs} Epochs | Batch: {batch_size})")
+    print("=" * 90)
+
+    boards, is_white, targets = dataset["boards"], dataset["is_white"], dataset["targets"]
+    castling = dataset.get("castling_rights", None)
+    dataset_size = targets.shape[0]
+
+    effective_size = dataset_size - (dataset_size % batch_size)
+    steps_per_epoch = effective_size // batch_size
+    total_steps = steps_per_epoch * epochs
+
+    decay_params, no_decay_params = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad: continue
+        if p.ndim < 2 or any(k in name for k in ("embed", "castling_proj")):
+            no_decay_params.append(p)
+        else:
+            decay_params.append(p)
+
+    optimizer = torch.optim.AdamW([
+        {"params": decay_params, "lr": lr, "weight_decay": 1e-4},
+        {"params": no_decay_params, "lr": lr, "weight_decay": 0.0}
+    ], fused=True)
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=lr * 0.03)
+    amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32
+
+    compiled_model = torch.compile(model, mode="reduce-overhead")
+    compiled_model.train()
+
+    start_t = time.time()
+    global_step = 0
+
+    for epoch in range(1, epochs + 1):
+        perm = torch.randperm(effective_size, device=device)
+        epoch_start_t = time.time()
+        last_loss = 0.0
+
+        for i in range(0, effective_size, batch_size):
+            global_step += 1
+            idx = perm[i:i + batch_size]
+            b, w, y = boards[idx], is_white[idx], targets[idx]
+            c = castling[idx] if castling is not None else None
+
+            if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                torch.compiler.cudagraph_mark_step_begin()
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=(amp_dtype != torch.float32)):
+                logits = compiled_model(b, w, castling_rights=c)
+                loss = F.cross_entropy(logits, y)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            scheduler.step()
+
+            last_loss = loss.item()
+
+        dt = time.time() - epoch_start_t
+        speed = effective_size / max(1e-4, dt)
+        print(f"  Epoch [{epoch:02d}/{epochs:02d}] Step [{global_step:05d}/{total_steps:05d}] | "
+              f"Loss: {last_loss:.4f} | Speed: {speed:6.0f} pos/s | Elapsed: {dt:.1f}s")
+
+    total_time = time.time() - start_t
+    print(f"\n[Training Finished] Processed {effective_size * epochs:,} positions in {total_time:.2f}s")
+# ==========================================
 # 5. RL SPARRING PARTNER LOADER
 # ==========================================
 class PattBotSparringPartner:
+    """
+    Self-play / RL sparring partner loader for DialecticPattChessBot checkpoints.
+    Supports fast batched tensor inference, temperature sampling, and greedy play.
+    """
     def __init__(self, ckpt_path="out/dialectic_patt_bot.pt", device="cuda"):
         self.device = device
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-        cfg = ckpt.get("config", {"dim": 64, "num_patt_tokens": 128, "rollout_steps": 4})
+        cfg = ckpt.get("config", {})
+
+        dim = cfg.get("dim", 128)
+        num_heads = cfg.get("num_heads", 8 if dim >= 128 else (6 if dim == 96 else 4))
+        head_dim = cfg.get("head_dim", dim // num_heads)
+
         self.model = DialecticPattChessBot(
-            dim=cfg["dim"],
-            num_patt_tokens=cfg["num_patt_tokens"],
-            rollout_steps=cfg["rollout_steps"]
+            dim=dim,
+            num_patt_tokens=cfg.get("num_patt_tokens", 256),
+            rollout_steps=cfg.get("rollout_steps", 6),
+            num_heads=num_heads,
+            head_dim=head_dim,
         ).to(device)
+
         self.model.load_state_dict(ckpt["model_state_dict"])
         self.model.eval()
 
     @torch.no_grad()
     def get_action(self, boards, is_white, legal_mask, castling_rights=None, temperature=0.0):
         return self.model.select_action(
-            boards, is_white, legal_mask, castling_rights=castling_rights, temperature=temperature
+            boards,
+            is_white,
+            legal_mask=legal_mask,
+            castling_rights=castling_rights,
+            temperature=temperature,
         )
-
+    
 # ==========================================
 # 6. MAIN EXECUTION
 # ==========================================
 def main():
-    parser = argparse.ArgumentParser(description="Fast Supervised Training for DialecticPattChessBot")
-    parser.add_argument("--dataset", type=str, default="data/chess/sf_dataset.pt", help="Path to offline SF dataset")
-    parser.add_argument("--batch_size", type=int, default=2048, help="Batch size (2048+ recommended for GPUs)")
-    parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
-    parser.add_argument("--lr", type=float, default=2e-3, help="Optimizer learning rate")
-    parser.add_argument("--dim", type=int, default=64, help="Embedding dimension")
-    parser.add_argument("--num_tokens", type=int, default=128, help="Patt concept tokens")
-    parser.add_argument("--rollout_steps", type=int, default=4, help="Rollout steps")
-    parser.add_argument("--out", type=str, default="out/dialectic_patt_bot.pt", help="Output checkpoint path")
+    parser = argparse.ArgumentParser(description="Champion Dialectic Patt Chess Bot Trainer")
+    parser.add_argument("--dataset", type=str, default="data/chess/sf_dataset.pt", help="Path to cleaned SF dataset")
+    parser.add_argument("--epochs", type=int, default=25, help="Epochs")
+    parser.add_argument("--batch_size", type=int, default=2048, help="Batch size")
+    parser.add_argument("--lr", type=float, default=1.0e-3, help="Learning rate")
+    parser.add_argument("--dim", type=int, default=128, help="Embedding dimension")
+    parser.add_argument("--num_tokens", type=int, default=256, help="PATT concept tokens")
+    parser.add_argument("--rollout_steps", type=int, default=6, help="Tied dialectic rollout plies")
+    parser.add_argument("--num_heads", type=int, default=8, help="Attention heads")
+    parser.add_argument("--out", type=str, default="out/dialectic_patt_bot.pt", help="Checkpoint output path")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -712,32 +819,32 @@ def main():
 
     print(f"Loading dataset from '{args.dataset}' into {device}...")
     dataset = torch.load(args.dataset, map_location=device, weights_only=False)
-    
     if "legal_masks" in dataset:
         del dataset["legal_masks"]
         torch.cuda.empty_cache()
 
-    model_cfg = {"dim": args.dim, "num_patt_tokens": args.num_tokens, "rollout_steps": args.rollout_steps}
+    model_cfg = {
+        "dim": args.dim,
+        "num_patt_tokens": args.num_tokens,
+        "rollout_steps": args.rollout_steps,
+        "num_heads": args.num_heads,
+        "head_dim": args.dim // args.num_heads
+    }
     model = DialecticPattChessBot(**model_cfg).to(device)
 
-    train_offline_stockfish(model, dataset, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, device=device)
+    train_model(model, dataset, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, device=device)
 
-    torch.save({
-        "model_state_dict": model.state_dict(),
-        "config": model_cfg
-    }, args.out)
+    torch.save({"model_state_dict": model.state_dict(), "config": model_cfg}, args.out)
     print(f"[Artifact Saved] -> {args.out}")
 
     sf_exec = shutil.which("stockfish") or ("./stockfish.exe" if os.path.exists("stockfish.exe") else None)
     if sf_exec:
-        sf_engine = StockfishEngine(sf_exec, threads=4, hash_mb=128)
+        pool = FastStockfishEvalPool(sf_exec, num_workers=min(12, os.cpu_count() or 4), hash_mb=32)
         for elo in [1350, 1600]:
-            print(f"\nEvaluating vs Stockfish Elo {elo} (32 Games)...")
-            res = evaluate_model_elo(model, sf_engine, elo=elo, games=32, device=device)
+            print(f"\nEvaluating vs Stockfish Elo {elo} (64 Games)...")
+            res = evaluate_model_elo(model, pool, elo=elo, games=64, max_plies=400, device=device)
             print(f"  Result vs {elo}: {res['score_str']} | Mean Material Delta: {res['mat_str']}")
-        sf_engine.close()
-    else:
-        print("\n[Notice] Stockfish binary not detected. Evaluation skipped.")
+        pool.close()
 
 if __name__ == "__main__":
     main()

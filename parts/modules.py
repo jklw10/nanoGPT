@@ -363,7 +363,7 @@ class Kattention(nn.Module):
         if h_dim:
             self.n_head = self.n_embd // h_dim
         else:
-            self.n_embd = config.n_head
+            self.n_head = config.n_head
         self.dropout = config.dropout
         self.head_dim =  self.n_embd // self.n_head 
 
