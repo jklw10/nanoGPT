@@ -9,11 +9,12 @@ import numpy as np
 import torch
 
 import torch.nn.functional as F
+import models.non_ml.triton_kmeans
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 torch._inductor.config.disable_cpp_codegen = True
 torch._dynamo.config.cache_size_limit = 128
-
 
 # =====================================================================
 # 1. Shared Primitives & Compiled Kernels
@@ -465,6 +466,239 @@ def run_hybrid_v11_aware_emeans(X: torch.Tensor, k: int, epochs: float = 0.5) ->
     C = run_engine_v11_aware(X, k)
     return run_original_emeans(X, k, epochs=epochs, init_C=C)
 
+def run_engine_v11_nosync(
+    X: torch.Tensor,
+    k: int,
+    sub_n: int = 16384,
+    use_sse: bool = True,
+    valley_boost: float = 2.5,
+    robust_cap_q: float | None = 0.95,
+    bw_scale: float = 0.65,
+) -> torch.Tensor:
+    n, d = X.shape
+    if n > sub_n:
+        X_sub = X[torch.randint(0, n, (sub_n,), device=X.device)]
+    else:
+        sub_n = n
+        X_sub = X[torch.randperm(n, device=X.device)]
+    X_sub = X_sub.float()
+    X_sub.nan_to_num_(nan=0.0, posinf=1e4, neginf=-1e4)
+
+    x_sub_sq = torch.linalg.vector_norm(X_sub, dim=1).square()
+    is_B = (torch.arange(sub_n, device=X.device) & 1) == 1
+    is_B_f = is_B.float().unsqueeze(1)
+    is_A_f = 1.0 - is_B_f
+
+    C_buf = torch.zeros((k, d), device=X.device, dtype=torch.float32)
+    C_buf[0] = X_sub.mean(dim=0)
+    prev_V = torch.zeros((k, d), device=X.device, dtype=torch.float32)
+    active = torch.zeros(k, device=X.device, dtype=torch.bool)
+    active[0] = True
+
+    num_bins = 64
+    idx = torch.arange(num_bins, device=X.device, dtype=torch.float32)
+    dist2 = (idx.unsqueeze(0) - idx.unsqueeze(1)) ** 2
+    sigma_bins = float(num_bins - 1) / 8.0
+
+    # Build static width schedule: growing phase (thresh_gate=0.05*max) + 2 cleanup rounds at m=k
+    b_max = min(12, max(1, k // 2))
+    schedule = []
+    m_hi = 1
+    while m_hi < k:
+        b = min(m_hi, max(1, (2 * m_hi + 2) // 3), b_max, k - m_hi)
+        schedule.append((m_hi, b, True))
+        m_hi += b
+    b_tail = min(8, max(1, k // 4))
+    for _ in range(3):
+        schedule.append((k, b_tail, True))
+    schedule.append((k, b_tail, False))
+
+    for m, b_step, use_gate in schedule:
+        m_next = min(k, m + b_step)
+        C_curr = C_buf[:m]
+        pv_curr = prev_V[:m]
+        act_m = active[:m]
+
+        c_half = 0.5 * torch.linalg.vector_norm(C_curr, dim=1).square()
+        scores = torch.addmm(-c_half, X_sub, C_curr.T).masked_fill(~act_m.unsqueeze(0), -1e9)
+        max_score, assign = torch.max(scores, dim=1)
+        raw_sse = torch.clamp(x_sub_sq - 2.0 * max_score, min=0.0)
+
+        if robust_cap_q is not None:
+            k_top = max(1, int(round((1.0 - robust_cap_q) * sub_n)))
+            cap = torch.topk(raw_sse, k_top, largest=True).values[-1]
+            w_pt = torch.clamp(cap / torch.clamp(raw_sse, min=1e-6), max=1.0)
+        else:
+            w_pt = torch.ones(sub_n, device=X.device, dtype=torch.float32)
+
+        O = F.one_hot(assign, m).float()
+        O_w = O * w_pt.unsqueeze(1)
+        total_cnt = O.sum(dim=0)
+        w_sum = O_w.sum(dim=0).clamp(min=1e-6)
+        M = (O_w.T @ X_sub) / w_sum.unsqueeze(1)
+
+        # 1. Dual-Axis Initialization (deflated against prev_V)
+        V1 = torch.randn(m, d, device=X.device, dtype=torch.float32)
+        V1 = V1 - (V1 * pv_curr).sum(dim=1, keepdim=True) * pv_curr
+        V1 = V1 / (V1.norm(dim=1, keepdim=True) + 1e-9)
+
+        V2 = torch.randn(m, d, device=X.device, dtype=torch.float32)
+        V2 = V2 - (V2 * V1).sum(dim=1, keepdim=True) * V1
+        V2 = V2 / (V2.norm(dim=1, keepdim=True) + 1e-9)
+
+        # 2. Deflated Dual Power Iteration
+        for _ in range(3):
+            V_both = torch.cat([V1, V2], dim=0)
+            dots = X_sub @ V_both.T
+            dot1 = dots[:, :m].gather(1, assign.unsqueeze(1)).squeeze(1)
+            dot2 = dots[:, m:].gather(1, assign.unsqueeze(1)).squeeze(1)
+
+            z1 = dot1 - (M * V1).sum(dim=1)[assign]
+            z2 = dot2 - (M * V2).sum(dim=1)[assign]
+
+            Z1_mat = O_w * z1.unsqueeze(1)
+            Z2_mat = O_w * z2.unsqueeze(1)
+            V_next_both = torch.cat([Z1_mat, Z2_mat], dim=1).T @ X_sub - torch.cat([
+                Z1_mat.sum(dim=0).unsqueeze(1) * M,
+                Z2_mat.sum(dim=0).unsqueeze(1) * M,
+            ], dim=0)
+
+            V1 = V_next_both[:m]
+            V1 = V1 / (V1.norm(dim=1, keepdim=True) + 1e-9)
+
+            V2 = V_next_both[m:]
+            V2 = V2 - (V2 * V1).sum(dim=1, keepdim=True) * V1
+            V2 = V2 / (V2.norm(dim=1, keepdim=True) + 1e-9)
+
+        # 3. 2D Mode Tracking
+        V_both = torch.cat([V1, V2], dim=0)
+        dots = X_sub @ V_both.T
+        u1 = dots[:, :m].gather(1, assign.unsqueeze(1)).squeeze(1) - (M * V1).sum(dim=1)[assign]
+        u2 = dots[:, m:].gather(1, assign.unsqueeze(1)).squeeze(1) - (M * V2).sum(dim=1)[assign]
+
+        var1 = (O_w.T @ (u1 * u1)) / w_sum
+        sig1 = torch.sqrt(var1.clamp(min=1e-12))
+        cA_1, cA_2 = -0.75 * sig1, torch.zeros_like(sig1)
+        cB_1, cB_2 = +0.75 * sig1, torch.zeros_like(sig1)
+
+        for _ in range(3):
+            dA2 = (u1 - cA_1[assign]) ** 2 + (u2 - cA_2[assign]) ** 2
+            dB2 = (u1 - cB_1[assign]) ** 2 + (u2 - cB_2[assign]) ** 2
+            is_B_pt = (dB2 < dA2).float().unsqueeze(1)
+
+            O_wB = O_w * is_B_pt
+            O_wA = O_w - O_wB
+            sum_wA = O_wA.sum(dim=0).clamp(min=1e-6)
+            sum_wB = O_wB.sum(dim=0).clamp(min=1e-6)
+
+            cA_1 = (O_wA.T @ u1) / sum_wA
+            cA_2 = (O_wA.T @ u2) / sum_wA
+            cB_1 = (O_wB.T @ u1) / sum_wB
+            cB_2 = (O_wB.T @ u2) / sum_wB
+
+        del_1, del_2 = cB_1 - cA_1, cB_2 - cA_2
+        norm_del = torch.sqrt(del_1 * del_1 + del_2 * del_2).clamp(min=1e-9)
+        V_star = (del_1 / norm_del).unsqueeze(1) * V1 + (del_2 / norm_del).unsqueeze(1) * V2
+        V_star = V_star / (V_star.norm(dim=1, keepdim=True) + 1e-9)
+
+        # 4. Split-Half KDE Valley Consensus
+        proj = (X_sub @ V_star.T).gather(1, assign.unsqueeze(1)).squeeze(1)
+        dot_mu_v = (M * V_star).sum(dim=1)
+
+        diff = proj - dot_mu_v[assign]
+        var = (O_w.T @ (diff * diff)) / w_sum
+        half_span = (4.0 * torch.sqrt(var.clamp(min=1e-12))).clamp(min=1e-4)
+        lo_v = dot_mu_v - half_span
+        span = 2.0 * half_span
+
+        pos = ((proj - lo_v[assign]) / span[assign] * (num_bins - 1)).clamp(0.0, float(num_bins - 1) - 1e-4)
+        b0 = pos.floor().long()
+        b1 = (b0 + 1).clamp(max=num_bins - 1)
+        frac = pos - b0.float()
+
+        B_hist_pt = (
+            F.one_hot(b0, num_bins).float() * ((1.0 - frac) * w_pt).unsqueeze(1)
+            + F.one_hot(b1, num_bins).float() * (frac * w_pt).unsqueeze(1)
+        )
+        raw_A = (O * is_A_f).T @ B_hist_pt
+        raw_B = (O * is_B_f).T @ B_hist_pt
+        raw_ab = torch.stack([raw_A, raw_B], dim=2)
+
+        h_bins = bw_scale * sigma_bins * (0.5 * total_cnt).clamp(min=2.0).pow(-0.2)
+        h2 = torch.clamp(h_bins * h_bins, min=0.05).view(m, 1, 1)
+        K_kernel = torch.exp(-0.5 * dist2.unsqueeze(0) / h2)
+        K_kernel = K_kernel / K_kernel.sum(dim=1, keepdim=True).clamp(min=1e-6)
+        dens_ab = torch.bmm(K_kernel, raw_ab)
+        dens_A, dens_B = dens_ab[:, :, 0], dens_ab[:, :, 1]
+
+        lp_A = torch.cummax(dens_A, dim=1).values
+        rp_A = torch.cummax(dens_A.flip(1), dim=1).values.flip(1)
+        lp_B = torch.cummax(dens_B, dim=1).values
+        rp_B = torch.cummax(dens_B.flip(1), dim=1).values.flip(1)
+
+        val_persist = torch.minimum(
+            torch.clamp(torch.minimum(lp_A, rp_A) - dens_A, min=0.0),
+            torch.clamp(torch.minimum(lp_B, rp_B) - dens_B, min=0.0),
+        )
+        dens_mean = 0.5 * (dens_A + dens_B)
+        cdf = torch.cumsum(dens_mean, dim=1) / dens_mean.sum(dim=1, keepdim=True).clamp(min=1e-6)
+        v_max, v_idx = torch.max(val_persist * (4.0 * cdf * (1.0 - cdf)), dim=1)
+
+        df_A = dens_A[:, 1:] - dens_A[:, :-1]
+        df_B = dens_B[:, 1:] - dens_B[:, :-1]
+        agree = (df_A * df_B).sum(dim=1) / ((df_A.norm(dim=1) * df_B.norm(dim=1)) + 1e-8)
+
+        min_dens_max = torch.minimum(dens_A, dens_B).max(dim=1).values
+        has_valley = (v_max > 0.03 * min_dens_max) & (agree > 0.35)
+        v_cand = lo_v + (v_idx.float() / (num_bins - 1)) * span
+        thresh = torch.where(has_valley, v_cand, dot_mu_v)
+
+        left_f = (proj < thresh[assign]).float().unsqueeze(1)
+        cnt_left = (O * left_f).sum(dim=0)
+        cnt_right = total_cnt - cnt_left
+        thresh = torch.where((cnt_left < 1.0) | (cnt_right < 1.0), dot_mu_v, thresh)
+
+        left_f = (proj < thresh[assign]).float().unsqueeze(1)
+        Ow_left = O_w * left_f
+        Ow_right = O_w - Ow_left
+        cnt_left = (O * left_f).sum(dim=0)
+        cnt_right = total_cnt - cnt_left
+
+        wl = Ow_left.sum(dim=0)
+        wr = Ow_right.sum(dim=0)
+        C_left = (Ow_left.T @ X_sub) / wl.clamp(min=1e-6).unsqueeze(1)
+        C_right = (Ow_right.T @ X_sub) / wr.clamp(min=1e-6).unsqueeze(1)
+        valid = act_m & (cnt_left >= 1.0) & (cnt_right >= 1.0)
+
+        # 5. Zero-Sync Throttled Split
+        if use_sse:
+            delta_sse = (wl * wr / (wl + wr).clamp(min=1e-6)) * torch.linalg.vector_norm(C_left - C_right, dim=1).square()
+            delta_sse = torch.where(valid, delta_sse, torch.zeros_like(delta_sse))
+            ranking_score = delta_sse * torch.where(has_valley, valley_boost, 1.0)
+        else:
+            valley_rel_depth = torch.where(has_valley, v_max / min_dens_max.clamp(min=1e-6), torch.zeros_like(v_max))
+            ranking_score = torch.where(valid, valley_rel_depth, torch.zeros_like(valley_rel_depth))
+            fallback = torch.where(valid, total_cnt, torch.zeros_like(total_cnt))
+            ranking_score = torch.where(ranking_score.max() > 0, ranking_score, fallback)
+
+        b_pick = min(b_step, m)
+        top_vals, top_ids = torch.topk(ranking_score, b_pick, largest=True)
+        free_mask = ~active[:m_next]
+        _, free_ids = torch.topk(free_mask.float(), b_pick, largest=True)
+
+        thresh_gate = (0.05 * top_vals[0]) if use_gate else 0.0
+        ok = valid[top_ids] & free_mask[free_ids] & (top_vals > 0.0) & (top_vals >= thresh_gate)
+        ok_2d = ok.unsqueeze(1)
+
+        C_buf = C_buf.scatter(0, top_ids.unsqueeze(1).expand(-1, d), torch.where(ok_2d, C_left[top_ids], C_buf[top_ids]))
+        C_buf = C_buf.scatter(0, free_ids.unsqueeze(1).expand(-1, d), torch.where(ok_2d, C_right[top_ids], C_buf[free_ids]))
+        active = active.scatter(0, free_ids, active[free_ids] | ok)
+
+        V_pick = V_star[top_ids]
+        prev_V = prev_V.scatter(0, top_ids.unsqueeze(1).expand(-1, d), torch.where(ok_2d, V_pick, prev_V[top_ids]))
+        prev_V = prev_V.scatter(0, free_ids.unsqueeze(1).expand(-1, d), torch.where(ok_2d, V_pick, prev_V[free_ids]))
+
+    return C_buf
 # =====================================================================
 # 5. Diverse Task Generators
 # =====================================================================
@@ -625,6 +859,8 @@ def evaluate_mse(X: torch.Tensor, centroids: torch.Tensor, core_mask: torch.Tens
 
 
 def run_benchmark():
+    models.non_ml.triton_kmeans.warmup_graphs([(16, 1024), (64, 1024)], half_x=True)
+    models.non_ml.triton_kmeans.warmup_graphs([(16, 1024), (64, 1024)], half_x=False)
     tasks = [
         {"title": "Task 1a: Isolated Gaussian Blobs + 20 Outliers",  "fn": make_task_isolated_blobs,     "N": 640000, "D": 1024, "K": 16},
         {"title": "Task 1b: Isolated Gaussian Blobs + 20 Outliers",  "fn": make_task_isolated_blobs,     "N": 640000, "D": 1024, "K": 64},
@@ -638,14 +874,18 @@ def run_benchmark():
 
     algos = [
         # Older SOTA / Standard Baselines
-        ("Classic Lloyd k-means (15 iters)",            lambda x, k: run_lloyd_kmeans(x, k, iters=15)),
-        ("Annoy Divisive (Power-Iter + Midpoint)",      lambda x, k: run_divisive_tree(x, k, split_rule="midpoint")),
-        ("RP-Tree Divisive (Power-Iter + Median)",      lambda x, k: run_divisive_tree(x, k, split_rule="median")),
-        ("Original e-means (1.0 epoch)",                lambda x, k: run_original_emeans(x, k, epochs=1.0)),
-        ("Original e-means (3.0 epochs)",               lambda x, k: run_original_emeans(x, k, epochs=3.0)),
-        # My Methods    
-        ("v11-aware",                            lambda x, k: run_engine_v11_aware(x, k)),
-        ("v11-aware emeans",                     lambda x, k: run_hybrid_v11_aware_emeans(x, k)),
+        #("Classic Lloyd k-means (15 iters)",        lambda x, k: run_lloyd_kmeans(x, k, iters=15)),
+        #("Annoy Divisive (Power-Iter + Midpoint)",  lambda x, k: run_divisive_tree(x, k, split_rule="midpoint")),
+        #("RP-Tree Divisive (Power-Iter + Median)",  lambda x, k: run_divisive_tree(x, k, split_rule="median")),
+        #("Original e-means (1.0 epoch)",            lambda x, k: run_original_emeans(x, k, epochs=1.0)),
+        #("Original e-means (3.0 epochs)",           lambda x, k: run_original_emeans(x, k, epochs=3.0)),
+        # My Methods
+        #("v11-aware",                               lambda x, k: run_engine_v11_aware(x, k)),
+        #("v11-aware emeans",                        lambda x, k: run_hybrid_v11_aware_emeans(x, k)),
+        #("v11-nosync",                              lambda x, k: run_engine_v11_nosync(x, k)),
+        ("v11-triton",                              lambda x, k: models.non_ml.triton_kmeans.run_engine_v11_triton(x, k)),
+        ("v11-triton hx true",                              lambda x, k: models.non_ml.triton_kmeans.run_engine_v11_triton(x, k,half_x=True)),
+        
     ]
 
     print(f"Hardware: {device.type.upper()} ({torch.cuda.get_device_name(0) if device.type == 'cuda' else 'CPU'})")
@@ -1051,8 +1291,10 @@ def run_vram_profile(trace_peak_allocs: bool = True, trace_first_task_only: bool
     ]
 
     algos = [
-        ("Classic Lloyd k-means (15 iters)",            lambda x, k: run_lloyd_kmeans(x, k, iters=15)),
-        ("Original e-means (1.0 epoch)",                lambda x, k: run_original_emeans(x, k, epochs=1.0)),
+        #("Classic Lloyd k-means (15 iters)",            lambda x, k: run_lloyd_kmeans(x, k, iters=15)),
+        #("Original e-means (1.0 epoch)",                lambda x, k: run_original_emeans(x, k, epochs=1.0)),
+        ("v11_aware",                lambda x, k: run_engine_v11_aware(x, k)),
+        ("v11_nosync",                lambda x, k: run_engine_v11_nosync(x, k)),
     ]
 
     dev_idx = torch.cuda.current_device()

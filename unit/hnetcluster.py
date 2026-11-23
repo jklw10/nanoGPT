@@ -1,17 +1,16 @@
 """
-Standalone Reality Auditor + Compiled Every-Step v11 Tester for models/HNet4.py
-Compares:
-  1. kattn_baseline  : Exact Kattention (dense T x T + log(T)*qm + TopKHot k=4)
-  2. cw_l2_ue8       : CausalWindowedKAttention (update_every=8 via @torch._dynamo.disable)
-  3. cw_l2_v11_every : Compiled batched v11 + Lloyd polish on EVERY pass (0 graph breaks, 0 .item() syncs)
-  [optional --with-seq]: cw_seq (M=1, no clustering)
+Standalone Reality Auditor + FlexAttention vs Gather Benchmark for models/HNet4.py
+Compares (at the exact same W & bs):
+  1. kattn_baseline : Exact Kattention (dense T x T + log(T)*qm + TopKHot k=4)
+  2. cw_noflex      : CausalWindowedKAttention (explicit gather + Stage-2 TopKHot k=4)
+  3. cw_flex        : CausalWindowedKAttention (BlockMask.from_kv_blocks + flex_attention, Stage-1 soft)
 
 Usage:
-    # 1. Compiled every-step v11 benchmark at T_inner=64:
-    python hnetcluster.py --steps 5000 --audit-every 1000 --compile
-
-    # 2. Long-context crossover at T_inner=256 (1024 -> 512 -> 256, same 16,384 tok/step):
+    # Size 1024 (1024 -> 512 -> 256, B=16, auto W=32 bs=16):
     python hnetcluster.py --steps 5000 --audit-every 1000 --block-size 1024 --batch-size 16 --compile
+
+    # Optional: 1:1 soft-attention parity on cw_noflex (skip Stage-2 TopKHot) or bs=32 W=64:
+    python hnetcluster.py --steps 5000 --audit-every 1000 --block-size 1024 --batch-size 16 --no-stage2 --compile
 """
 
 import argparse
@@ -20,6 +19,7 @@ import math
 import time
 import torch
 import torch.nn.functional as F
+from torch.nn.attention.flex_attention import flex_attention, BlockMask
 
 from scipy.optimize import linear_sum_assignment
 
@@ -38,12 +38,6 @@ def compiled_v11_batched_spherical(
     valley_boost: float = 2.5,
     bw_scale: float = 0.65,
 ) -> torch.Tensor:
-    """
-    100% static-shape, batched (H, N, D) spherical Engine v11:
-    - Runs all H heads in parallel.
-    - Unrolls the static b_sched splits for k (no .item() CPU syncs, no dynamic slice shapes).
-    - Uses functional scatter + torch.cat so torch.compile/Inductor traces cleanly with 0 graph breaks.
-    """
     orig_dtype = X_heads.dtype
     dev = X_heads.device
     X_in = F.normalize(
@@ -73,7 +67,6 @@ def compiled_v11_batched_spherical(
     dist2 = (idx_b.unsqueeze(0) - idx_b.unsqueeze(1)) ** 2
     sigma_bins = float(num_bins - 1) / 8.0
 
-    # Static split schedule (e.g. k=16 -> [(1,1), (2,2), (4,3), (7,5), (12,4)])
     schedule = []
     m_cur = 1
     while m_cur < k:
@@ -84,16 +77,15 @@ def compiled_v11_batched_spherical(
     for m, b in schedule:
         C_curr = C_buf[:, :m, :]
         scores = torch.bmm(X_sub, C_curr.transpose(1, 2))
-        _, assign = torch.max(scores, dim=-1)  # (H, S)
+        _, assign = torch.max(scores, dim=-1)
 
         O = torch.zeros(H, S, m, device=dev, dtype=torch.float32).scatter_(
             2, assign.unsqueeze(-1), 1.0
         )
-        total_cnt = O.sum(dim=1)               # (H, m)
+        total_cnt = O.sum(dim=1)
         w_sum = total_cnt.clamp(min=1e-6)
-        M = torch.bmm(O.transpose(1, 2), X_sub) / w_sum.unsqueeze(-1)  # (H, m, D)
+        M = torch.bmm(O.transpose(1, 2), X_sub) / w_sum.unsqueeze(-1)
 
-        # 1. Dual-Axis Initialization (deflated against prev_V)
         pv = prev_V[:, :m, :]
         V1 = torch.randn(H, m, D, device=dev, dtype=torch.float32)
         V1 = V1 - (V1 * pv).sum(dim=-1, keepdim=True) * pv
@@ -103,16 +95,14 @@ def compiled_v11_batched_spherical(
         V2 = V2 - (V2 * V1).sum(dim=-1, keepdim=True) * V1
         V2 = F.normalize(V2, p=2, dim=-1, eps=1e-9)
 
-        # 2. Deflated Dual Power Iteration
         for _ in range(3):
-            V_both = torch.cat([V1, V2], dim=1)  # (H, 2m, D)
+            V_both = torch.cat([V1, V2], dim=1)
             dots = torch.bmm(X_sub, V_both.transpose(1, 2))
             dot1 = dots[:, :, :m].gather(2, assign.unsqueeze(-1)).squeeze(-1)
             dot2 = dots[:, :, m:].gather(2, assign.unsqueeze(-1)).squeeze(-1)
 
             mu1 = (M * V1).sum(dim=-1)
             mu2 = (M * V2).sum(dim=-1)
-
             z1 = dot1 - mu1.gather(1, assign)
             z2 = dot2 - mu2.gather(1, assign)
 
@@ -129,7 +119,6 @@ def compiled_v11_batched_spherical(
             V2 = V_next_both[:, m:, :]
             V2 = F.normalize(V2 - (V2 * V1).sum(dim=-1, keepdim=True) * V1, p=2, dim=-1, eps=1e-9)
 
-        # 3. 2D Mode Tracking
         V_both = torch.cat([V1, V2], dim=1)
         dots = torch.bmm(X_sub, V_both.transpose(1, 2))
         u1 = dots[:, :, :m].gather(2, assign.unsqueeze(-1)).squeeze(-1) - (M * V1).sum(dim=-1).gather(1, assign)
@@ -163,7 +152,6 @@ def compiled_v11_batched_spherical(
             eps=1e-9,
         )
 
-        # 4. Split-Half KDE Valley Check
         proj = torch.bmm(X_sub, V_star.transpose(1, 2)).gather(2, assign.unsqueeze(-1)).squeeze(-1)
         dot_mu_v = (M * V_star).sum(dim=-1)
 
@@ -184,7 +172,7 @@ def compiled_v11_batched_spherical(
         hist_ab = torch.zeros(H, 2 * m * num_bins, device=dev, dtype=torch.float32)
         hist_ab.scatter_add_(1, flat_base + b0, 1.0 - frac)
         hist_ab.scatter_add_(1, flat_base + b1, frac)
-        raw_ab = hist_ab.view(H, 2, m, num_bins).permute(0, 2, 3, 1)  # (H, m, 64, 2)
+        raw_ab = hist_ab.view(H, 2, m, num_bins).permute(0, 2, 3, 1)
 
         h_bins = bw_scale * sigma_bins * (0.5 * total_cnt).clamp(min=2.0).pow(-0.2)
         h2 = torch.clamp(h_bins * h_bins, min=0.05).view(H, m, 1, 1)
@@ -230,13 +218,12 @@ def compiled_v11_batched_spherical(
         C_right = F.normalize(torch.bmm(O_right.transpose(1, 2), X_sub) / cnt_right.clamp(min=1e-6).unsqueeze(-1), p=2, dim=-1)
         valid = (cnt_left >= 1.0) & (cnt_right >= 1.0)
 
-        # 5. Split Ranking & Functional Update
         delta_sse = (cnt_left * cnt_right / (cnt_left + cnt_right).clamp(min=1e-6)) * (C_left - C_right).square().sum(dim=-1)
         delta_sse = torch.where(valid, delta_sse, torch.zeros_like(delta_sse))
         ranking_score = delta_sse * torch.where(has_valley, valley_boost, 1.0)
 
-        _, top_ids = torch.topk(ranking_score, b, dim=-1, largest=True)  # (H, b)
-        ok = valid.gather(1, top_ids).unsqueeze(-1)                       # (H, b, 1)
+        _, top_ids = torch.topk(ranking_score, b, dim=-1, largest=True)
+        ok = valid.gather(1, top_ids).unsqueeze(-1)
         top_ids_d = top_ids.unsqueeze(-1).expand(-1, -1, D)
 
         C_l_sel = torch.where(ok, C_left.gather(1, top_ids_d), C_curr.gather(1, top_ids_d))
@@ -256,23 +243,20 @@ def compiled_v11_batched_spherical(
 
 
 # =====================================================================
-# 2. Causal-Windowed 2-Stage Kattention
+# 2. Causal-Windowed Attention (Gather vs BlockMask.from_kv_blocks Flex)
 # =====================================================================
 
 class CausalWindowedKAttention(torch.nn.Module):
-    """
-    Fast cluster-sparse Kattention:
-    - update_mode="v11_every": runs compiled_v11_batched_spherical + Lloyd polish EVERY pass (0 graph breaks).
-    - update_mode="ue8":       runs amortized @torch._dynamo.disable _maybe_update_centroids every `update_every`.
-    """
     def __init__(
         self,
         cfg: hnet4.HNetConfig,
-        win_size: int = 8,
+        win_size: int = 32,
         update_every: int = 8,
         use_l2_norm: bool = True,
         update_mode: str = "ue8",
-        v11_sub_n: int = 4096,
+        v11_sub_n: int = 1024,
+        use_flex: bool = False,
+        two_stage_tok: bool = True,
     ):
         super().__init__()
         self.cfg = cfg
@@ -283,8 +267,15 @@ class CausalWindowedKAttention(torch.nn.Module):
         self.use_l2_norm = use_l2_norm
         self.update_mode = update_mode
         self.v11_sub_n = v11_sub_n
+        self.use_flex = use_flex
+        self.two_stage_tok = two_stage_tok
         self._step_cnt = 0
         self._last_refresh = 0
+
+        if self.use_flex:
+            assert cfg.emeans_block_size >= 16 and (cfg.emeans_block_size & (cfg.emeans_block_size - 1)) == 0, (
+                f"FlexAttention requires bs >= 16 power of 2, got {cfg.emeans_block_size}"
+            )
 
         self.q_attn = torch.nn.Linear(cfg.dim_l3, cfg.dim_l3, bias=False)
         self.k_attn = torch.nn.Linear(cfg.dim_l3, cfg.dim_l3, bias=False)
@@ -401,8 +392,101 @@ class CausalWindowedKAttention(torch.nn.Module):
             k_s = k_eff.view(B, H, N_B, bs, D)
             v_s = v.view(B, H, N_B, bs, D)
 
-        # 2. Stage-1 Coarse Routing (past windows only -> 100% causally valid blocks)
         block_C = k_s.mean(dim=3)
+
+        # -----------------------------------------------------------------
+        # 2A. FlexAttention Path (Q-block Stage-1 + BlockMask.from_kv_blocks)
+        # -----------------------------------------------------------------
+        if self.use_flex:
+            q_blk = q_eff.view(B, H, N_B, bs, D).mean(dim=3)  # (B, H, N_B, D)
+            router_logits = torch.matmul(q_blk, block_C.transpose(-2, -1)) * scale
+
+            block_win = (torch.arange(N_B, device=x.device) // B_W).view(1, 1, 1, N_B)
+            q_blk_win_1d = torch.arange(N_B, device=x.device) // B_W
+            past_win_mask = block_win < q_blk_win_1d.view(1, 1, N_B, 1)
+
+            off_logits = router_logits.masked_fill(~past_win_mask, float("-inf"))
+            off_mask = hnet4.TopKHot.apply(off_logits, k_off, self.cfg.topk_mode)
+            _, off_idx = torch.topk(off_logits, k=k_off, dim=-1)
+            off_valid = torch.gather(off_mask, -1, off_idx) > 0
+
+            # Concat [chronological local k_eff, window-sorted k_s] -> KV_LEN = 2 * T
+            k_cat = torch.cat([k_eff, k_s.reshape(B, H, T, D)], dim=2)
+            v_cat = torch.cat([v,     v_s.reshape(B, H, T, D)], dim=2)
+
+            # Partial blocks: only the diagonal block per Q-block (needs causal mask_mod)
+            kv_num_blocks = torch.ones((B, H, N_B), device=x.device, dtype=torch.int32)
+            kv_indices = F.pad(
+                torch.arange(N_B, device=x.device, dtype=torch.int32)
+                .view(1, 1, N_B, 1)
+                .expand(B, H, N_B, 1),
+                (0, 2 * N_B - 1),
+                value=0,
+            ).contiguous()
+
+            # Full blocks (skip mask_mod): prior blocks in current W-window + selected past sorted blocks
+            past_cand = (N_B + off_idx).to(torch.int32)
+            past_valid = (q_blk_win_1d >= 1).view(1, 1, N_B, 1) & off_valid
+            if B_W > 1:
+                loc_off = torch.arange(B_W - 1, device=x.device, dtype=torch.int32)
+                loc_cand = (q_blk_win_1d.to(torch.int32) * B_W).unsqueeze(-1) + loc_off.unsqueeze(0)
+                loc_valid = (
+                    (loc_cand < torch.arange(N_B, device=x.device, dtype=torch.int32).unsqueeze(-1))
+                    .view(1, 1, N_B, B_W - 1)
+                    .expand(B, H, -1, -1)
+                )
+                loc_cand_bh = loc_cand.view(1, 1, N_B, B_W - 1).expand(B, H, -1, -1)
+                all_cand = torch.cat([loc_cand_bh, past_cand], dim=-1)
+                all_valid = torch.cat([loc_valid, past_valid], dim=-1)
+            else:
+                all_cand = past_cand
+                all_valid = past_valid
+
+            full_kv_num_blocks = all_valid.sum(dim=-1, dtype=torch.int32)
+            cand_packed = torch.where(all_valid, all_cand, torch.full_like(all_cand, 2 * N_B))
+            full_kv_indices, _ = torch.sort(cand_packed, dim=-1)
+            full_kv_indices = torch.where(full_kv_indices >= 2 * N_B, 0, full_kv_indices)
+            full_kv_indices = F.pad(
+                full_kv_indices,
+                (0, 2 * N_B - full_kv_indices.size(-1)),
+                value=0,
+            ).contiguous()
+
+            def causal_local_mask(b, h, q_idx, kv_idx):
+                return (kv_idx >= T) | (q_idx >= kv_idx)
+
+            block_mask = BlockMask.from_kv_blocks(
+                kv_num_blocks=kv_num_blocks,
+                kv_indices=kv_indices,
+                full_kv_num_blocks=full_kv_num_blocks,
+                full_kv_indices=full_kv_indices,
+                BLOCK_SIZE=(bs, bs),
+                mask_mod=causal_local_mask,
+                seq_lengths=(T, 2 * T),
+            )
+
+            q_flex = (q_eff * (scale * math.sqrt(D))).to(k_cat.dtype)
+            flex_opts = {
+                "BACKEND": "TRITON",
+                "fwd_BLOCK_M": bs,
+                "fwd_BLOCK_N": bs,
+                "bwd_BLOCK_M1": bs,
+                "bwd_BLOCK_N1": bs,
+                "bwd_BLOCK_M2": bs,
+                "bwd_BLOCK_N2": bs,
+            }
+            out = flex_attention(q_flex, k_cat, v_cat, block_mask=block_mask, kernel_options=flex_opts)
+
+            # STE gradient back into router_logits / block_C
+            #has_any = past_win_mask.any(dim=-1, keepdim=True)
+            #safe_r = router_logits.masked_fill(~past_win_mask, -1e9)
+            #s = (off_mask * F.softmax(safe_r, dim=-1)).sum(dim=-1, keepdim=True) * has_any.to(q.dtype)
+            #out = (out.view(B, H, N_B, bs, D) * (1.0 + s - s.detach()).unsqueeze(3)).view(B, H, T, D)
+            return self.resid_dropout(self.c_proj(out.transpose(1, 2).contiguous().view(B, T, C_dim)))
+
+        # -----------------------------------------------------------------
+        # 2B. Gather Path (No-Flex Baseline with Identical W, bs, k_off)
+        # -----------------------------------------------------------------
         router_logits = torch.matmul(q_eff, block_C.transpose(-2, -1)) * scale
 
         block_win = (torch.arange(N_B, device=x.device) // B_W).view(1, 1, 1, N_B)
@@ -420,7 +504,6 @@ class CausalWindowedKAttention(torch.nn.Module):
         v_glob = torch.gather(v_s, 2, gather_kv).view(B, H, T, k_off * bs, D)
         glob_gate = off_valid.unsqueeze(-1).expand(-1, -1, -1, -1, bs).reshape(B, H, T, k_off * bs)
 
-        # 3. Local Causal Window (exact within current W window)
         q_win_1d = torch.arange(T, device=x.device) // W
         k_loc = k_eff.view(B, H, N_W, W, D)[:, :, q_win_1d, :, :]
         v_loc = v.view(B, H, N_W, W, D)[:, :, q_win_1d, :, :]
@@ -436,14 +519,17 @@ class CausalWindowedKAttention(torch.nn.Module):
             dim=-1,
         )
 
-        # 4. Stage-2 Kattention Token Top-K (k=4)
         scores = torch.einsum("bhtd,bhtkd->bhtk", q_eff, k_g) * scale
         scores = scores.masked_fill(~full_mask, float("-inf"))
-        tok_mask = hnet4.TopKHot.apply(
-            scores, min(self.cfg.k_sparse_tok, scores.size(-1)), self.cfg.topk_mode
-        )
 
-        probs = F.softmax(scores, dim=-1) * tok_mask * gate
+        if self.two_stage_tok:
+            tok_mask = hnet4.TopKHot.apply(
+                scores, min(self.cfg.k_sparse_tok, scores.size(-1)), self.cfg.topk_mode
+            )
+            probs = F.softmax(scores, dim=-1) * tok_mask * gate
+        else:
+            probs = F.softmax(scores, dim=-1) * gate
+
         probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-8)
 
         out = torch.einsum("bhtk,bhtkd->bhtd", probs, v_g)
@@ -452,11 +538,13 @@ class CausalWindowedKAttention(torch.nn.Module):
 
 def build_cw_model(
     cfg: hnet4.HNetConfig,
-    win_size: int = 8,
+    win_size: int = 32,
     update_every: int = 8,
     use_l2_norm: bool = True,
     update_mode: str = "ue8",
-    v11_sub_n: int = 4096,
+    v11_sub_n: int = 1024,
+    use_flex: bool = False,
+    two_stage_tok: bool = True,
 ) -> hnet4.HNet:
     model = hnet4.HNet(vocab_size=hnet4.vocab_size, cfg=cfg).to(hnet4.device)
     for block in model.inner:
@@ -468,6 +556,8 @@ def build_cw_model(
             use_l2_norm=use_l2_norm,
             update_mode=update_mode,
             v11_sub_n=v11_sub_n,
+            use_flex=use_flex,
+            two_stage_tok=two_stage_tok,
         ).to(hnet4.device)
         new_attn.load_state_dict(old_attn.state_dict(), strict=False)
         block.attn = new_attn
@@ -475,7 +565,7 @@ def build_cw_model(
 
 
 # =====================================================================
-# 3. Optimal Token-Overlap Hungarian Alignment
+# 3. Optimal Token-Overlap Hungarian Alignment & Oracle Audit
 # =====================================================================
 
 def _solve_max_assignment(mat_np):
@@ -507,73 +597,6 @@ def token_overlap_agreement(X_heads: torch.Tensor, C_old: torch.Tensor, C_new: t
         hung_acc.append(float(overlap[h][r_ind, c_ind].sum()) / N)
 
     return sum(asis_acc) / H, sum(hung_acc) / H
-
-
-# =====================================================================
-# 4. Oracle Recall & Quantization Audit Helpers
-# =====================================================================
-
-@torch.no_grad()
-def eval_router_oracle(
-    q_eff: torch.Tensor,
-    k_eff: torch.Tensor,
-    k_mag: torch.Tensor,
-    scale: float,
-    C_use: torch.Tensor | None,
-    bs: int,
-    k_blocks: int,
-    mag_sort: bool,
-    oracle_probs: torch.Tensor,
-    oracle_top4: torch.Tensor,
-):
-    B, H, T, D = k_eff.shape
-    N_B = T // bs
-    k_off = max(1, min(k_blocks - 1, N_B - 1))
-
-    if C_use is None:
-        perm_k = torch.arange(T, device=k_eff.device).view(1, 1, T).expand(B, H, T)
-    else:
-        k_n = F.normalize(k_eff, p=2, dim=-1)
-        k_scores = torch.einsum("bhtd,hmd->bhtm", k_n, C_use.to(k_n.dtype))
-        assign_k = torch.argmax(k_scores, dim=-1)
-        if mag_sort:
-            mag_rank = k_mag / (k_mag.amax(dim=-1, keepdim=True) + 1.0)
-            sort_key = assign_k.float() * 2.0 + (1.0 - mag_rank)
-            perm_k = torch.argsort(sort_key, dim=-1, stable=True)
-        else:
-            perm_k = torch.argsort(assign_k, dim=-1, stable=True)
-
-    k_s = torch.gather(k_eff, 2, perm_k.unsqueeze(-1).expand(-1, -1, -1, D))
-    block_C = k_s.view(B, H, N_B, bs, D).mean(dim=3)
-    router_logits = torch.matmul(q_eff, block_C.transpose(-2, -1)) * scale
-
-    orig_k_blocks = perm_k.view(B, H, N_B, bs)
-    q_block_id = torch.arange(T, device=q_eff.device) // bs
-    block_q_start = (q_block_id * bs).view(1, 1, T, 1)
-    block_has_past = (orig_k_blocks.amin(dim=-1).unsqueeze(2) < block_q_start)
-
-    off_logits = router_logits.masked_fill(~block_has_past, float("-inf"))
-    _, off_idx = torch.topk(off_logits, k=k_off, dim=-1)
-    off_valid_sel = torch.gather(off_logits, -1, off_idx) > float("-inf")
-
-    flat_idx = off_idx.view(B, H, T * k_off)
-    orig_k_glob = torch.gather(
-        orig_k_blocks, 2, flat_idx.unsqueeze(-1).expand(-1, -1, -1, bs)
-    ).view(B, H, T, k_off * bs)
-    glob_valid_tok = off_valid_sel.unsqueeze(-1).expand(-1, -1, -1, -1, bs).reshape(B, H, T, k_off * bs)
-
-    orig_loc = torch.arange(T, device=q_eff.device).view(N_B, bs)[q_block_id, :].view(1, 1, T, bs).expand(B, H, -1, -1)
-    t_pos = torch.arange(T, device=q_eff.device).view(1, 1, T, 1)
-
-    full_mask = torch.cat([t_pos >= orig_loc, (orig_k_glob < block_q_start) & glob_valid_tok], dim=-1)
-    cand_pos = torch.cat([orig_loc, orig_k_glob], dim=-1)
-
-    gathered_probs = torch.gather(oracle_probs[:, :, 4:, :], -1, cand_pos[:, :, 4:, :].clamp(min=0))
-    mass_captured = (gathered_probs * full_mask[:, :, 4:, :].float()).sum(dim=-1).mean().item()
-
-    cand_masked = cand_pos[:, :, 4:, :].masked_fill(~full_mask[:, :, 4:, :], -1)
-    hits = (oracle_top4.unsqueeze(-1) == cand_masked.unsqueeze(-2)).any(dim=-1)
-    return hits.float().mean().item(), mass_captured
 
 
 @torch.no_grad()
@@ -649,28 +672,18 @@ def audit_v11_layer(attn_mod, x_in: torch.Tensor) -> dict:
     H, D = attn_mod.n_head, attn_mod.head_dim
     M = attn_mod.cfg.emeans_clusters
     bs = attn_mod.cfg.emeans_block_size
-    is_cw = isinstance(attn_mod, CausalWindowedKAttention)
+    W = attn_mod.win_size
 
     q = attn_mod.q_attn(x_in).view(B, T, H, D).transpose(1, 2)
     k = attn_mod.k_attn(x_in).view(B, T, H, D).transpose(1, 2)
     k_mag = k.float().norm(dim=-1)
 
-    if is_cw:
-        if attn_mod.use_l2_norm:
-            q_eff = F.normalize(q, p=2, dim=-1)
-            k_eff = F.normalize(k, p=2, dim=-1)
-            scale = attn_mod.logit_scale.exp().clamp(max=50.0).item()
-        else:
-            q_eff = q * (math.log(max(T, 2)) * attn_mod.qm)
-            k_eff = k
-            scale = 1.0 / math.sqrt(D)
-    elif attn_mod.cfg.variant == "l2_norm":
+    if attn_mod.use_l2_norm:
         q_eff = F.normalize(q, p=2, dim=-1)
         k_eff = F.normalize(k, p=2, dim=-1)
         scale = attn_mod.logit_scale.exp().clamp(max=50.0).item()
     else:
-        scale_t = math.log(max(T, 2)) if attn_mod.cfg.use_qm_scale else 1.0
-        q_eff = q * (scale_t * attn_mod.qm) if attn_mod.cfg.use_qm_scale else q
+        q_eff = q * (math.log(max(T, 2)) * attn_mod.qm)
         k_eff = k
         scale = 1.0 / math.sqrt(D)
 
@@ -715,17 +728,10 @@ def audit_v11_layer(attn_mod, x_in: torch.Tensor) -> dict:
     oracle_probs = F.softmax(oracle_logits, dim=-1)
     _, oracle_top4 = torch.topk(oracle_logits[:, :, 4:, :], k=4, dim=-1)
 
-    if is_cw:
-        W = attn_mod.win_size
-        rec_tr, mass_tr = eval_cw_router_oracle(q_eff, k_eff, k_mag, scale, C_tr, W, bs, attn_mod.cfg.k_blocks, oracle_probs, oracle_top4)
-        rec_fr25, _ = eval_cw_router_oracle(q_eff, k_eff, k_mag, scale, C_fr_25, W, bs, attn_mod.cfg.k_blocks, oracle_probs, oracle_top4)
-        rec_fr10, _ = eval_cw_router_oracle(q_eff, k_eff, k_mag, scale, C_fr_10, W, bs, attn_mod.cfg.k_blocks, oracle_probs, oracle_top4)
-        rec_seq, mass_seq = eval_cw_router_oracle(q_eff, k_eff, k_mag, scale, None, W, bs, attn_mod.cfg.k_blocks, oracle_probs, oracle_top4)
-    else:
-        rec_tr, mass_tr = eval_router_oracle(q_eff, k_eff, k_mag, scale, C_tr, bs, attn_mod.cfg.k_blocks, attn_mod.cfg.mag_sort, oracle_probs, oracle_top4)
-        rec_fr25, _ = eval_router_oracle(q_eff, k_eff, k_mag, scale, C_fr_25, bs, attn_mod.cfg.k_blocks, attn_mod.cfg.mag_sort, oracle_probs, oracle_top4)
-        rec_fr10, _ = eval_router_oracle(q_eff, k_eff, k_mag, scale, C_fr_10, bs, attn_mod.cfg.k_blocks, attn_mod.cfg.mag_sort, oracle_probs, oracle_top4)
-        rec_seq, mass_seq = eval_router_oracle(q_eff, k_eff, k_mag, scale, None, bs, attn_mod.cfg.k_blocks, False, oracle_probs, oracle_top4)
+    rec_tr, mass_tr = eval_cw_router_oracle(q_eff, k_eff, k_mag, scale, C_tr, W, bs, attn_mod.cfg.k_blocks, oracle_probs, oracle_top4)
+    rec_fr25, _ = eval_cw_router_oracle(q_eff, k_eff, k_mag, scale, C_fr_25, W, bs, attn_mod.cfg.k_blocks, oracle_probs, oracle_top4)
+    rec_fr10, _ = eval_cw_router_oracle(q_eff, k_eff, k_mag, scale, C_fr_10, W, bs, attn_mod.cfg.k_blocks, oracle_probs, oracle_top4)
+    rec_seq, mass_seq = eval_cw_router_oracle(q_eff, k_eff, k_mag, scale, None, W, bs, attn_mod.cfg.k_blocks, oracle_probs, oracle_top4)
 
     return {
         "drift": (loss_tr / loss_fr25.clamp(min=1e-6)).mean().item(),
@@ -761,9 +767,7 @@ def audit_model(name: str, raw_model: hnet4.HNet, vx: torch.Tensor):
     reports = []
     for l_idx, block in enumerate(raw_model.inner):
         x_in = block.ln_1(x)
-        if isinstance(block.attn, hnet4.UniversalEngineV11Attention) or (
-            isinstance(block.attn, CausalWindowedKAttention) and block.attn.cfg.emeans_clusters > 1
-        ):
+        if isinstance(block.attn, CausalWindowedKAttention) and block.attn.cfg.emeans_clusters > 1:
             st = audit_v11_layer(block.attn, x_in)
             st["layer"] = l_idx
             reports.append(st)
@@ -802,21 +806,23 @@ def evaluate_model_local(raw_model: hnet4.HNet, get_batch_fn) -> tuple[float, fl
 
 
 # =====================================================================
-# 5. Benchmark + Audit Runner
+# 4. Benchmark + Audit Runner
 # =====================================================================
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--steps", type=int, default=10000)
+    parser.add_argument("--steps", type=int, default=5000)
     parser.add_argument("--audit-every", type=int, default=1000)
-    parser.add_argument("--compile", action="store_true", help="Compile models for faster training")
-    parser.add_argument("--block-size", type=int, default=256, help="Outer seq len (inner scales //2 -> //4)")
-    parser.add_argument("--batch-size", type=int, default=64, help="Match ~16384 tok/step (e.g., 16 for block-size 1024)")
-    parser.add_argument("--win-size", type=int, default=8, help="Causal window size W in inner attention")
-    parser.add_argument("--bs", type=int, default=4, help="Block size inside each window (W % bs == 0)")
+    parser.add_argument("--compile", action="store_true", help="Compile models (recommended for FlexAttention)")
+    parser.add_argument("--block-size", type=int, default=1024, help="Outer seq len (inner scales //2 -> //4)")
+    parser.add_argument("--batch-size", type=int, default=16, help="Match ~16384 tok/step (16 for block-size 1024)")
+    parser.add_argument("--win-size", type=int, default=None, help="Causal window size W (default: 32 if T_inner>=256 else 8)")
+    parser.add_argument("--bs", type=int, default=None, help="Block size inside window (default: 16 if T_inner>=256 else 4)")
     parser.add_argument("--k-blocks", type=int, default=4, help="Stage-1 blocks (k_off = k_blocks - 1)")
-    parser.add_argument("--v11-sub-n", type=int, default=4096, help="Subsample size for v11 per head")
-    parser.add_argument("--with-seq", action="store_true", help="Also include unclustered cw_seq")
+    parser.add_argument("--update-mode", type=str, default="ue8", choices=["ue8", "v11_every"])
+    parser.add_argument("--v11-sub-n", type=int, default=1024, help="Subsample size for v11 per head")
+    parser.add_argument("--no-stage2", action="store_true", help="Disable Stage-2 TopKHot on cw_noflex for 1:1 soft-attn parity")
+    parser.add_argument("--no-kattn", action="store_true", help="Skip kattn_baseline and only compare cw_noflex vs cw_flex")
     args = parser.parse_args()
 
     torch.set_float32_matmul_precision("high")
@@ -824,8 +830,10 @@ def main():
 
     k_l1 = args.block_size // 2
     k_l2 = args.block_size // 4
-    assert k_l2 % args.win_size == 0 and args.win_size % args.bs == 0, (
-        f"Need T_inner ({k_l2}) % win_size ({args.win_size}) == 0 and win_size % bs ({args.bs}) == 0"
+    bs = args.bs if args.bs is not None else (16 if k_l2 >= 256 else 4)
+    win_size = args.win_size if args.win_size is not None else (2 * bs)
+    assert k_l2 % win_size == 0 and win_size % bs == 0, (
+        f"Need T_inner ({k_l2}) % win_size ({win_size}) == 0 and win_size % bs ({bs}) == 0"
     )
 
     get_batch_fn = hnet4.utils.get_get_batch(
@@ -843,21 +851,30 @@ def main():
         block_size=args.block_size,
         k_gather_l1=k_l1,
         k_gather_l2=k_l2,
-        emeans_block_size=args.bs,
+        emeans_block_size=bs,
         k_blocks=args.k_blocks,
         emeans_clusters=16,
     )
 
-    specs = {
-        "kattn_baseline":  (base_kattn, None),
-        "cw_l2_ue8":       (base_cw, dict(win_size=args.win_size, update_every=8, use_l2_norm=True, update_mode="ue8",       v11_sub_n=args.v11_sub_n)),
-        "cw_l2_v11_every": (base_cw, dict(win_size=args.win_size, update_every=1, use_l2_norm=True, update_mode="v11_every", v11_sub_n=args.v11_sub_n)),
-    }
-    if args.with_seq:
-        specs["cw_seq"] = (
-            replace(base_cw, emeans_clusters=1),
-            dict(win_size=args.win_size, update_every=8, use_l2_norm=True, update_mode="ue8", v11_sub_n=args.v11_sub_n),
-        )
+    specs = {}
+    #if not args.no_kattn:
+    #    specs["kattn_baseline"] = (base_kattn, None)
+    #specs["cw_noflex"] = (
+    #    base_cw,
+    #    dict(
+    #        win_size=win_size, update_every=8, use_l2_norm=True,
+    #        update_mode=args.update_mode, v11_sub_n=args.v11_sub_n,
+    #        use_flex=False, two_stage_tok=(not args.no_stage2),
+    #    ),
+    #)
+    specs["cw_flex"] = (
+        base_cw,
+        dict(
+            win_size=win_size, update_every=8, use_l2_norm=True,
+            update_mode=args.update_mode, v11_sub_n=args.v11_sub_n,
+            use_flex=True, two_stage_tok=False,
+        ),
+    )
 
     raw_models, models, opts = {}, {}, {}
     bx0, by0 = get_batch_fn("train")
@@ -887,7 +904,7 @@ def main():
 
     print(
         f"Auditor on {device} | B={args.batch_size} seq={args.block_size}->{k_l1}->{k_l2} "
-        f"(W={args.win_size}, bs={args.bs}, k_blk={args.k_blocks}, sub_n={args.v11_sub_n}) | "
+        f"(W={win_size}, bs={bs}, k_blk={args.k_blocks}, mode={args.update_mode}, stage2={not args.no_stage2}) | "
         f"steps={args.steps} | compile={args.compile}"
     )
 

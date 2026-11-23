@@ -36,6 +36,9 @@ Orthlin = modules.OrthogonalLinear
 #settings :)
 #intest
 
+cw_v11          = True
+
+
 cardnewt        = False   
 rootkan         = False  
 rootkan_highdeg = False
@@ -43,7 +46,7 @@ rootkan_pade    = False
 rootkan_glu     = False
 
 qrot_radial     = False
-qrot_pre_rootkan= True
+qrot_pre_rootkan= False
 qrot_angle      = False
 
 
@@ -289,6 +292,448 @@ class Attention(nn.Module):
 
         return y
 
+
+
+class _TopKHot(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, k, mode="dense"):
+        k = min(k, x.size(-1))
+        _, indices = torch.topk(x, k=k, dim=-1)
+        active_mask = torch.zeros_like(x).scatter_(-1, indices, 1.0)
+        valid_positions = (x > float("-inf")).to(x.dtype)
+        active_mask = active_mask * valid_positions
+        ctx.save_for_backward(x, active_mask, valid_positions)
+        ctx.k = k
+        ctx.mode = mode
+        return active_mask
+
+    @staticmethod
+    def backward(ctx, g):
+        x, active_mask, valid_positions = ctx.saved_tensors
+        k, mode = ctx.k, ctx.mode
+        if mode == "k_sparse":
+            return g * active_mask, None, None
+
+        with torch.no_grad():
+            score_target = -g.masked_fill(valid_positions == 0, float("-inf"))
+            _, topk_idx = torch.topk(score_target, k=k, dim=-1)
+            hard_target = torch.zeros_like(x).scatter_(-1, topk_idx, 1.0) * valid_positions
+
+        valid_cnt = valid_positions.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        g_scale = (g * valid_positions).abs().sum(dim=-1, keepdim=True) / valid_cnt
+
+        if mode == "dense":
+            grad_x = g_scale * (torch.sigmoid(x) - hard_target) * valid_positions
+        elif mode == "2k_sparse":
+            grad_x = g_scale * (torch.sigmoid(x) * active_mask - hard_target) * valid_positions
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+        return grad_x, None, None
+
+
+@torch.no_grad()
+def _v11_batched_spherical(
+    X_heads: torch.Tensor,
+    k: int = 16,
+    sub_n: int = 1024,
+    valley_boost: float = 2.5,
+    bw_scale: float = 0.65,
+) -> torch.Tensor:
+    orig_dtype = X_heads.dtype
+    dev = X_heads.device
+    X_in = F.normalize(
+        torch.nan_to_num(X_heads.float(), nan=0.0, posinf=1e4, neginf=-1e4),
+        p=2,
+        dim=-1,
+    )
+    H, N, D = X_in.shape
+
+    if N > sub_n:
+        S = sub_n
+        idx_sub = torch.randint(0, N, (H, S), device=dev)
+        X_sub = torch.gather(X_in, 1, idx_sub.unsqueeze(-1).expand(-1, -1, D))
+    else:
+        S = N
+        X_sub = X_in[:, torch.randperm(S, device=dev), :]
+
+    is_B = (torch.arange(S, device=dev) & 1) == 1
+    C_buf = torch.zeros((H, k, D), device=dev, dtype=torch.float32)
+    init_c = F.normalize(X_sub.mean(dim=1), p=2, dim=-1)
+    C_buf = torch.cat([init_c.unsqueeze(1), C_buf[:, 1:, :]], dim=1)
+    prev_V = torch.zeros((H, k, D), device=dev, dtype=torch.float32)
+
+    num_bins = 64
+    idx_b = torch.arange(num_bins, device=dev, dtype=torch.float32)
+    dist2 = (idx_b.unsqueeze(0) - idx_b.unsqueeze(1)) ** 2
+    sigma_bins = float(num_bins - 1) / 8.0
+
+    schedule = []
+    m_cur = 1
+    while m_cur < k:
+        b_sched = min(m_cur, max(1, (2 * m_cur + 2) // 3), k - m_cur)
+        schedule.append((m_cur, b_sched))
+        m_cur += b_sched
+
+    for m, b in schedule:
+        C_curr = C_buf[:, :m, :]
+        _, assign = torch.max(torch.bmm(X_sub, C_curr.transpose(1, 2)), dim=-1)
+
+        O = torch.zeros(H, S, m, device=dev, dtype=torch.float32).scatter_(
+            2, assign.unsqueeze(-1), 1.0
+        )
+        total_cnt = O.sum(dim=1)
+        w_sum = total_cnt.clamp(min=1e-6)
+        M = torch.bmm(O.transpose(1, 2), X_sub) / w_sum.unsqueeze(-1)
+
+        pv = prev_V[:, :m, :]
+        V1 = torch.randn(H, m, D, device=dev, dtype=torch.float32)
+        V1 = F.normalize(V1 - (V1 * pv).sum(dim=-1, keepdim=True) * pv, p=2, dim=-1, eps=1e-9)
+
+        V2 = torch.randn(H, m, D, device=dev, dtype=torch.float32)
+        V2 = F.normalize(V2 - (V2 * V1).sum(dim=-1, keepdim=True) * V1, p=2, dim=-1, eps=1e-9)
+
+        for _ in range(3):
+            V_both = torch.cat([V1, V2], dim=1)
+            dots = torch.bmm(X_sub, V_both.transpose(1, 2))
+            dot1 = dots[:, :, :m].gather(2, assign.unsqueeze(-1)).squeeze(-1)
+            dot2 = dots[:, :, m:].gather(2, assign.unsqueeze(-1)).squeeze(-1)
+
+            z1 = dot1 - (M * V1).sum(dim=-1).gather(1, assign)
+            z2 = dot2 - (M * V2).sum(dim=-1).gather(1, assign)
+
+            Z1_mat = O * z1.unsqueeze(-1)
+            Z2_mat = O * z2.unsqueeze(-1)
+            V_next_both = torch.bmm(torch.cat([Z1_mat, Z2_mat], dim=2).transpose(1, 2), X_sub) - torch.cat([
+                Z1_mat.sum(dim=1).unsqueeze(-1) * M,
+                Z2_mat.sum(dim=1).unsqueeze(-1) * M,
+            ], dim=1)
+
+            V1 = F.normalize(V_next_both[:, :m, :], p=2, dim=-1, eps=1e-9)
+            V2 = V_next_both[:, m:, :]
+            V2 = F.normalize(V2 - (V2 * V1).sum(dim=-1, keepdim=True) * V1, p=2, dim=-1, eps=1e-9)
+
+        V_both = torch.cat([V1, V2], dim=1)
+        dots = torch.bmm(X_sub, V_both.transpose(1, 2))
+        u1 = dots[:, :, :m].gather(2, assign.unsqueeze(-1)).squeeze(-1) - (M * V1).sum(dim=-1).gather(1, assign)
+        u2 = dots[:, :, m:].gather(2, assign.unsqueeze(-1)).squeeze(-1) - (M * V2).sum(dim=-1).gather(1, assign)
+
+        var1 = torch.zeros(H, m, device=dev, dtype=torch.float32).scatter_add_(1, assign, u1 * u1) / w_sum
+        sig1 = torch.sqrt(var1.clamp(min=1e-12))
+        cA_1, cA_2 = -0.75 * sig1, torch.zeros_like(sig1)
+        cB_1, cB_2 = +0.75 * sig1, torch.zeros_like(sig1)
+
+        for _ in range(3):
+            dA2 = (u1 - cA_1.gather(1, assign)) ** 2 + (u2 - cA_2.gather(1, assign)) ** 2
+            dB2 = (u1 - cB_1.gather(1, assign)) ** 2 + (u2 - cB_2.gather(1, assign)) ** 2
+            w_B = (dB2 < dA2).float()
+            w_A = 1.0 - w_B
+            sum_wA = torch.zeros(H, m, device=dev, dtype=torch.float32).scatter_add_(1, assign, w_A).clamp(min=1e-6)
+            sum_wB = torch.zeros(H, m, device=dev, dtype=torch.float32).scatter_add_(1, assign, w_B).clamp(min=1e-6)
+            cA_1 = torch.zeros(H, m, device=dev, dtype=torch.float32).scatter_add_(1, assign, w_A * u1) / sum_wA
+            cA_2 = torch.zeros(H, m, device=dev, dtype=torch.float32).scatter_add_(1, assign, w_A * u2) / sum_wA
+            cB_1 = torch.zeros(H, m, device=dev, dtype=torch.float32).scatter_add_(1, assign, w_B * u1) / sum_wB
+            cB_2 = torch.zeros(H, m, device=dev, dtype=torch.float32).scatter_add_(1, assign, w_B * u2) / sum_wB
+
+        del_1, del_2 = cB_1 - cA_1, cB_2 - cA_2
+        norm_del = torch.sqrt(del_1 * del_1 + del_2 * del_2).clamp(min=1e-9)
+        V_star = F.normalize(
+            (del_1 / norm_del).unsqueeze(-1) * V1 + (del_2 / norm_del).unsqueeze(-1) * V2,
+            p=2,
+            dim=-1,
+            eps=1e-9,
+        )
+
+        proj = torch.bmm(X_sub, V_star.transpose(1, 2)).gather(2, assign.unsqueeze(-1)).squeeze(-1)
+        dot_mu_v = (M * V_star).sum(dim=-1)
+        diff = proj - dot_mu_v.gather(1, assign)
+        var = torch.zeros(H, m, device=dev, dtype=torch.float32).scatter_add_(1, assign, diff * diff) / w_sum
+        half_span = (4.0 * torch.sqrt(var.clamp(min=1e-12))).clamp(min=1e-4)
+        lo_v = dot_mu_v - half_span
+        span = 2.0 * half_span
+
+        pos = ((proj - lo_v.gather(1, assign)) / span.gather(1, assign) * (num_bins - 1)).clamp(
+            0.0, float(num_bins - 1) - 1e-4
+        )
+        b0 = pos.floor().long()
+        b1 = (b0 + 1).clamp(max=num_bins - 1)
+        frac = pos - b0.float()
+
+        flat_base = is_B.long().view(1, S) * (m * num_bins) + assign * num_bins
+        hist_ab = torch.zeros(H, 2 * m * num_bins, device=dev, dtype=torch.float32)
+        hist_ab.scatter_add_(1, flat_base + b0, 1.0 - frac)
+        hist_ab.scatter_add_(1, flat_base + b1, frac)
+        raw_ab = hist_ab.view(H, 2, m, num_bins).permute(0, 2, 3, 1)
+
+        h_bins = bw_scale * sigma_bins * (0.5 * total_cnt).clamp(min=2.0).pow(-0.2)
+        h2 = torch.clamp(h_bins * h_bins, min=0.05).view(H, m, 1, 1)
+        K_kernel = torch.exp(-0.5 * dist2.view(1, 1, num_bins, num_bins) / h2)
+        K_kernel = K_kernel / K_kernel.sum(dim=2, keepdim=True).clamp(min=1e-6)
+        dens_ab = torch.matmul(K_kernel, raw_ab)
+        dens_A, dens_B = dens_ab[..., 0], dens_ab[..., 1]
+
+        lp_A = torch.cummax(dens_A, dim=-1).values
+        rp_A = torch.cummax(dens_A.flip(-1), dim=-1).values.flip(-1)
+        lp_B = torch.cummax(dens_B, dim=-1).values
+        rp_B = torch.cummax(dens_B.flip(-1), dim=-1).values.flip(-1)
+
+        val_persist = torch.minimum(
+            (torch.minimum(lp_A, rp_A) - dens_A).clamp(min=0.0),
+            (torch.minimum(lp_B, rp_B) - dens_B).clamp(min=0.0),
+        )
+        dens_mean = 0.5 * (dens_A + dens_B)
+        cdf = torch.cumsum(dens_mean, dim=-1) / dens_mean.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        v_max, v_idx = torch.max(val_persist * (4.0 * cdf * (1.0 - cdf)), dim=-1)
+
+        df_A = dens_A[..., 1:] - dens_A[..., :-1]
+        df_B = dens_B[..., 1:] - dens_B[..., :-1]
+        agree = (df_A * df_B).sum(dim=-1) / ((df_A.norm(dim=-1) * df_B.norm(dim=-1)) + 1e-8)
+
+        min_dens_max = torch.minimum(dens_A, dens_B).amax(dim=-1)
+        has_valley = (v_max > 0.03 * min_dens_max) & (agree > 0.35)
+        v_cand = lo_v + (v_idx.float() / (num_bins - 1)) * span
+        thresh = torch.where(has_valley, v_cand, dot_mu_v)
+
+        is_left = proj < thresh.gather(1, assign)
+        cnt_left = (O * is_left.float().unsqueeze(-1)).sum(dim=1)
+        cnt_right = total_cnt - cnt_left
+        thresh = torch.where((cnt_left < 1.0) | (cnt_right < 1.0), dot_mu_v, thresh)
+
+        left_f = (proj < thresh.gather(1, assign)).float().unsqueeze(-1)
+        O_left = O * left_f
+        O_right = O - O_left
+        cnt_left = O_left.sum(dim=1)
+        cnt_right = total_cnt - cnt_left
+
+        C_left = F.normalize(torch.bmm(O_left.transpose(1, 2), X_sub) / cnt_left.clamp(min=1e-6).unsqueeze(-1), p=2, dim=-1)
+        C_right = F.normalize(torch.bmm(O_right.transpose(1, 2), X_sub) / cnt_right.clamp(min=1e-6).unsqueeze(-1), p=2, dim=-1)
+        valid = (cnt_left >= 1.0) & (cnt_right >= 1.0)
+
+        delta_sse = (cnt_left * cnt_right / (cnt_left + cnt_right).clamp(min=1e-6)) * (C_left - C_right).square().sum(dim=-1)
+        ranking_score = torch.where(valid, delta_sse, torch.zeros_like(delta_sse)) * torch.where(has_valley, valley_boost, 1.0)
+
+        _, top_ids = torch.topk(ranking_score, b, dim=-1, largest=True)
+        ok = valid.gather(1, top_ids).unsqueeze(-1)
+        top_ids_d = top_ids.unsqueeze(-1).expand(-1, -1, D)
+
+        C_l_sel = torch.where(ok, C_left.gather(1, top_ids_d), C_curr.gather(1, top_ids_d))
+        C_r_sel = torch.where(ok, C_right.gather(1, top_ids_d), X_sub[:, :b, :])
+        V_sel = V_star.gather(1, top_ids_d)
+
+        C_left_upd = C_curr.scatter(1, top_ids_d, C_l_sel)
+        V_left_upd = pv.scatter(1, top_ids_d, V_sel)
+        if m + b < k:
+            C_buf = torch.cat([C_left_upd, C_r_sel, C_buf[:, m + b :, :]], dim=1)
+            prev_V = torch.cat([V_left_upd, V_sel, prev_V[:, m + b :, :]], dim=1)
+        else:
+            C_buf = torch.cat([C_left_upd, C_r_sel], dim=1)
+            prev_V = torch.cat([V_left_upd, V_sel], dim=1)
+
+    return C_buf.to(orig_dtype)
+
+
+@torch.no_grad()
+def _damped_lloyd_spherical(x_heads: torch.Tensor, C_heads: torch.Tensor, damp_scale: float = 2.0) -> torch.Tensor:
+    H, N, _ = x_heads.shape
+    M = C_heads.shape[1]
+    x_f32 = F.normalize(x_heads.float(), p=2, dim=-1)
+    C_f32 = C_heads.float()
+
+    max_score, assign = torch.max(torch.bmm(x_f32, C_f32.transpose(1, 2)), dim=-1)
+    dist_sq = torch.clamp(1.0 - max_score, min=0.0)
+
+    step = max(1, N // 1024)
+    lam = torch.clamp(damp_scale * torch.median(dist_sq[:, ::step], dim=1, keepdim=True).values, min=1e-4)
+    w = lam / (dist_sq + lam)
+
+    O_w = torch.zeros(H, N, M, device=x_heads.device, dtype=torch.float32)
+    O_w.scatter_(2, assign.unsqueeze(-1), w.unsqueeze(-1))
+
+    counts = O_w.sum(dim=1).unsqueeze(-1)
+    new_C = F.normalize(torch.bmm(O_w.transpose(1, 2), x_f32) / torch.clamp(counts, min=1e-6), p=2, dim=-1)
+    return torch.where(counts < 1e-6, C_f32, new_C).to(C_heads.dtype)
+
+
+class CausalWindowedV11Attention(nn.Module):
+    """Drop-in NanoGPT attention: Causal-Windowed v11 + Stage-2 Kattention (cw_l2)."""
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.head_dim = config.n_embd // config.n_head
+
+        bias = getattr(config, "bias", False)
+        dropout = getattr(config, "dropout", 0.0)
+
+        # Optional config overrides (safe defaults match cw_l2_m16)
+        self.win_size = getattr(config, "cw_win_size", 8)
+        self.bs = getattr(config, "cw_block_size", 4)
+        self.k_blocks = getattr(config, "cw_k_blocks", 4)
+        self.k_sparse_tok = getattr(config, "cw_k_sparse_tok", 4)
+        self.n_clusters = getattr(config, "cw_n_clusters", 16)
+        self.update_every = getattr(config, "cw_update_every", 8)
+        self.refresh_interval = getattr(config, "cw_refresh_interval", 50)
+        self.sub_n = getattr(config, "cw_sub_n", 1024)
+        self.update_mode = getattr(config, "cw_update_mode", "ue8")  # "ue8" | "v11_every"
+        self.topk_mode = getattr(config, "cw_topk_mode", "dense")
+        assert self.win_size % self.bs == 0
+
+        self._step_cnt = 0
+        self._last_refresh = 0
+
+        self.q_attn = nn.Linear(self.n_embd, self.n_embd, bias=bias)
+        self.k_attn = nn.Linear(self.n_embd, self.n_embd, bias=bias)
+        self.v_attn = nn.Linear(self.n_embd, self.n_embd, bias=bias)
+        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=bias)
+        self.resid_dropout = nn.Dropout(dropout)
+
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(14.0)))
+        init_c = F.normalize(torch.randn(self.n_head, self.n_clusters, self.head_dim) * 0.02, p=2, dim=-1)
+        self.register_buffer("C_heads", init_c)
+
+    @torch._dynamo.disable
+    @torch.no_grad()
+    def _maybe_update_centroids(self, k_n: torch.Tensor):
+        self._step_cnt += 1
+        is_first = (self._step_cnt == 1)
+        is_full_refresh = is_first or ((self._step_cnt - self._last_refresh) >= self.refresh_interval)
+        if not is_full_refresh and (self._step_cnt % self.update_every != 0):
+            return
+
+        B, H, T, D = k_n.shape
+        x_heads = torch.nan_to_num(
+            k_n.detach().float().transpose(0, 1).reshape(H, B * T, D),
+            nan=0.0, posinf=1e4, neginf=-1e4,
+        )
+        if is_full_refresh:
+            self._last_refresh = self._step_cnt
+            C_seed = _v11_batched_spherical(x_heads, k=self.n_clusters, sub_n=self.sub_n)
+        else:
+            C_seed = self.C_heads.float()
+
+        C_next = _damped_lloyd_spherical(x_heads, C_seed, damp_scale=2.0).to(self.C_heads.dtype)
+        self.C_heads.copy_(C_next)
+
+    def forward(self, x, causal=True):
+        B, T, C = x.size()
+        H, D = self.n_head, self.head_dim
+        W, bs = self.win_size, self.bs
+
+        q = self.q_attn(x).view(B, T, H, D).transpose(1, 2)
+        k = self.k_attn(x).view(B, T, H, D).transpose(1, 2)
+        v = self.v_attn(x).view(B, T, H, D).transpose(1, 2)
+
+        q_eff = F.normalize(q, p=2, dim=-1)
+        k_eff = F.normalize(k, p=2, dim=-1)
+        scale = self.logit_scale.exp().clamp(max=50.0)
+
+        # Short-sequence fallback (e.g., generate() when T <= W)
+        if T <= W:
+            att = torch.matmul(q_eff, k_eff.transpose(-2, -1)) * scale
+            if causal:
+                cmask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool)).view(1, 1, T, T)
+                att = att.masked_fill(~cmask, float("-inf"))
+            tok_mask = _TopKHot.apply(att, min(self.k_sparse_tok, T), self.topk_mode)
+            probs = F.softmax(att, dim=-1) * tok_mask
+            probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-6)
+            out = torch.matmul(probs, v).transpose(1, 2).contiguous().view(B, T, C)
+            return self.resid_dropout(self.c_proj(out))
+
+        # Pad on right only during eval/generate if T % W != 0 (never triggers when T = block_size)
+        pad = (W - (T % W)) % W
+        if pad > 0:
+            q_eff = F.pad(q_eff, (0, 0, 0, pad))
+            k_eff = F.pad(k_eff, (0, 0, 0, pad))
+            v = F.pad(v, (0, 0, 0, pad))
+            k_mag = F.pad(k.float().norm(dim=-1), (0, pad))
+        else:
+            k_mag = k.float().norm(dim=-1)
+
+        T_pad = T + pad
+        N_W, B_W = T_pad // W, W // bs
+        N_B = N_W * B_W
+        k_off = max(1, min(self.k_blocks - 1, N_B - B_W))
+
+        if self.training:
+            if self.update_mode == "v11_every":
+                with torch.no_grad():
+                    x_heads = torch.nan_to_num(
+                        k_eff.detach().float().transpose(0, 1).reshape(H, B * T_pad, D),
+                        nan=0.0, posinf=1e4, neginf=-1e4,
+                    )
+                    C_v11 = _v11_batched_spherical(x_heads, k=self.n_clusters, sub_n=self.sub_n)
+                    C_next = _damped_lloyd_spherical(x_heads, C_v11, damp_scale=2.0).to(self.C_heads.dtype)
+                    self.C_heads.copy_(C_next)
+                C_use = C_next.to(k_eff.dtype)
+            else:
+                self._maybe_update_centroids(k_eff)
+                C_use = self.C_heads.to(k_eff.dtype)
+        else:
+            C_use = self.C_heads.to(k_eff.dtype)
+
+        # 1. Cluster & mag-sort inside each W-window
+        assign_w = torch.argmax(torch.einsum("bhtd,hmd->bhtm", k_eff, C_use), dim=-1).view(B, H, N_W, W)
+        k_mag_w = k_mag.view(B, H, N_W, W)
+        mag_rank = k_mag_w / (k_mag_w.amax(dim=-1, keepdim=True) + 1.0)
+        perm_w = torch.argsort(assign_w.float() * 2.0 + (1.0 - mag_rank), dim=-1, stable=True)
+
+        perm_kv = perm_w.unsqueeze(-1).expand(-1, -1, -1, -1, D)
+        k_s = torch.gather(k_eff.view(B, H, N_W, W, D), 3, perm_kv).view(B, H, N_B, bs, D)
+        v_s = torch.gather(v.view(B, H, N_W, W, D), 3, perm_kv).view(B, H, N_B, bs, D)
+
+        # 2. Stage-1 block router
+        block_C = k_s.mean(dim=3)
+        router_logits = torch.matmul(q_eff, block_C.transpose(-2, -1)) * scale
+
+        block_win = (torch.arange(N_B, device=x.device) // B_W).view(1, 1, 1, N_B)
+        q_win = (torch.arange(T_pad, device=x.device) // W).view(1, 1, T_pad, 1)
+        if causal:
+            win_mask = block_win < q_win
+        else:
+            valid_win = block_win < ((T + W - 1) // W if pad == 0 else N_W - 1)
+            win_mask = (block_win != q_win) & valid_win
+
+        off_logits = router_logits.masked_fill(~win_mask, float("-inf"))
+        off_mask = _TopKHot.apply(off_logits, k_off, self.topk_mode)
+        _, off_idx = torch.topk(off_logits, k=k_off, dim=-1)
+        off_valid = torch.gather(off_mask, -1, off_idx)
+
+        flat_idx = off_idx.view(B, H, T_pad * k_off)
+        gather_kv = flat_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, bs, D)
+        k_glob = torch.gather(k_s, 2, gather_kv).view(B, H, T_pad, k_off * bs, D)
+        v_glob = torch.gather(v_s, 2, gather_kv).view(B, H, T_pad, k_off * bs, D)
+        glob_gate = off_valid.unsqueeze(-1).expand(-1, -1, -1, -1, bs).reshape(B, H, T_pad, k_off * bs)
+
+        # 3. Local window
+        q_win_1d = torch.arange(T_pad, device=x.device) // W
+        k_loc = k_eff.view(B, H, N_W, W, D)[:, :, q_win_1d, :, :]
+        v_loc = v.view(B, H, N_W, W, D)[:, :, q_win_1d, :, :]
+        loc_pos = (q_win_1d * W).view(T_pad, 1) + torch.arange(W, device=x.device).view(1, W)
+        if causal:
+            t_pos = torch.arange(T_pad, device=x.device).view(T_pad, 1)
+            local_mask = (t_pos >= loc_pos).view(1, 1, T_pad, W).expand(B, H, -1, -1)
+        else:
+            local_mask = (loc_pos < T).view(1, 1, T_pad, W).expand(B, H, -1, -1)
+
+        k_g = torch.cat([k_loc, k_glob], dim=3)
+        v_g = torch.cat([v_loc, v_glob], dim=3)
+        full_mask = torch.cat([local_mask, glob_gate > 0], dim=-1)
+        gate = torch.cat(
+            [torch.ones(B, H, T_pad, W, device=x.device, dtype=q_eff.dtype), glob_gate.to(q_eff.dtype)],
+            dim=-1,
+        )
+
+        # 4. Stage-2 token Top-K
+        scores = torch.einsum("bhtd,bhtkd->bhtk", q_eff, k_g) * scale
+        scores = scores.masked_fill(~full_mask, float("-inf"))
+        tok_mask = _TopKHot.apply(scores, min(self.k_sparse_tok, scores.size(-1)), self.topk_mode)
+
+        probs = F.softmax(scores, dim=-1) * tok_mask * gate
+        probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-6)
+
+        out = torch.einsum("bhtk,bhtkd->bhtd", probs, v_g)[:, :, :T, :]
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
+        return self.resid_dropout(self.c_proj(out))
 
 class KreinAttention(nn.Module):
     def __init__(self, config):
@@ -613,11 +1058,6 @@ class MetricSimplexAttention(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, T, C)
 
         return self.resid_dropout(self.out_proj(out))
-
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 class LinearMetricSimplexAttention(nn.Module):
 
@@ -1377,6 +1817,8 @@ class Block(nn.Module):
         self.attn = Attention(config)
         if(qrottention):
             self.attn = modules.SSM(config.n_embd,config.dropout,config.bias)
+        elif cw_v11: 
+            self.attn = CausalWindowedV11Attention(config)
         elif assocssm:
             self.attn = modules.AssociativeSSM(config.n_embd,config.dropout,config.bias)
         elif kreinSSM:
